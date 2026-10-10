@@ -1,0 +1,206 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.chengzhi-c.pi-desktop-xdpool",
+  "name": "pi-desktop-xdpool",
+  "version": "1.0.0",
+  "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接进 PI-Desktop。WorkBuddy 被限流时自动换号，三家各有开关。",
+  "author": "chengzhi-c (PI-Desktop port of XDTrees/dsh-workbuddy-xdpool)",
+  "license": "MIT",
+  "homepage": "https://github.com/chengzhi-c/pi-desktop-xdpool",
+  "repository": "https://github.com/chengzhi-c/pi-desktop-xdpool",
+  "main": "main.js",
+  "categories": [
+    "productivity"
+  ],
+  "permissions": [
+    "ui.panel",
+    "background.service",
+    "provider.register",
+    "renderer.extension",
+    "clipboard.write"
+  ],
+  "renderer": "renderer/composer.mjs",
+  "rendererActions": [
+    "plugin.call"
+  ],
+  "rendererCallMethods": [
+    "xd.composerPoints",
+    "xd.composerPrefer"
+  ],
+  "engines": {
+    "piDesktop": ">=0.15.0"
+  },
+  "i18n": {
+    "en": {
+      "name": "pi-desktop-xdpool",
+      "description": "Bring this machine's WorkBuddy, Trae and Qoder desktop sign-ins into PI-Desktop. A rate-limited WorkBuddy account fails over to the next one. Each source has its own switch.",
+      "safetyNotes": "Reads the WorkBuddy, Trae and Qoder sign-ins already saved on this machine. If an install is not in its default location, only its uninstall registry entry is read to find it. Keys for encrypted fields stay in memory. Tokens go only to each vendor's own hosts: copilot.tencent.com / codebuddy.cn / codebuddy.ai / workbuddy.ai, api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai, gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh. Chat is served from 127.0.0.1."
+    },
+    "zh-CN": {
+      "name": "pi-desktop-xdpool",
+      "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接进 PI-Desktop。WorkBuddy 被限流时自动换号，三家各有开关。",
+      "safetyNotes": "只读本机 WorkBuddy、Trae、Qoder 已保存的登录。默认位置找不到安装目录时，只读卸载项来定位。加密字段的密钥只留在内存。令牌只发往各家自己的接口：copilot.tencent.com / codebuddy.cn / codebuddy.ai / workbuddy.ai、api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai、gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh。对话由本机 127.0.0.1 上的端点转发。"
+    }
+  },
+  "safetyNotes": "Reads the WorkBuddy, Trae and Qoder sign-ins already saved on this machine. If an install is not in its default location, only its uninstall registry entry is read to find it. Keys for encrypted fields stay in memory. Tokens go only to each vendor's own hosts: copilot.tencent.com / codebuddy.cn / codebuddy.ai / workbuddy.ai, api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai, gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh. Chat is served from 127.0.0.1.",
+  "ui": {
+    "panel": "renderer/index.html",
+    "title": {
+      "en": "pi-desktop-xdpool",
+      "zh-CN": "pi-desktop-xdpool"
+    },
+    "width": 900,
+    "height": 900
+  },
+  "activationEvents": [
+    "onStartup"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "id": "xdpool.open",
+        "title": "pi-desktop-xdpool: Open Panel",
+        "category": "Productivity",
+        "keywords": [
+          "workbuddy",
+          "pool",
+          "池",
+          "模型"
+        ]
+      },
+      {
+        "id": "xdpool.rescan",
+        "title": "pi-desktop-xdpool: Detect Accounts Again",
+        "category": "Productivity",
+        "keywords": [
+          "workbuddy",
+          "rescan",
+          "重新检测"
+        ]
+      },
+      {
+        "id": "xdpool.resetCooldowns",
+        "title": "pi-desktop-xdpool: Clear All Cooldowns",
+        "category": "Productivity",
+        "keywords": [
+          "workbuddy",
+          "cooldown",
+          "清除冷却"
+        ]
+      },
+      {
+        "id": "xdpool.checkin",
+        "title": "pi-desktop-xdpool: Daily Check-in (All Accounts)",
+        "category": "Productivity",
+        "keywords": [
+          "workbuddy",
+          "trae",
+          "qoder",
+          "checkin",
+          "签到"
+        ]
+      },
+      {
+        "id": "xdpool.doctor",
+        "title": "pi-desktop-xdpool: Run Connection Check",
+        "category": "Productivity",
+        "keywords": [
+          "workbuddy",
+          "doctor",
+          "诊断"
+        ]
+      }
+    ],
+    "settings": [
+      {
+        "key": "enabled",
+        "type": "boolean",
+        "title": "启用 pi-desktop-xdpool",
+        "default": true,
+        "scope": "plugin"
+      },
+      {
+        "key": "sourceWorkbuddy",
+        "type": "boolean",
+        "title": "启用 WorkBuddy 来源",
+        "default": true,
+        "scope": "plugin"
+      },
+      {
+        "key": "sourceTrae",
+        "type": "boolean",
+        "title": "启用 Trae 来源",
+        "default": true,
+        "scope": "plugin"
+      },
+      {
+        "key": "sourceQoder",
+        "type": "boolean",
+        "title": "启用 Qoder 来源",
+        "default": true,
+        "scope": "plugin"
+      },
+      {
+        "key": "distribution",
+        "type": "select",
+        "title": "账号使用方式",
+        "default": "priority",
+        "scope": "plugin",
+        "enum": [
+          {
+            "label": "优先用一个账号（用完再换下一个）",
+            "value": "priority"
+          },
+          {
+            "label": "轮流使用（把消耗均摊到每个账号）",
+            "value": "round-robin"
+          },
+          {
+            "label": "优先使用临期积分",
+            "value": "expiry"
+          },
+          {
+            "label": "同一对话固定账号（新对话再换）",
+            "value": "sticky"
+          }
+        ]
+      },
+      {
+        "key": "cooldownSeconds",
+        "type": "number",
+        "title": "限流冷却时间（秒）",
+        "default": 60,
+        "scope": "plugin"
+      },
+      {
+        "key": "catalogRefreshMinutes",
+        "type": "number",
+        "title": "模型列表刷新间隔（分钟）",
+        "default": 30,
+        "scope": "plugin"
+      },
+      {
+        "key": "authFile",
+        "type": "string",
+        "title": "WorkBuddy 登录文件路径（扫描同目录，高级）",
+        "default": "",
+        "scope": "plugin"
+      },
+      {
+        "key": "showComposerPoints",
+        "type": "boolean",
+        "title": "在输入框工具栏显示当前账号积分",
+        "default": false,
+        "scope": "plugin"
+      }
+    ],
+    "services": [
+      {
+        "id": "provider-host",
+        "label": "pi-desktop-xdpool provider host"
+      }
+    ],
+    "providers": []
+  },
+  "changelog": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接进 PI-Desktop。WorkBuddy 被限流时换号。三家各有开关。"
+}

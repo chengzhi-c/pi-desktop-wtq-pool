@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>pi-desktop-xdpool · 预览</title>
+  <!--
+    Preview page for the plugin panel.
+
+    The iframe mounts the repository's own renderer/index.html, panel.css and
+    panel.js against a stubbed host bridge, so what you click is the shipping
+    component. Screenshots for the README are taken from this same page.
+
+    Run it:  node docs/serve.cjs      then open the printed address.
+  -->
+  <style>
+    /* Palette mirrors renderer/panel.css so the wrapper reads as part of the
+       plugin. Same design language: borders and spacing carry the hierarchy,
+       no shadows. */
+    :root {
+      color-scheme: dark;
+      --bg: #101216;
+      --panel: #16181d;
+      --card: #1c1f25;
+      --fg: #e8eaee;
+      --muted: #9aa1ad;
+      --border: #2c3038;
+      --accent: #2dd4bf;
+      --on-accent: #0c3d37;
+    }
+    :root[data-base="light"] {
+      color-scheme: light;
+      --bg: #f4f5f7;
+      --panel: #ffffff;
+      --card: #ffffff;
+      --fg: #1b1d21;
+      --muted: #6b7280;
+      --border: #e3e5ea;
+      --accent: #0f766e;
+      --on-accent: #ffffff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 14px/1.6 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    a { color: var(--accent); }
+
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 56px; }
+
+    header.top {
+      display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px;
+      padding-bottom: 16px; border-bottom: 1px solid var(--border);
+    }
+    header.top h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -.01em; }
+    header.top .tag {
+      font-size: 12px; color: var(--muted);
+      border: 1px solid var(--border); border-radius: 999px; padding: 1px 9px;
+    }
+    header.top .spacer { flex: 1 1 auto; }
+    header.top .links { display: flex; gap: 14px; font-size: 13px; }
+
+    .lede { margin: 18px 0 22px; max-width: 70ch; color: var(--fg); }
+    .lede p { margin: 0 0 8px; }
+    .lede .muted { color: var(--muted); font-size: 13px; }
+
+    .toolbar {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+      margin: 0 0 12px;
+    }
+    .toolbar .label { font-size: 12px; color: var(--muted); margin-right: 2px; }
+    .seg { display: flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    .seg button {
+      appearance: none; border: 0; background: transparent; color: var(--muted);
+      font: inherit; font-size: 13px; padding: 5px 12px; cursor: pointer;
+    }
+    .seg button + button { border-left: 1px solid var(--border); }
+    .seg button:hover { color: var(--fg); }
+    .seg button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
+    .toolbar .spacer { flex: 1 1 auto; }
+
+    .stage {
+      border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+      background: var(--panel);
+    }
+    .stage .caption {
+      display: flex; align-items: center; gap: 8px;
+      padding: 9px 14px; font-size: 12px; color: var(--muted);
+      border-bottom: 1px solid var(--border);
+    }
+    .stage .caption .dot {
+      width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
+    }
+    iframe { display: block; width: 100%; height: 820px; border: 0; background: var(--panel); }
+
+    footer.foot {
+      margin-top: 18px; font-size: 12px; color: var(--muted);
+      display: flex; flex-wrap: wrap; gap: 6px 16px;
+    }
+    @media (max-width: 720px) { iframe { height: 720px; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <h1>pi-desktop-xdpool</h1>
+      <span class="tag">v1.0.0</span>
+      <span class="tag">MIT</span>
+      <span class="spacer"></span>
+      <nav class="links">
+        <a href="https://github.com/chengzhi-c/pi-desktop-xdpool#readme">README</a>
+        <a href="https://github.com/chengzhi-c/pi-desktop-xdpool">GitHub</a>
+      </nav>
+    </header>
+
+    <div class="lede">
+      <p>把本机 WorkBuddy、Trae、Qoder 的桌面登录接进 PI-Desktop。WorkBuddy 被限流时自动换号，三家各有开关。</p>
+      <p class="muted">
+        下面即为发布版的设置面板，直接加载同一个 <code>renderer/</code>，另接一个演示用的宿主桩。
+        可切换标签页与来源、调整模型参数、切换主题。
+      </p>
+    </div>
+
+    <div class="toolbar">
+      <span class="label">来源</span>
+      <div class="seg" id="segSource">
+        <button type="button" data-source="workbuddy" aria-pressed="true">WorkBuddy</button>
+        <button type="button" data-source="trae" aria-pressed="false">Trae</button>
+        <button type="button" data-source="qoder" aria-pressed="false">Qoder</button>
+      </div>
+      <span class="label">视图</span>
+      <div class="seg" id="segView">
+        <button type="button" data-tab="pool" aria-pressed="true">账号池</button>
+        <button type="button" data-tab="models" aria-pressed="false">模型</button>
+        <button type="button" data-tab="check" aria-pressed="false">连接检查</button>
+      </div>
+      <span class="spacer"></span>
+      <span class="label">主题</span>
+      <div class="seg" id="segBase">
+        <button type="button" data-base="dark" aria-pressed="true">暗色</button>
+        <button type="button" data-base="light" aria-pressed="false">亮色</button>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="caption"><span class="dot"></span>发布版面板 · 演示数据</div>
+      <iframe id="panel" src="./preview-panel.html" title="pi-desktop-xdpool 面板预览"></iframe>
+    </div>
+
+    <footer class="foot">
+      <span>演示数据为虚构，不含任何真实账号或令牌。</span>
+      <span>本地运行：<code>node docs/serve.cjs</code></span>
+    </footer>
+  </div>
+
+  <script>
+    (function () {
+      "use strict";
+      var frame = document.getElementById("panel");
+      var root = document.documentElement;
+      var source = "workbuddy";
+      var view = "pool";
+      var base = "dark";
+
+      function press(segId, attr, value) {
+        var buttons = document.getElementById(segId).querySelectorAll("button");
+        for (var i = 0; i < buttons.length; i += 1) {
+          buttons[i].setAttribute("aria-pressed", String(buttons[i].getAttribute(attr) === value));
+        }
+      }
+
+      /* The iframe is same-origin, so the wrapper drives the panel's own tab
+         buttons. */
+      function apply() {
+        var doc = frame.contentDocument;
+        if (!doc) return;
+        var tab = doc.querySelector('#sourceTabs .tab[data-source="' + source + '"]');
+        if (tab) tab.click();
+        var sub = doc.querySelector('#viewTabs .subtab[data-tab="' + view + '"]');
+        if (sub) sub.click();
+        if (frame.contentWindow.__previewSetAppearance) {
+          frame.contentWindow.__previewSetAppearance(base);
+        }
+      }
+
+      function onSegment(segId, attr, pick) {
+        document.getElementById(segId).addEventListener("click", function (event) {
+          var button = event.target.closest("button[" + attr + "]");
+          if (!button) return;
+          pick(button.getAttribute(attr));
+          press(segId, attr, button.getAttribute(attr));
+          apply();
+        });
+      }
+
+      onSegment("segSource", "data-source", function (v) { source = v; });
+      onSegment("segView", "data-tab", function (v) { view = v; });
+      onSegment("segBase", "data-base", function (v) { base = v; root.dataset.base = v; });
+
+      root.dataset.base = base;
+      // The panel boots asynchronously after the frame fetches its markup.
+      frame.addEventListener("load", function () { setTimeout(apply, 400); });
+    })();
+  </script>
+</body>
+</html>

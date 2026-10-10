@@ -1,0 +1,25 @@
+{
+  "name": "pi-desktop-xdpool",
+  "version": "1.0.0",
+  "private": true,
+  "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接进 PI-Desktop。WorkBuddy 被限流时自动换号，三家各有开关。",
+  "author": "chengzhi-c",
+  "homepage": "https://github.com/chengzhi-c/pi-desktop-xdpool",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chengzhi-c/pi-desktop-xdpool.git"
+  },
+  "bugs": {
+    "url": "https://github.com/chengzhi-c/pi-desktop-xdpool/issues"
+  },
+  "license": "MIT",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "esbuild": "^0.25.9",
+    "typescript": "^5.9.3"
+  }
+}
