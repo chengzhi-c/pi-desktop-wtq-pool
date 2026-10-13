@@ -9,7 +9,7 @@
  * both import this module, because two copies of a security check are two
  * chances to drift.
  *
- * @module pi-desktop-xdpool/loopback
+ * @module pi-desktop-wtq-pool/loopback
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -91,28 +91,47 @@ export function writeOpenAIError(res: ServerResponse, status: number, kind: stri
  * put a live token in the response body the caller reads.
  *
  * Both shapes an echo actually takes are covered: the header form, with whatever
- * scheme the vendor uses (`Bearer COSY.…` for Qoder, `Cloud-IDE-JWT …` for Trae,
- * `X-Refresh-Token:` for WorkBuddy), and the field form, in the camelCase
- * spelling this plugin itself sends and parses (`accessToken`, `refreshToken`)
- * as well as the snake_case one a query string carries. The three-part JWT
- * needs no key at all: it is recognisable on its own, and the opaque prefixes
- * are Qoder's own.
+ * scheme the vendor uses (`Bearer COSY.…` for Qoder, `Cloud-IDE-JWT …`,
+ * `X-Cloudide-Token …` and `X-Ide-Token …` for Trae, `X-Refresh-Token:` for
+ * WorkBuddy), and the field form, in the camelCase spelling this plugin itself
+ * sends and parses (`accessToken`, `refreshToken`) as well as the snake_case
+ * one a query string carries. The three-part JWT needs no key at all: it is
+ * recognisable on its own, and the opaque prefixes are Qoder's own.
+ *
+ * Trae's tokens are opaque, not JWTs, so only the scheme rules cover them -
+ * which is why every header name the plugin itself sends is listed there. A
+ * space-separated echo of one the list missed printed the whole credential.
  */
 const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
-  [/\beyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){0,2}/g, '[redacted token]'],
-  [/\b(qoder-oauth-token-)[A-Za-z0-9_-]+/g, '$1[redacted]'],
-  [/\b(rt_)[A-Za-z0-9_-]+/g, '$1[redacted]'],
-  // A header that carries the credential itself. Anchored on the scheme name, so
-  // prose that merely says "bearer" is untouched.
-  [/\b(Bearer|Cloud-IDE-JWT|X-Refresh-Token|Cosy-Key)\s*:?\s+\S+/gi, '$1 [redacted]'],
+  // A scheme that carries the credential itself, in either the `Bearer <value>`
+  // header form or the `"Cosy-Key":"<value>"` form a quoted JSON echo takes. This
+  // runs before the bare-JWT rule below: a JWT replaced first would leave the
+  // scheme rule matching the replacement's own text and print a half-redaction.
+  // The value is a bounded token run, not `\S+` - the greedy form ate the rest of
+  // the line, destroying the fields after it and truncating the body mid-JSON -
+  // and the eight-character floor is what keeps a prose word (`invalid Bearer
+  // format`) from being taken for a credential.
+  [/\b(Bearer|Cosy-Key|Cloud-IDE-JWT|X-Cloudide-Token|X-Ide-Token|X-Refresh-Token|X-Api-Key)\b([\s:="'\\]{1,6})[A-Za-z0-9_+/.=~-]{8,}/gi, '$1$2[redacted]'],
+  [/\beyJ[A-Za-z0-9_+/.=-]+(?:\.[A-Za-z0-9_+/.=-]+){0,2}/g, '[redacted token]'],
+  [/\b(qoder-oauth-token-)[A-Za-z0-9_+/.=-]+/g, '$1[redacted]'],
+  [/\b(rt_)[A-Za-z0-9_+/.=-]+/g, '$1[redacted]'],
   /**
-   * A field whose name says it is a credential. The value must be at least six
-   * characters and carry a letter, which is what keeps this off an upstream
-   * business code — `"code":6004` and `code=11115` are the actionable half of an
-   * error, and a bare `code` is deliberately not a key here for the same reason
-   * (`"code":"soft_rate"` is the classification, not a secret).
+   * A field whose name says it is a credential, and its value.
+   *
+   * The key and both quotes may carry JSON escaping, because an upstream that
+   * quotes the request it was sent nests the credential one escape layer down
+   * (`{\"accessToken\":\"…\"}`) — the shape Trae's and Qoder's 401 bodies
+   * actually take. The value class carries the base64 punctuation (`+ / =`)
+   * and the dot, or a real token would be redacted only up to its first such
+   * character and the tail would still reach the client.
+   *
+   * The value must be at least six characters and carry a letter, which is what
+   * keeps this off an upstream business code: `"code":6004` and `code=11115` are
+   * the actionable half of an error, and a bare `code` is deliberately not a key
+   * here for the same reason (`"code":"soft_rate"` is the classification, not a
+   * secret).
    */
-  [/(["']?(?:access_?token|refresh_?token|id_?token|auth_?token|api_?key|secret|token)["']?\s*[:=]\s*["']?)(?=[A-Za-z0-9_-]{6,})(?=[A-Za-z0-9_-]*[A-Za-z_-])[A-Za-z0-9_-]+/gi, '$1[redacted]'],
+  [/((?:\\{0,2}["']?)(?:access_?token|refresh_?token|id_?token|auth_?token|oauth_?token|api_?key|secret|token)(?:\\{0,2}["']?\s*[:=]\s*\\{0,2}["']?))(?=[A-Za-z0-9_+/.=-]{6,})(?=[A-Za-z0-9_+/.=-]*[A-Za-z_-])[A-Za-z0-9_+/.=-]+/gi, '$1[redacted]'],
   [/\b[A-Za-z]:[\\/][^\r\n"'<>|]*/g, '[redacted path]'],
   [/\\\\[^\r\n"'<>|]+/g, '[redacted path]'],
   [/(['"])(\/(?!\/)[^'"\r\n]+)\1/g, '$1[redacted path]$1'],
@@ -197,14 +216,14 @@ export async function answerRequest(
   log?: { warn?(...args: unknown[]): void },
 ): Promise<void> {
   res.on('error', (error: unknown) => {
-    log?.warn?.('pi-desktop-xdpool: response socket closed mid-write', error)
+    log?.warn?.('pi-desktop-wtq-pool: response socket closed mid-write', error)
   })
   try {
     await handle()
   } catch (error: unknown) {
     // The reason is recorded before the answer is written: a 500 the client can
     // read but the log cannot explain is a bug report nobody can act on.
-    log?.warn?.('pi-desktop-xdpool: request failed', error)
+    log?.warn?.('pi-desktop-wtq-pool: request failed', error)
     try {
       if (!res.headersSent) {
         if (error instanceof BodyTooLargeError) {
@@ -215,7 +234,32 @@ export async function answerRequest(
       }
       else res.end()
     } catch (writeError: unknown) {
-      log?.warn?.('pi-desktop-xdpool: could not answer a failed request', writeError)
+      log?.warn?.('pi-desktop-wtq-pool: could not answer a failed request', writeError)
     }
   }
+}
+
+/**
+ * Apply the three request guards, answering the refusal itself.
+ *
+ * Answers `true` when the request may be routed and `false` once a refusal has
+ * been written, so a gateway's `handle` reads as "guarded, then routed". The
+ * refusals live here for the same reason the predicates do: three gateways
+ * spelling out 403/403/401 is three chances to answer a different status, and
+ * the Host and Origin refusals have no caller of their own to test them.
+ */
+export function guardsPass(req: IncomingMessage, res: ServerResponse): boolean {
+  if (!hostIsLoopback(req.headers.host)) {
+    writeOpenAIError(res, 403, 'host_not_allowed', 'Host header must name the loopback interface')
+    return false
+  }
+  if (!originIsLoopback(req.headers.origin)) {
+    writeOpenAIError(res, 403, 'origin_not_allowed', 'Origin must be a loopback origin')
+    return false
+  }
+  if (!bearerAccepted(req)) {
+    writeOpenAIError(res, 401, 'unauthorized', 'missing or invalid Authorization bearer')
+    return false
+  }
+  return true
 }

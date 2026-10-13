@@ -1,5 +1,2 @@
 node_modules/
-# Build output. The .piplug is produced by tools/pack.ps1 from the tree, so it
-# is a release artifact rather than source: keeping it in history made every
-# version bump carry a ~1 MB binary and rewrote the packfile on each one.
 dist/

@@ -25,7 +25,16 @@ const TYPES = {
 }
 
 http.createServer((req, res) => {
-  const url = new URL(req.url, 'http://127.0.0.1')
+  // A request-target the parser cannot resolve also throws, and it does so
+  // before the guards below run: same rule as the decode failures, answered
+  // rather than allowed to kill the server.
+  let url
+  try {
+    url = new URL(req.url, 'http://127.0.0.1')
+  } catch {
+    res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' }).end('bad request')
+    return
+  }
   // The preview page lives in docs/, so '/' redirects into it: the page's
   // relative links (./preview-panel.html, ../renderer/panel.js) resolve against
   // the URL, and a rewritten body under the wrong path would 404 every one.
@@ -33,7 +42,21 @@ http.createServer((req, res) => {
     res.writeHead(302, { location: '/docs/index.html' }).end()
     return
   }
-  const rel = decodeURIComponent(url.pathname).replace(/^\/+/, '')
+  // A malformed percent-escape (`/%zz`) makes decodeURIComponent throw, and a
+  // decoded NUL makes fs.readFile throw; both would kill the server from inside
+  // this callback, so they answer 400 instead. The path guard below still treats
+  // the decoded value as untrusted.
+  let rel
+  try {
+    rel = decodeURIComponent(url.pathname).replace(/^\/+/, '')
+  } catch {
+    res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' }).end('bad request: ' + url.pathname)
+    return
+  }
+  if (rel.includes('\0')) {
+    res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' }).end('bad request: ' + url.pathname)
+    return
+  }
   const file = path.resolve(ROOT, rel)
   if (file !== ROOT && !file.startsWith(ROOT + path.sep)) {
     res.writeHead(403).end('forbidden')

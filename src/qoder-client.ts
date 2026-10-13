@@ -13,7 +13,7 @@
  * Everything the client needs from the outside is injected (credential,
  * `fetchImpl`), so the whole path can be exercised offline.
  *
- * @module pi-desktop-xdpool/qoder-client
+ * @module pi-desktop-wtq-pool/qoder-client
  */
 
 import { randomUUID } from 'node:crypto'

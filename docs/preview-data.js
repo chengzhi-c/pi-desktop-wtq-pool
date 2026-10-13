@@ -4,9 +4,6 @@
  * Synthetic only - accounts, credits and model ids here are illustrative and
  * belong to nobody. The shapes follow what renderer/panel.js actually reads, so
  * the preview exercises the real component.
- *
- * No shipped file references this one: tools/pack.ps1 packs neither docs/ nor
- * this file.
  */
 (function () {
   const iso = (days) => new Date(Date.now() + days * 86400000).toISOString()
@@ -15,7 +12,7 @@
   const state = {
     sources: { workbuddy: true, trae: true, qoder: true },
     disabledRegions: [],
-    pluginVersion: '1.0.0',
+    pluginVersion: '1.0.1',
     unpublishedDeclarations: [],
     modelCap: 64,
     distribution: 'priority',
@@ -28,6 +25,7 @@
         claimed: 3,
         at: iso(-0.2),
         travel: { departed: 2, claimed: 2, adopted: 1 },
+        growth: { streak: 1, tasks: 2, credit: 400, failed: 0 },
         qoder: { claimed: 1, skipped: 0, failed: 0 },
         trae: { claimed: 1, skipped: 0, failed: 0 },
       },
@@ -40,7 +38,6 @@
       cn: { running: true, baseUrl: 'http://127.0.0.1:41831/v1' },
       global: { running: true, baseUrl: 'http://127.0.0.1:41841/v1' },
     },
-    refreshMinutes: 30,
     warnings: {},
     staleSelectionRegions: [],
     refreshing: false,
@@ -229,7 +226,7 @@
       ],
       gateways: [
         {
-          region: 'cn', port: 41851, models: 4, portFallback: false, lastError: '',
+          region: 'cn', port: 41851, models: 2, portFallback: false, lastError: '',
           roster: [
             { id: 'deepseek-v3.2', name: 'DeepSeek V3.2', alias: '', nativeContextWindow: 128000,
               nativeMaxOutputTokens: 16000, nativeSupportsImages: false, nativeThinkingLevels: [], advanced: false },
@@ -241,7 +238,7 @@
           selection: { enabledModelIds: ['deepseek-v3.2', 'doubao-seed-1.6'], overrides: { 'doubao-seed-1.6': { alias: 'doubao' } } },
         },
         {
-          region: 'ai', port: 41861, models: 0, portFallback: false, lastError: '',
+          region: 'ai', port: 41861, models: 1, portFallback: false, lastError: '',
           roster: [
             { id: 'gpt-5.1', name: 'GPT-5.1', alias: '', nativeContextWindow: 400000,
               nativeMaxOutputTokens: 128000, nativeSupportsImages: true, nativeThinkingLevels: [], advanced: false },
@@ -276,7 +273,7 @@
       ],
       gateways: [
         {
-          region: 'cn', port: 41871, models: 5, portFallback: false, lastError: '',
+          region: 'cn', port: 41871, models: 1, portFallback: false, lastError: '',
           roster: [
             { id: 'qwen3-coder-plus', name: 'Qwen3 Coder Plus', alias: '', nativeContextWindow: 128000,
               nativeMaxOutputTokens: 32000, nativeSupportsImages: false, nativeThinkingLevels: [], advanced: false },
@@ -286,7 +283,7 @@
           selection: { enabledModelIds: ['qwen3-coder-plus'], overrides: {} },
         },
         {
-          region: 'global', port: 41881, models: 0, portFallback: false, lastError: '',
+          region: 'global', port: 41881, models: 1, portFallback: false, lastError: '',
           roster: [
             { id: 'gpt-5.1', name: 'GPT-5.1', alias: '', nativeContextWindow: 400000,
               nativeMaxOutputTokens: 128000, nativeSupportsImages: true, nativeThinkingLevels: [], advanced: false },
@@ -300,25 +297,35 @@
   // The check view fills only from `xd.doctor`, never from `xd.state`.
   const doctor = {
     ok: true,
+    // Every id and detail below is the shape `doctor()` emits: the provider
+    // label comes from PROVIDER_NAME_BY_REGION, and each count is the number
+    // this file's own `models`/`selection` data would actually declare.
     findings: [
       { id: 'plugin-enabled', ok: true, detail: 'enabled' },
       { id: 'source-workbuddy', ok: true, detail: 'on' },
-      { id: 'source-trae', ok: true, detail: '2 sign-in(s): Trae CN, Trae International' },
-      { id: 'source-qoder', ok: true, detail: '2 sign-in(s): Qoder CN, Qoder Global' },
+      { id: 'source-trae', ok: true, detail: 'on; 2 account(s) (cn x1, ai x1); serving cn: 2 model(s), ai: 1 model(s)' },
+      { id: 'source-qoder', ok: true, detail: 'on; 2 account(s) (cn x1, global x1); serving cn: 1 model(s), global: 1 model(s)' },
       { id: 'accounts', ok: true, detail: '4 account(s): lin.cn@example.com, du.cn@example.com, wu.cn@example.com, lin.intl@example.com' },
       { id: 'rotation', ok: true, detail: '3 of 4 account(s) can serve a request now' },
       { id: 'host-registered-providers', ok: true, detail: 'PI-Desktop lists every provider this plugin declares' },
-      { id: 'xdpool-cn: endpoint', ok: true, detail: 'listening on http://127.0.0.1:41831/v1' },
-      { id: 'xdpool-cn: models', ok: true, detail: '5 model(s) in the catalog' },
-      { id: 'xdpool-cn: declared', ok: true, detail: 'published in this plugin\'s manifest' },
-      { id: 'xdpool-global: endpoint', ok: true, detail: 'listening on http://127.0.0.1:41841/v1' },
-      { id: 'xdpool-global: models', ok: true, detail: '8 model(s) in the catalog' },
+      { id: 'WTQ Pool (CN): endpoint', ok: true, detail: 'listening on http://127.0.0.1:41831/v1' },
+      { id: 'WTQ Pool (CN): models', ok: true, detail: '6 model(s) in the catalog' },
+      { id: 'WTQ Pool (CN): declared', ok: true, detail: "published in this plugin's manifest" },
+      { id: 'WTQ Pool (Global): endpoint', ok: true, detail: 'listening on http://127.0.0.1:41841/v1' },
+      { id: 'WTQ Pool (Global): models', ok: true, detail: '2 model(s) in the catalog' },
+      { id: 'WTQ Pool (Global): declared', ok: true, detail: "published in this plugin's manifest" },
+      { id: 'WTQ Pool (CN): published address', ok: true, detail: 'matches the endpoint this gateway bound (http://127.0.0.1:41831/v1)' },
+      { id: 'WTQ Pool (Global): published address', ok: true, detail: 'matches the endpoint this gateway bound (http://127.0.0.1:41841/v1)' },
+      { id: 'WTQ Pool Trae (CN): published address', ok: true, detail: 'matches the endpoint this gateway bound (http://127.0.0.1:41851/v1)' },
+      { id: 'WTQ Pool Trae (Global): published address', ok: true, detail: 'matches the endpoint this gateway bound (http://127.0.0.1:41861/v1)' },
+      { id: 'WTQ Pool Qoder (CN): published address', ok: true, detail: 'matches the endpoint this gateway bound (http://127.0.0.1:41871/v1)' },
+      { id: 'WTQ Pool Qoder (Global): published address', ok: true, detail: 'matches the endpoint this gateway bound (http://127.0.0.1:41881/v1)' },
       { id: 'declaration-written', ok: true, detail: 'up to date' },
     ],
   }
 
   doctor.report = [
-    'pi-desktop-xdpool doctor',
+    'WTQ Pool doctor',
     new Date().toISOString(),
     'overall: PASS',
     '',

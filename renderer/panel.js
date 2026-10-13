@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * pi-desktop-xdpool - panel logic.
+ * pi-desktop-wtq-pool - panel logic.
  *
  * The panel owns no data and makes no network request: everything it shows
  * comes from the plugin's main process through `window.pluginBridge.invoke`,
@@ -53,7 +53,7 @@ var EN = {
   "pool.healthy": "Rate limits automatically switch to another available account.",
   "pool.allCooling": "Every account is rate-limited right now; requests pause until a cooldown lifts.",
   "pool.checkinAll": "Check in every account",
-  "pool.checkinAllHint": "Collect every account's daily reward without switching between them.",
+  "pool.checkinAllHint": "Collect every account's daily check-in. The streak bonus and task rewards run with the scheduled pass.",
   "pool.checkinAllBusy": "Checking in…",
   "pool.checkinAllDone": "Checked in {count} account(s)",
   "pool.checkinAllNone": "Every account is already checked in today",
@@ -215,8 +215,9 @@ var EN = {
   "auto.rowQoder": "Qoder",
   "auto.rowTrae": "Trae",
   "auto.rowCounts": "{label}: {claimed} collected · {skipped} skipped · {failed} failed",
+  "auto.rowGrowth": "Streak and tasks: {streak} streak tier(s) · {tasks} task(s) · +{credit} credits · {failed} failed",
   "auto.rowTravelCounts": "{label}: {departed} sent · {claimed} claimed · {adopted} adopted",
-  "auto.hint": "Claims the daily reward of all three sources (WorkBuddy / Trae / Qoder) and runs the travel patrol in one pass; today's is skipped, a missed hour runs at the next start.",
+  "auto.hint": "Claims the daily reward of all three sources (WorkBuddy / Trae / Qoder), the streak bonus and task rewards of domestic WorkBuddy accounts, and runs the travel patrol in one pass; today's is skipped, a missed hour runs at the next start.",
   "composer.title": "Composer credits",
   "composer.on": "On",
   "composer.off": "Off",
@@ -228,11 +229,13 @@ var EN = {
   "check.empty": "Run the check to see whether a chat can reach WorkBuddy, Trae or Qoder.",
   "check.pass": "PASS",
   "check.fail": "FAIL",
-  "foot.version": "v{version}",
   "foot.shim": "endpoint {url}",
   "foot.shimOff": "endpoint not listening",
-  "foot.refresh": "catalog refresh every {min} min",
   "foot.rosterStale": "{region} needs attention: {detail}",
+  "foot.github": "GitHub",
+  "foot.npm": "npm",
+  "foot.docs": "Docs",
+  "foot.license": "License",
   "err.bridge": "The panel bridge is unavailable.",
   "tag.free": "free",
   "tag.rate": "x{rate}",
@@ -274,7 +277,7 @@ var ZH = {
   "pool.healthy": "限流时会自动切换到其他可用账号。",
   "pool.allCooling": "所有账号当前都被限流，请求会等到有账号冷却结束。",
   "pool.checkinAll": "全部签到",
-  "pool.checkinAllHint": "一次领完所有账号的每日奖励，不用挨个切换。",
+  "pool.checkinAllHint": "一次领完所有账号今天的签到。连登奖励和任务奖励随自动签到、立即运行领取。",
   "pool.checkinAllBusy": "签到中…",
   "pool.checkinAllDone": "已签到 {count} 个账号",
   "pool.checkinAllNone": "所有账号今天都已签到",
@@ -442,18 +445,21 @@ var ZH = {
   "auto.rowQoder": "Qoder",
   "auto.rowTrae": "Trae",
   "auto.rowCounts": "{label}：领取 {claimed} · 跳过 {skipped} · 失败 {failed}",
+  "auto.rowGrowth": "连登与任务：连登 {streak} 档 · 任务 {tasks} 个 · +{credit} 积分 · 失败 {failed}",
   "auto.rowTravelCounts": "{label}：派出 {departed} · 领奖 {claimed} · 领养 {adopted}",
-  "auto.hint": "时间到后一次性领取三家（WorkBuddy / Trae / Qoder）的签到奖励，并顺带完成猫猫旅行；今天已领过的跳过，错过的到下次启动补领。",
+  "auto.hint": "时间到后一次性领取三家（WorkBuddy / Trae / Qoder）的签到奖励、WorkBuddy 国内账号的连登奖励和任务奖励，并顺带完成猫猫旅行；今天已领过的跳过，错过的到下次启动补领。",
   "auto.badHours": "时间请填 0–23 的整数小时，例如 9 或 9,21。",
   "check.title": "连接检查",
   "check.empty": "运行检查可以看到对话能否连上 WorkBuddy、Trae 或 Qoder。",
   "check.pass": "通过",
   "check.fail": "未通过",
-  "foot.version": "v{version}",
   "foot.shim": "端点 {url}",
   "foot.shimOff": "端点未监听",
-  "foot.refresh": "模型目录每 {min} 分钟刷新",
   "foot.rosterStale": "{region} 需要注意：{detail}",
+  "foot.github": "GitHub",
+  "foot.npm": "npm",
+  "foot.docs": "文档",
+  "foot.license": "许可",
   "err.bridge": "面板桥不可用。",
   "tag.free": "免费",
   "tag.rate": "x{rate}",
@@ -634,15 +640,6 @@ function setActiveRegion(source, region) {
 var drafts = {};
 /** model id -> { enabled, alias, window, output, images, levels, defaultLevel, open } */
 var draft = null;
-/**
- * Identity of the draft: the gateway plus the exact set of model ids it was
- * built from. The first render runs before any state has arrived, so a draft
- * built then would otherwise be reused for a model list it knows nothing about
- * (every row would read `undefined`). Keying on the id set also means a catalog
- * that gains or loses a model rebuilds the draft, while a plain refresh of the
- * same list leaves the user's unsaved edits alone.
- */
-var draftKey = null;
 /** The page `draft` belongs to, so discarding drops that page's edits alone. */
 var draftSlot = null;
 var busy = null;           // id of the control awaiting a response
@@ -680,7 +677,7 @@ function renderHeader() {
   // restarts its animation — the class only comes and goes.
   $("topBar").classList.toggle("refreshing", refreshing);
 
-  $("barTitle").textContent = "pi-desktop-xdpool";
+  $("barTitle").textContent = "WTQ Pool";
   var sub = state === null
     ? t("state.loading")
     : t("pool.summary", { count: accounts.length, cooling: cooling });
@@ -950,11 +947,11 @@ function renderPoolStrip() {
   var accounts = accountsOf(activeRegion);
   var cooling = accounts.filter(function (a) { return a.cooling; }).length;
   var off = accounts.filter(function (a) { return a.disabled === true; }).length;
-  // Only the accounts that can serve are counted: one that is switched off is
-  // not rate-limited, so adding it to the cooling count used to read "every
-  // account is rate-limited" over a row that also said "1 switched off". A pool
-  // whose serving accounts are all cooling really does pause, and one with
-  // nothing switched on says so on the line below rather than here.
+  // Only the accounts that can serve are counted: a switched-off account is not
+  // rate-limited, so counting it here would read "every account is rate-limited"
+  // over a row that also said "1 switched off". A pool whose serving accounts are
+  // all cooling really does pause, and one with nothing switched on says so on
+  // the line below rather than here.
   var serving = accounts.length - off;
   var noteText = accounts.length === 0
     ? ""
@@ -966,9 +963,9 @@ function renderPoolStrip() {
 /**
  * The button that turns a whole source off.
  *
- * It used to live next to the source's title; it now sits at the bottom of
- * that source's content, where a stray click cannot switch the gateways off,
- * and it names the source so it cannot be read as a region's switch.
+ * It sits at the bottom of that source's content rather than beside the title,
+ * where a stray click cannot switch the gateways off, and it names the source so
+ * it cannot be read as a region's switch.
  */
 function sourceToggle(source, on) {
   var label = t(on ? "source.disable" : "source.enable", { source: t(SOURCE_TITLES[source]) });
@@ -1349,11 +1346,10 @@ function distributionControl(source) {
  * The hours box is left alone while it has focus, so a state refresh (the panel
  * polls while a background pass runs) never eats what is being typed.
  *
- * The on/off buttons are static nodes too, for a sharper reason: they used to be
- * rebuilt on every render, and a button that is destroyed while it holds focus
- * loses it — the browser then scrolls the replacement into view, which is the
- * shake every click produced. So they are painted once here and only their
- * state is updated.
+ * The on/off buttons are static nodes for a sharper reason: rebuilt on every
+ * render, a button destroyed while it holds focus loses it, and the browser then
+ * scrolls the replacement into view — the shake every click produced. So they are
+ * painted once here and only their state is updated.
  */
 function renderAutoCheckin() {
   $("autoTitle").textContent = t("auto.title");
@@ -1439,16 +1435,20 @@ function renderComposerPoints() {
 function autoNoteRows(auto) {
   var last = auto.last;
   if (!last) return [{ text: t("auto.neverRun"), tone: "" }];
+  // Opening stub: sources have not answered yet. A finished "0 accounts" row
+  // here is what "run now" painted and then never replaced.
+  if (last.pending === true && last.travel == null && last.qoder == null && last.trae == null) {
+    return [{ text: t("auto.running"), tone: "" }];
+  }
   var slot = String(last.slot).replace("T", " ");
   if (last.error) return [{ text: t("auto.lastFailedAt", { slot: slot, message: last.error }), tone: "fail" }];
-  var rows = [{
+  var rows = [];
+  if (last.pending === true) rows.push({ text: t("auto.running"), tone: "" });
+  rows.push({
     text: t(last.manual === true ? "auto.lastManual" : "auto.lastAuto",
       { slot: slot, count: Number(last.claimed) || 0 }),
-    tone: "ok",
-  }];
-  // A source counts as done when it collected something, skipped when it
-  // reported skips, and failed when it reported failures. "Nothing to do" is the
-  // quiet case and gets no dot, so a healthy pass is not a wall of colour.
+    tone: last.pending === true ? "" : "ok",
+  });
   var push = function (label, counts) {
     if (!counts) return;
     var claimed = Number(counts.claimed) || 0;
@@ -1464,9 +1464,6 @@ function autoNoteRows(auto) {
       tone: failed > 0 ? "fail" : claimed > 0 ? "ok" : skipped > 0 ? "skip" : "",
     });
   };
-  // The travel patrol reports three counts of its own, and two of the claim
-  // row's are ones it never produces: it read "0 skipped · 0 failed" after every
-  // pass, which is a statement about nothing. Its own row says what it did.
   var pushTravel = function (counts) {
     if (!counts) return;
     var claimed = Number(counts.claimed) || 0;
@@ -1481,8 +1478,22 @@ function autoNoteRows(auto) {
       tone: claimed > 0 || adopted > 0 ? "ok" : "",
     });
   };
-  push(t("auto.rowWorkbuddy"), last);
+  push(t("auto.rowWorkbuddy"), { claimed: last.claimed, skipped: last.skipped, failed: last.failed });
   pushTravel(last.travel);
+  if (last.growth) {
+    var growth = last.growth;
+    var streakTiers = Number(growth.streak) || 0;
+    var taskCount = Number(growth.tasks) || 0;
+    rows.push({
+      text: t("auto.rowGrowth", {
+        streak: streakTiers,
+        tasks: taskCount,
+        credit: Number(growth.credit) || 0,
+        failed: Number(growth.failed) || 0,
+      }),
+      tone: Number(growth.failed) > 0 ? "fail" : streakTiers > 0 || taskCount > 0 ? "ok" : "",
+    });
+  }
   push(t("auto.rowQoder"), last.qoder);
   push(t("auto.rowTrae"), last.trae);
   return rows;
@@ -1697,7 +1708,7 @@ function creditsBlock(credits, key, options) {
 
   // Same rule as the upstream parser: a pack with nothing left in it is not
   // shown and not counted. `remain`, not `size` — a drained 50-credit month has
-  // a size of 50 and used to survive this filter as an empty row.
+  // a size of 50 and would otherwise survive this filter as an empty row.
   var packages = (credits.packages || []).filter(function (pack) {
     return settings.keepEmpty === true || !(typeof pack.remain === "number" && pack.remain <= 0);
   });
@@ -1851,7 +1862,9 @@ function packWhen(pack) {
   }
   if (pack.neverExpires === true) return el("span", "pack-when", t("credits.noExpiry"));
   if (typeof pack.expiresAtMs !== "number" || pack.expiresAtMs <= 0) return el("span", "pack-when", "");
-  var soon = pack.expiresAtMs - Date.now() < PACK_SOON_MS;
+  // Same lower bound as the round above: an expiry already in the past is not
+  // "soon", it is spent, and without this a stale row kept its warning badge.
+  var soon = pack.expiresAtMs > Date.now() && pack.expiresAtMs - Date.now() < PACK_SOON_MS;
   return el("span", soon ? "pack-when pack-soon" : "pack-when", t("credits.expiresAt", {
     date: formatDayStamp(pack.expiresAtMs),
   }));
@@ -2014,7 +2027,6 @@ function renderModels() {
     drafts[slot] = { key: key, draft: draftFor(list, page.selection) };
   }
   draft = drafts[slot].draft;
-  draftKey = key;
   draftSlot = slot;
 
   $("modelListTitle").textContent = page.label;
@@ -2534,16 +2546,25 @@ function modelSheetBody(model, entry) {
 }
 
 
+/**
+ * The ceiling `main.js` enforces on a token budget (`MAX_TOKEN_BUDGET`).
+ *
+ * A number past it makes the whole selection payload invalid there, so the save
+ * would drop every edit in this pass rather than clamp one field. The browser
+ * bound keeps the value inside the range the host can store.
+ */
+var MAX_TOKEN_BUDGET = 0xffffffff;
 function numberInput(value, onChange) {
   var input = document.createElement("input");
   input.type = "number";
   input.className = "num-input";
+  input.max = String(MAX_TOKEN_BUDGET);
   input.min = "1";
   input.step = "1000";
   input.value = String(value);
   input.addEventListener("change", function () {
     var next = Number(input.value);
-    if (!Number.isFinite(next) || next <= 0) {
+    if (!Number.isFinite(next) || next <= 0 || next > MAX_TOKEN_BUDGET) {
       input.value = String(value);
       return;
     }
@@ -2677,10 +2698,8 @@ function renderFooter() {
   var foot = $("foot");
   clear(foot);
   if (state === null) return;
-  foot.appendChild(el("span", null, t("foot.version", { version: state.pluginVersion || "?" })));
   var endpoint = footerEndpoint();
   foot.appendChild(el("span", endpoint.on ? null : "muted", endpoint.text));
-  if (state.refreshMinutes) foot.appendChild(el("span", null, t("foot.refresh", { min: state.refreshMinutes })));
   // Either the gateway could not sign in, or it is still serving a roster from
   // an earlier read. Both are worth saying out loud; the message leads with the
   // reason so it does not have to guess which of the two it is. Only the pool's
@@ -2695,10 +2714,10 @@ function renderFooter() {
 
 function render() {
   // Every render pass rebuilds most of the panel, so the element holding focus
-  // is destroyed and the browser scrolls its replacement into view — which is
-  // the shake a click used to produce. Record what had focus and where the page
-  // was, and put both back afterwards. The same guard the account and model
-  // columns already use, lifted to the whole panel.
+  // is destroyed and the browser scrolls its replacement into view — the shake a
+  // click produces. Record what had focus and where the page was, and put both
+  // back afterwards. The same guard the account and model columns already use,
+  // lifted to the whole panel.
   var keep = placeOf(document.body);
   renderHeader();
   renderAutoCheckin();
@@ -2733,8 +2752,13 @@ function render() {
 
 // ---------------------------------------------------------------- actions
 
+var stateRevision = 0;
+
 function adopt(next) {
-  if (next && typeof next === "object") state = next;
+  if (next && typeof next === "object") {
+    state = next;
+    stateRevision += 1;
+  }
 }
 
 function runBusy(id, work) {
@@ -2785,10 +2809,47 @@ function adoptAndMaybePoll(next, attempts) {
   if (attempts >= 15) { stopPolling(); return; }
   stopPolling();
   refreshPoll = window.setTimeout(function () {
+    refreshPoll = null;
+    var revision = stateRevision;
     invoke("xd.state").then(function (again) {
+      if (revision !== stateRevision) {
+        if (state && state.refreshing === true) adoptAndMaybePoll(state, attempts + 1);
+        return;
+      }
       adoptAndMaybePoll(again, attempts + 1);
     }).catch(function () { stopPolling(); });
   }, REFRESH_POLL_MS);
+}
+
+var checkinPoll = null;
+var CHECKIN_POLL_MS = 2000;
+var CHECKIN_POLL_LIMIT = 90;
+
+function stopCheckinPoll() {
+  if (checkinPoll !== null) {
+    window.clearTimeout(checkinPoll);
+    checkinPoll = null;
+  }
+}
+
+/** Keep reading the log while a check-in pass is still marked pending. */
+function pollCheckinLog(attempts) {
+  var last = state && state.autoCheckin && state.autoCheckin.last;
+  if (!last || last.pending !== true) { stopCheckinPoll(); return; }
+  if (busy !== null && busy !== "checkin") { stopCheckinPoll(); return; }
+  if (attempts >= CHECKIN_POLL_LIMIT) { stopCheckinPoll(); return; }
+  if (checkinPoll !== null) return;
+  checkinPoll = window.setTimeout(function () {
+    checkinPoll = null;
+    var revision = stateRevision;
+    invoke("xd.state").then(function (again) {
+      if (revision !== stateRevision) { pollCheckinLog(attempts + 1); return; }
+      if (busy !== null && busy !== "checkin") return;
+      adopt(again);
+      render();
+      pollCheckinLog(attempts + 1);
+    }).catch(function () { stopCheckinPoll(); });
+  }, CHECKIN_POLL_MS);
 }
 
 function refresh() {
@@ -2891,8 +2952,15 @@ function parseCheckinHours(text) {
 /** Switch the daily automatic check-in, or move its hours, in one request. */
 function setAutoCheckin(enabled, hours) {
   if (hours === null) {
-    note(t("auto.badHours"));
-    return Promise.resolve();
+    // Only switching ON needs a readable hour list. Switching OFF must not: the
+    // box can hold stale invalid text from an earlier edit, and bailing out there
+    // left the timer running while the panel reported the schedule as off.
+    if (enabled === true) {
+      note(t("auto.badHours"));
+      return Promise.resolve();
+    }
+    var current = state && state.autoCheckin && state.autoCheckin.hours;
+    hours = Array.isArray(current) ? current : [];
   }
   return runBusy("autoCheckin", function () {
     return invoke("xd.setAutoCheckin", { enabled: enabled === true, hours: hours });
@@ -2984,7 +3052,6 @@ function discardDraft() {
   // throw away.
   if (draftSlot !== null) delete drafts[draftSlot];
   draft = null;
-  draftKey = null;
   draftSlot = null;
   renderModels();
   note(null);
@@ -3029,7 +3096,6 @@ function saveModels() {
     // stored rather than from a draft that is no longer pending.
     if (submittedSlot !== null) delete drafts[submittedSlot];
     draft = null;
-    draftKey = null;
     draftSlot = null;
     render();
     announce(t("models.saved"));
@@ -3122,11 +3188,31 @@ function labelTabs() {
     var key = tabs[i].getAttribute("data-tab");
     tabs[i].textContent = t("tab." + key);
   }
+  // The footer links are static markup, so their labels follow the locale here
+  // rather than through the render pass.
+  var labels = document.querySelectorAll(".foot-links [data-foot-label]");
+  for (var j = 0; j < labels.length; j += 1) {
+    labels[j].textContent = t("foot." + labels[j].getAttribute("data-foot-label"));
+  }
 }
 
 // -------------------------------------------------------------------- init
 
 function bind() {
+  // Every footer link is an external address, and every one of them has to go
+  // through the host: this renderer is sandboxed, so a plain navigation would
+  // replace the panel instead of opening a browser.
+  var footLinks = document.querySelector(".foot-links");
+  if (footLinks) {
+    footLinks.addEventListener("click", function (event) {
+      var anchor = event.target.closest("a[href]");
+      if (anchor === null || bridge === null) return;
+      event.preventDefault();
+      invoke("shell.openExternal", { url: anchor.href }).catch(function (error) {
+        note(String(error && error.message ? error.message : error));
+      });
+    });
+  }
   $("refreshBtn").addEventListener("click", refresh);
   $("rescanBtn").addEventListener("click", rescan);
   $("resetBtn").addEventListener("click", clearCooldowns);
@@ -3156,6 +3242,7 @@ function bind() {
   // as long as that takes — the button reports it rather than sitting idle.
   $("autoRunNow").addEventListener("click", function () {
     runBusy("checkin", function () { return invoke("xd.runCheckinNow"); })
+      .then(function () { pollCheckinLog(0); })
       .catch(function () {});
   });
 
@@ -3229,12 +3316,28 @@ function boot() {
   invoke("app.getAppearance").then(applyAppearance).catch(function () {});
   // First paint comes from cache; the poll below picks up the refresh the main
   // process runs behind it, which is what keeps opening the panel fast.
-  invoke("xd.state").then(function (next) {
-    adoptAndMaybePoll(next, 0);
-  }).catch(function (error) {
-    note(String(error && error.message ? error.message : error));
-    render();
-  });
+  // The one failure worth waiting out is the plugin process not being up yet:
+  // the bridge answers "plugin not loaded" while the host is still starting
+  // it, and rendering that as the panel's permanent state left a fast-opened
+  // panel dead until it was reopened. A few bounded retries cover the startup
+  // window; anything still failing after them is a real error and renders
+  // as one.
+  var bootAttempts = 0;
+  function requestFirstState() {
+    invoke("xd.state").then(function (next) {
+      adoptAndMaybePoll(next, 0);
+      pollCheckinLog(0);
+    }).catch(function (error) {
+      bootAttempts += 1;
+      if (bootAttempts < 4) {
+        setTimeout(requestFirstState, 600);
+        return;
+      }
+      note(String(error && error.message ? error.message : error));
+      render();
+    });
+  }
+  requestFirstState();
 }
 
 boot();

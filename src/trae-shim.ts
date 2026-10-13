@@ -9,7 +9,7 @@
 import { randomUUID } from 'node:crypto'
 import type { TraeStreamEvent } from './trae-sse'
 import { SseDecoder, decodeTraeEvent } from './trae-sse'
-import { prepareSoloBody } from './trae-upstream'
+import { redactSecrets } from './loopback'
 
 /** What the gateway must answer when Trae refuses inside the stream. */
 export interface TraeFailure {
@@ -19,25 +19,6 @@ export interface TraeFailure {
 }
 
 export type TraeRelayErrorKind = 'hard_credit' | 'client' | 'server'
-
-/**
- * OpenAI request body → the Trae `llm_utils_chat` envelope.
- *
- * The per-model `function` is the one thing this adds over the plain envelope:
- * a model is only callable through the directory function that listed it
- * (`glm-5.3` exists solely under `solo_work_remote`), and sending it through
- * any other function answers `4001 param is invalid`. A model with no mapping
- * falls back to the caller's own value, then to `solo_work_lite`.
- */
-export function traeRequestBody(
-  openAiBody: string,
-  functionForModel?: (model: string) => string | undefined,
-): string {
-  let model = ''
-  try { model = (JSON.parse(openAiBody) as Record<string, unknown>)['model'] as string ?? '' } catch { model = '' }
-  const stamped = typeof model === 'string' ? functionForModel?.(model) : undefined
-  return prepareSoloBody(openAiBody, undefined, stamped)
-}
 
 interface OpenAIToolCallDelta {
   index: number
@@ -98,7 +79,11 @@ export function describeTraeFailure(failure: TraeFailure): string {
     if (extra !== '') parts.push(extra.slice(0, 200))
   }
   const detail = failure.message.trim()
-  return detail === '' ? parts.join(' · ') : `${parts.join(' · ')} · upstream: ${detail}`
+  // Redacted here, at the one function that assembles this text, because the
+  // frame it builds is sent straight to the client: an upstream error frame
+  // that quotes the request it was sent carries the credential in `message`,
+  // and `extra` is an opaque diagnostic object that may carry it too.
+  return redactSecrets(detail === '' ? parts.join(' · ') : `${parts.join(' · ')} · upstream: ${detail}`)
 }
 
 /**
@@ -127,6 +112,14 @@ export interface TraeRelayOptions {
   /** Injected for reproducible chunk ids. */
   id?: string
   created?: number
+  /**
+   * Told about a failure that arrived after output had already started.
+   *
+   * The stream itself ends in a shape the client can finish on, so the error
+   * never reaches it as a stream error and would otherwise leave nothing
+   * behind at all. This is how the gateway still records it.
+   */
+  onFailure?: (error: unknown) => void
 }
 
 /**
@@ -151,7 +144,7 @@ export function bridgeTraeStream(
   let cancelled = false
   let sawToolCalls = false
   let emittedFinishReason = false
-  let upstreamError: Error | undefined
+  let upstreamDone = false
   // OpenAI-shaped usage, widened past `number` because the cache breakdown
   // nests under `prompt_tokens_details`.
   let usage: Record<string, number | Record<string, number>> | undefined
@@ -178,9 +171,10 @@ export function bridgeTraeStream(
   const consume = (event: ReturnType<SseDecoder['push']>[number], controller: ReadableStreamDefaultController<Uint8Array>): void => {
     if (cancelled) return
     const decoded = decodeTraeEvent(event)
+    if (decoded.type === 'done' || event.event === 'done') upstreamDone = true
     if (decoded.type === 'unknown') {
       const failure = traeFailureOf(decoded)
-      if (failure !== undefined) upstreamError = new Error(describeTraeFailure(failure))
+      if (failure !== undefined) throw new Error(describeTraeFailure(failure))
       return
     }
     if (decoded.type === 'delta') {
@@ -219,13 +213,7 @@ export function bridgeTraeStream(
     }
     if (decoded.type !== 'done' && decoded.type !== 'delta') return
     if (emittedFinishReason) return
-    // Mark the terminal state before erroring the controller, so the post-loop
-    // fallback never enqueues after `controller.error()`.
     emittedFinishReason = true
-    if (upstreamError !== undefined) {
-      controller.error(upstreamError)
-      return
-    }
     controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : decoded.finishReason || 'stop'))
   }
 
@@ -237,17 +225,10 @@ export function bridgeTraeStream(
           if (cancelled) return
           if (next.done) break
           for (const event of sse.push(decoder.decode(next.value, { stream: true }))) consume(event, controller)
+          if (upstreamDone) break
         }
         if (cancelled) return
         for (const event of sse.finish()) consume(event, controller)
-        // An upstream failure ends the stream as an error, whether it arrived
-        // before the `done` event (errored there) or only at EOF. Returning
-        // here matters: the controller is already errored, so the enqueue
-        // below would throw instead of closing cleanly.
-        if (upstreamError !== undefined) {
-          controller.error(upstreamError)
-          return
-        }
         // A clean EOF is a valid termination even without an explicit done
         // event; the client still needs a non-null finish_reason.
         if (!emittedFinishReason) {
@@ -256,9 +237,41 @@ export function bridgeTraeStream(
         }
         controller.enqueue(encoder.encode('data: [DONE]\n\n'))
         controller.close()
-      } catch (error) {
-        if (!cancelled) controller.error(error)
+      } catch (error: unknown) {
+        // Same contract as the Qoder bridge: a failure after output has started
+        // cannot change the 200 the client already holds, so the stream ends in
+        // the shape a client can finish on - an in-band error frame, the
+        // terminal finish chunk, then `[DONE]`. Erroring the controller left a
+        // truncated body with neither marker, which is a turn the caller can
+        // only end by timing out.
+        if (cancelled) controller.error(error)
+        else {
+          // An abort is this gateway's own `res.on('close')` reaching the
+          // relay: the caller stopped waiting, which is the intended path and
+          // not an upstream failure. It arrives before the stream's `cancel`
+          // runs, so `cancelled` is still false here and the error itself is
+          // the only signal - recorded as a warning it wrote one line per
+          // cancelled turn, which buried the failures worth reading.
+          if (!(error instanceof Error && error.name === 'AbortError')) options.onFailure?.(error)
+          // Redacted here because this frame is the one place a stream error's
+          // text reaches the client without passing through `writeOpenAIError`.
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            id,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            choices: [],
+            error: { message: redactSecrets(error instanceof Error ? error.message : String(error)), type: 'upstream_error' },
+          })}\n\n`))
+          if (!emittedFinishReason) {
+            emittedFinishReason = true
+            controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : 'stop'))
+          }
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+          controller.close()
+        }
       } finally {
+        await reader.cancel().catch(() => {})
         reader.releaseLock()
       }
     },
@@ -341,30 +354,41 @@ export async function openTraeResponse(
   let sawOutput = false
   let failure: TraeFailure | undefined
   let ended = false
+  let terminal = false
   const inspect = (events: ReturnType<SseDecoder['push']>): void => {
     for (const event of events) {
       const decoded = decodeTraeEvent(event)
+      terminal ||= decoded.type === 'done' || event.event === 'done'
       if (decoded.type === 'delta' && (decoded.text !== ''
         || (decoded.reasoning !== undefined && decoded.reasoning !== '')
         || normalizeTraeToolCalls(decoded.toolCalls).length > 0)) sawOutput = true
       failure ??= traeFailureOf(decoded)
-      if (sawOutput || failure !== undefined) break
+      if (sawOutput || failure !== undefined || terminal) break
     }
   }
-  while (buffered.length < PEEK_MAX_CHUNKS && bufferedBytes < PEEK_MAX_BYTES) {
-    const next = await reader.read()
-    if (next.done) {
-      ended = true
-      // Flush the tail: a stream cut off before its blank line holds exactly
-      // the failure this peek exists to catch, and `push` alone never
-      // dispatches it.
-      inspect(sse.finish())
-      break
+  try {
+    while (buffered.length < PEEK_MAX_CHUNKS && bufferedBytes < PEEK_MAX_BYTES) {
+      const next = await reader.read()
+      if (next.done) {
+        ended = true
+        // Flush the tail: a stream cut off before its blank line holds exactly
+        // the failure this peek exists to catch, and `push` alone never
+        // dispatches it.
+        inspect(sse.finish())
+        break
+      }
+      buffered.push(next.value)
+      bufferedBytes += next.value.byteLength
+      inspect(sse.push(decoder.decode(next.value, { stream: true })))
+      if (sawOutput || failure !== undefined || terminal) break
     }
-    buffered.push(next.value)
-    bufferedBytes += next.value.byteLength
-    inspect(sse.push(decoder.decode(next.value, { stream: true })))
-    if (sawOutput || failure !== undefined) break
+  } catch (error: unknown) {
+    // Both `reader.read()` and `SseDecoder.push` throw - the latter by design on
+    // an over-long line. Without this the reader was never cancelled, so the
+    // upstream socket stayed open until its own idle timeout while the caller
+    // saw a 500 that named a parse failure rather than the truncated read.
+    await reader.cancel().catch(() => {})
+    throw error
   }
   // Nothing has been forwarded yet, so a failure found here can still become a
   // real status code. Once output has started, the stream is already committed.

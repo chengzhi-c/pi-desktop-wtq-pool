@@ -9,7 +9,7 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
-import { answerRequest, bearerAccepted, hostIsLoopback, isJsonContentType, listedModels, originIsLoopback, readRequestBody, writeJson, writeOpenAIError } from './loopback'
+import { answerRequest, guardsPass, isJsonContentType, listedModels, readRequestBody, writeJson, writeOpenAIError } from './loopback'
 import type { TraeCredential } from './trae-discovery'
 import type { TraeIdentity, TraeReasoningCapability, TraeSoloModel } from './trae-upstream'
 import { TraeSoloUpstreamClient } from './trae-upstream'
@@ -22,8 +22,8 @@ export interface TraeGatewayLogger {
 }
 
 export interface TraeGatewayOptions {
-  /** Sign-ins found on this machine; the first usable one answers requests. */
-  credentials(): Promise<TraeCredential[]>
+  /** Sign-ins found on this machine. `'chat'` is a turn that should advance rotation; every other read must not. */
+  credentials(purpose?: 'chat'): Promise<TraeCredential[]>
   /** Request identity for the credential being used. */
   identity(credential: TraeCredential): Promise<TraeIdentity>
   /** Injected so the whole path runs offline in checks. */
@@ -75,8 +75,8 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
   let catalogAt = 0
   let catalogInFlight: Promise<TraeSoloModel[]> | undefined
 
-  async function firstCredential(): Promise<TraeCredential> {
-    const credentials = await options.credentials()
+  async function firstCredential(purpose?: 'chat'): Promise<TraeCredential> {
+    const credentials = await options.credentials(purpose)
     const usable = credentials.find(credential => credential.accessToken !== '')
     if (usable === undefined) throw new Error('no Trae sign-in found on this machine')
     return usable
@@ -114,6 +114,8 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
       writeOpenAIError(res, 415, 'unsupported_media_type', 'Content-Type must be application/json')
       return
     }
+    const watcher = new AbortController()
+    res.on('close', () => watcher.abort())
     const raw = (await readRequestBody(req)).toString('utf8')
     let model = ''
     try { model = (JSON.parse(raw) as Record<string, unknown>)['model'] as string ?? '' } catch { model = '' }
@@ -127,6 +129,7 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
     // actually lists this model; a fallback to the cached roster keeps a
     // transient directory failure from turning into a 4001 upstream.
     const directory = await models().catch(() => cachedModels)
+    if (watcher.signal.aborted) return
     let functions = functionMapOf(directory)
     if (functions.size === 0) functions = functionMapOf(cachedModels)
     if (functions.size === 0) {
@@ -144,21 +147,16 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
 
     let credential: TraeCredential
     try {
-      credential = await firstCredential()
+      credential = await firstCredential('chat')
     } catch (error: unknown) {
       writeOpenAIError(res, 503, 'upstream_unavailable', String(error instanceof Error ? error.message : error))
       return
     }
+    if (watcher.signal.aborted) return
     // The level the client picked is translated into Trae's own spelling from
     // what this model advertises; a level it does not advertise is left out
     // rather than sent as a spelling SOLO would ignore.
     const capabilities = capabilityMapOf(directory)
-    const watcher = new AbortController()
-    // A cancelled turn keeps reading from the upstream, and the credits it
-    // spends produce output nobody receives; the caller hanging up is the only
-    // signal there is that it no longer wants them. Without this the stream runs
-    // to its own ceiling after the client is gone.
-    res.on('close', () => watcher.abort())
     const result = await clientFor(credential).chatStream(
       raw,
       watcher.signal,
@@ -174,7 +172,16 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
       return
     }
 
-    const relayed = await openTraeResponse(result.response, model)
+    // A relay failure ends the stream in a shape the client can finish on, so
+    // it never surfaces as a stream error - this is what keeps it in the log. A
+    // caller hang-up is consumed by the relay's own cancel and never arrives
+    // here, which is the half that matters: one warning per cancelled turn
+    // buried every failure worth reading.
+    const relayed = await openTraeResponse(result.response, model, {
+      onFailure: (error: unknown) => {
+        logger?.warn?.('pi-desktop-wtq-pool: trae relay stream failed mid-flight', error)
+      },
+    })
     if (relayed.status !== 200) {
       // A failure that arrived before any output: answer it as a real status
       // instead of a stream the client would read as an empty turn.
@@ -193,26 +200,26 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
       'X-Accel-Buffering': 'no',
     })
     const body = Readable.fromWeb(relayed.body as Parameters<typeof Readable.fromWeb>[0])
+    // Transport-level only: a relay failure arrives through `onFailure` above,
+    // so anything reaching here is the socket itself. An `AbortError` is this
+    // gateway's own `res.on('close')` reaching the relay - the caller stopped
+    // waiting, which is the intended path, not a Trae failure, and one warning
+    // per cancelled turn buried everything worth reading. Every other error is
+    // logged: the failures that matter arrive after the response headers, where
+    // no client-side signal is involved and the old caller-signal gate silenced
+    // them entirely.
     body.on('error', (error: unknown) => {
-      logger?.warn?.('pi-desktop-xdpool: trae relay stream failed mid-flight', error)
+      const aborted = watcher.signal.aborted || (error instanceof Error && error.name === 'AbortError')
+      if (!aborted) {
+        logger?.warn?.('pi-desktop-wtq-pool: trae relay stream failed mid-flight', error)
+      }
       if (res.writable) res.end()
     })
     body.pipe(res)
   }
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (!hostIsLoopback(req.headers.host)) {
-      writeOpenAIError(res, 403, 'host_not_allowed', 'Host header must name the loopback interface')
-      return
-    }
-    if (!originIsLoopback(req.headers.origin)) {
-      writeOpenAIError(res, 403, 'origin_not_allowed', 'Origin must be a loopback origin')
-      return
-    }
-    if (!bearerAccepted(req)) {
-      writeOpenAIError(res, 401, 'unauthorized', 'missing or invalid Authorization bearer')
-      return
-    }
+    if (!guardsPass(req, res)) return
     const url = req.url ?? '/'
     if (req.method === 'GET' && (url === '/healthz' || url === '/healthz/')) {
       const credentials = await options.credentials().catch(() => [])
@@ -232,7 +239,7 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
           writeOpenAIError(res, 503, 'upstream_unavailable', String(error instanceof Error ? error.message : error))
           return
         }
-        logger?.warn?.('pi-desktop-xdpool: trae directory refresh failed; serving the cached roster')
+        logger?.warn?.('pi-desktop-wtq-pool: trae directory refresh failed; serving the cached roster')
       }
       const ids = options.listedIds?.()
       const listed = ids === undefined ? served : listedModels(served, ids)
@@ -262,7 +269,7 @@ export function createTraeGateway(options: TraeGatewayOptions): TraeGateway {
   // down. An unhandled 'error' on the server would take the plugin's process
   // with it.
   server.on('error', (error: unknown) => {
-    logger?.warn?.('pi-desktop-xdpool: trae gateway server error', error)
+    logger?.warn?.('pi-desktop-wtq-pool: trae gateway server error', error)
   })
 
   const port = (): number => {

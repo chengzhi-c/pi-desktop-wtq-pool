@@ -676,6 +676,7 @@ export class TraeSoloUpstreamClient {
       let list: unknown[]
       try {
         const response = await this.fetchImpl(traeEndpoint(base, TRAE_SOLO_MODELS_PATH), {
+          redirect: 'error',
           method: 'POST',
           headers,
           body: JSON.stringify({
@@ -728,6 +729,7 @@ export class TraeSoloUpstreamClient {
       const response = await this.fetchImpl(
         `${REGION_GATEWAYS[region].remote}/models?functions=${TRAE_DIRECTORY_FUNCTIONS[region].join(',')}`,
         {
+          redirect: 'error',
           headers: {
             'Authorization': `Cloud-IDE-JWT ${credential.accessToken}`,
             'Content-Type': 'application/json',
@@ -757,6 +759,7 @@ export class TraeSoloUpstreamClient {
     const [credential, identity] = await Promise.all([this.options.credential(), this.options.identity()])
     if (traeRegionOfCredential(credential) !== 'cn') throw new Error('Trae usage exists on CN only')
     const response = await this.fetchImpl(traeEndpoint(REGION_GATEWAYS.cn.pay, TRAE_USAGE_PATH), {
+      redirect: 'error',
       method: 'POST',
       headers: traeCheckinHeaders(credential, identity),
       body: JSON.stringify({ require_usage: true }),
@@ -780,6 +783,7 @@ export class TraeSoloUpstreamClient {
     const region = traeRegionOfCredential(credential)
     if (region !== 'ai') throw new Error('Trae pay status exists on the international region only')
     const response = await this.fetchImpl(traeEndpoint(this.options.baseUrl ?? REGION_GATEWAYS[region].pay, TRAE_PAY_STATUS_PATH), {
+      redirect: 'error',
       method: 'POST',
       headers: traeCheckinHeaders(credential, identity, region),
       body: '{}',
@@ -804,6 +808,7 @@ export class TraeSoloUpstreamClient {
     const [credential, identity] = await Promise.all([this.options.credential(), this.options.identity()])
     if (traeRegionOfCredential(credential) !== 'cn') throw new Error('Trae check-in exists on CN only')
     const response = await this.fetchImpl(traeEndpoint(REGION_GATEWAYS.cn.pay, path), {
+      redirect: 'error',
       method: 'POST',
       headers: traeCheckinHeaders(credential, identity),
       body: '{}',
@@ -827,6 +832,7 @@ export class TraeSoloUpstreamClient {
     let response: Response
     try {
       response = await this.fetchImpl(traeEndpoint(base, TRAE_SOLO_CHAT_PATH), {
+        redirect: 'error',
         method: 'POST', headers, body: prepared,
         signal: signal === undefined ? AbortSignal.timeout(120_000) : AbortSignal.any([signal, AbortSignal.timeout(120_000)]),
       })
@@ -834,7 +840,13 @@ export class TraeSoloUpstreamClient {
       return { ok: false, status: 0, kind: 'server', message: `transport error: ${String(error)}` }
     }
     if (response.ok) return { ok: true, response }
-    const text = (await response.text()).slice(0, 1024)
+    // Guarded like every sibling body read: a non-2xx whose connection dies
+    // mid-body (a proxy cutting a 429, a gateway reset) rejects this, and the
+    // rejection escaped `chatStream` entirely - the client saw a plugin-level
+    // 500 with `TypeError: terminated` instead of the upstream's own status and
+    // message, which are exactly what the failover needs to choose another
+    // account.
+    const text = (await response.text().catch(() => '')).slice(0, 1024)
     return { ok: false, status: response.status, kind: classifyTraeUpstreamError(response.status), message: text || `Trae SOLO returned HTTP ${response.status}` }
   }
 }

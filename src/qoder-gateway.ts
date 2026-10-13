@@ -7,12 +7,12 @@
  * Everything the gateway needs from the outside is injected (credentials,
  * `fetchImpl`), so the whole path can be exercised offline.
  *
- * @module pi-desktop-xdpool/qoder-gateway
+ * @module pi-desktop-wtq-pool/qoder-gateway
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
-import { answerRequest, bearerAccepted, hostIsLoopback, isJsonContentType, listedModels, originIsLoopback, readRequestBody, writeJson, writeOpenAIError } from './loopback'
+import { answerRequest, guardsPass, isJsonContentType, listedModels, readRequestBody, writeJson, writeOpenAIError } from './loopback'
 import type { QoderRegion } from './qoder-discovery'
 import type { QoderChatModel, QoderClientCredential } from './qoder-client'
 import { QoderUpstreamClient } from './qoder-client'
@@ -26,8 +26,8 @@ export interface QoderGatewayLogger {
 
 export interface QoderGatewayOptions {
   region: QoderRegion
-  /** Sign-ins found on this machine; the first usable one answers requests. */
-  credentials(): Promise<QoderClientCredential[]>
+  /** Sign-ins found on this machine. `'chat'` is a turn that should advance rotation; every other read must not. */
+  credentials(purpose?: 'chat'): Promise<QoderClientCredential[]>
   /** Injected so the whole path runs offline in checks. */
   fetchImpl?: typeof fetch
   /** Preferred loopback port; 0 asks the OS for any free one. */
@@ -54,8 +54,8 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
   let catalogAt = 0
   let catalogInFlight: Promise<QoderChatModel[]> | undefined
 
-  async function firstCredential(): Promise<QoderClientCredential> {
-    const credentials = await options.credentials()
+  async function firstCredential(purpose?: 'chat'): Promise<QoderClientCredential> {
+    const credentials = await options.credentials(purpose)
     const usable = credentials.find(credential => credential.token !== '')
     if (usable === undefined) throw new Error('no Qoder sign-in found on this machine')
     return usable
@@ -93,6 +93,8 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
       writeOpenAIError(res, 415, 'unsupported_media_type', 'Content-Type must be application/json')
       return
     }
+    const watcher = new AbortController()
+    res.on('close', () => watcher.abort())
     const raw = (await readRequestBody(req)).toString('utf8')
     let model = ''
     try { model = (JSON.parse(raw) as Record<string, unknown>)['model'] as string ?? '' } catch { model = '' }
@@ -113,6 +115,7 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
       reason = 'Qoder model directory could not be read: ' + String(error instanceof Error ? error.message : error)
       return cachedModels
     })
+    if (watcher.signal.aborted) return
     if (roster.length === 0) roster = cachedModels
     if (roster.length === 0) {
       writeOpenAIError(res, 503, 'upstream_unavailable', reason)
@@ -125,18 +128,14 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
 
     let credential: QoderClientCredential
     try {
-      credential = await firstCredential()
+      credential = await firstCredential('chat')
     } catch (error: unknown) {
       writeOpenAIError(res, 503, 'upstream_unavailable', String(error instanceof Error ? error.message : error))
       return
     }
+    if (watcher.signal.aborted) return
     const directory = roster.find(entry => entry.id === model)
     const call = qoderRequestBody(raw, model, directory)
-    // Cut the stream when the caller stops waiting. A cancelled turn that keeps
-    // reading from the upstream spends credits nobody receives, and the client
-    // hanging up is the only signal there is that it no longer wants them.
-    const watcher = new AbortController()
-    res.on('close', () => watcher.abort())
     const result = await clientFor(credential).chatStream(call.body, call.model, {
       ...call.options,
       extraHeaders: {
@@ -154,7 +153,16 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
       return
     }
 
-    const relayed = await openQoderResponse(result.response, model)
+    // The relay ends a failed stream in a shape the client can finish on, so
+    // the failure never surfaces as a stream error - `onFailure` is what keeps
+    // it in the log. A caller hang-up is consumed by the relay's own cancel and
+    // never reaches this, which is the half of the contract that matters: one
+    // warning per cancelled turn buried everything else.
+    const relayed = await openQoderResponse(result.response, model, {
+      onFailure: (error: unknown) => {
+        logger?.warn?.('pi-desktop-wtq-pool: qoder relay stream failed mid-flight', error)
+      },
+    })
     if (relayed.status !== 200) {
       // A failure that arrived before any output: answer it as a real status
       // instead of a stream the client would read as an empty turn.
@@ -176,26 +184,26 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
       'X-Accel-Buffering': 'no',
     })
     const body = Readable.fromWeb(relayed.body as Parameters<typeof Readable.fromWeb>[0])
+    // Transport-level only: a relay failure arrives through `onFailure` above,
+    // so anything reaching here is the socket itself. An `AbortError` is this
+    // gateway's own `res.on('close')` reaching the relay - the caller stopped
+    // waiting, which is the intended path, not a Qoder failure, and one warning
+    // per cancelled turn buried everything worth reading. Every other error is
+    // logged: the failures that matter arrive after the response headers, where
+    // no client-side signal is involved and the old caller-signal gate silenced
+    // them entirely.
     body.on('error', (error: unknown) => {
-      logger?.warn?.('pi-desktop-xdpool: qoder relay stream failed mid-flight', error)
+      const aborted = watcher.signal.aborted || (error instanceof Error && error.name === 'AbortError')
+      if (!aborted) {
+        logger?.warn?.('pi-desktop-wtq-pool: qoder relay stream failed mid-flight', error)
+      }
       if (res.writable) res.end()
     })
     body.pipe(res)
   }
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (!hostIsLoopback(req.headers.host)) {
-      writeOpenAIError(res, 403, 'host_not_allowed', 'Host header must name the loopback interface')
-      return
-    }
-    if (!originIsLoopback(req.headers.origin)) {
-      writeOpenAIError(res, 403, 'origin_not_allowed', 'Origin must be a loopback origin')
-      return
-    }
-    if (!bearerAccepted(req)) {
-      writeOpenAIError(res, 401, 'unauthorized', 'missing or invalid Authorization bearer')
-      return
-    }
+    if (!guardsPass(req, res)) return
     const url = req.url ?? '/'
     if (req.method === 'GET' && (url === '/healthz' || url === '/healthz/')) {
       const credentials = await options.credentials().catch(() => [])
@@ -215,7 +223,7 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
           writeOpenAIError(res, 503, 'upstream_unavailable', String(error instanceof Error ? error.message : error))
           return
         }
-        logger?.warn?.('pi-desktop-xdpool: qoder directory refresh failed; serving the cached roster')
+        logger?.warn?.('pi-desktop-wtq-pool: qoder directory refresh failed; serving the cached roster')
       }
       const ids = options.listedIds?.()
       const listed = ids === undefined ? served : listedModels(served, ids)
@@ -245,7 +253,7 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
   // down. An unhandled 'error' on the server would take the plugin's process
   // with it.
   server.on('error', (error: unknown) => {
-    logger?.warn?.('pi-desktop-xdpool: qoder gateway server error', error)
+    logger?.warn?.('pi-desktop-wtq-pool: qoder gateway server error', error)
   })
 
   const port = (): number => {

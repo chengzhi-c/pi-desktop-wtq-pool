@@ -50,7 +50,14 @@ export function unwrapFailure(frame: unknown): { code: string; detail: string } 
     node = next
     descended = true
   }
-  if (descended && isPlainObject(node) && typeof node['message'] !== 'string') {
+  // The walked-into object is a better description than the string that led
+  // to it only when no message was found on the way down. Replacing a message
+  // that is already there throws away the one line the user can act on: a
+  // "Login expired" frame carrying a `details` object came back as
+  // `{"reqId":1}`, and because that text no longer said what happened, the
+  // sign-in-expired branch downstream stopped matching and the turn answered
+  // 502 instead of 401 - so the client never re-prompted for a login.
+  if (descended && detail === '' && isPlainObject(node)) {
     detail = JSON.stringify(node)
   }
   return { code, detail }
@@ -123,6 +130,8 @@ export class QoderFrameDecoder {
   private buffer = ''
   private done = false
 
+  /** Whether the wire has supplied its terminal marker, independent of TCP EOF. */
+  get ended(): boolean { return this.done }
   /** Payloads seen so far; `[DONE]` ends the stream and yields nothing. */
   push(chunk: string): string[] {
     if (this.done) return []

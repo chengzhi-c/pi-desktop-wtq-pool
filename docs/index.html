@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>pi-desktop-xdpool · 预览</title>
+  <title>WTQ账号池 · 预览</title>
   <!--
     Preview page for the plugin panel.
 
@@ -18,17 +18,6 @@
        plugin. Same design language: borders and spacing carry the hierarchy,
        no shadows. */
     :root {
-      color-scheme: dark;
-      --bg: #101216;
-      --panel: #16181d;
-      --card: #1c1f25;
-      --fg: #e8eaee;
-      --muted: #9aa1ad;
-      --border: #2c3038;
-      --accent: #2dd4bf;
-      --on-accent: #0c3d37;
-    }
-    :root[data-base="light"] {
       color-scheme: light;
       --bg: #f4f5f7;
       --panel: #ffffff;
@@ -36,8 +25,19 @@
       --fg: #1b1d21;
       --muted: #6b7280;
       --border: #e3e5ea;
-      --accent: #0f766e;
+      --accent: #2e706a;
       --on-accent: #ffffff;
+    }
+    :root[data-base="dark"] {
+      color-scheme: dark;
+      --bg: #101216;
+      --panel: #16181d;
+      --card: #1c1f25;
+      --fg: #e8eaee;
+      --muted: #9aa1ad;
+      --border: #2c3038;
+      --accent: #67c1b8;
+      --on-accent: #163633;
     }
     * { box-sizing: border-box; }
     body {
@@ -79,7 +79,6 @@
     .seg button + button { border-left: 1px solid var(--border); }
     .seg button:hover { color: var(--fg); }
     .seg button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
-    .toolbar .spacer { flex: 1 1 auto; }
 
     .stage {
       border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
@@ -105,48 +104,33 @@
 <body>
   <div class="wrap">
     <header class="top">
-      <h1>pi-desktop-xdpool</h1>
-      <span class="tag">v1.0.0</span>
+      <h1>WTQ账号池</h1>
       <span class="tag">MIT</span>
       <span class="spacer"></span>
       <nav class="links">
-        <a href="https://github.com/chengzhi-c/pi-desktop-xdpool#readme">README</a>
-        <a href="https://github.com/chengzhi-c/pi-desktop-xdpool">GitHub</a>
+        <a href="https://github.com/chengzhi-c/pi-desktop-wtq-pool#readme">README</a>
+        <a href="https://github.com/chengzhi-c/pi-desktop-wtq-pool">GitHub</a>
       </nav>
     </header>
 
     <div class="lede">
-      <p>把本机 WorkBuddy、Trae、Qoder 的桌面登录接进 PI-Desktop。WorkBuddy 被限流时自动换号，三家各有开关。</p>
+      <p>把本机 WorkBuddy、Trae、Qoder 的桌面登录接入 PI-Desktop。WorkBuddy 支持限流换号，Trae、Qoder 按请求分发。</p>
       <p class="muted">
-        下面即为发布版的设置面板，直接加载同一个 <code>renderer/</code>，另接一个演示用的宿主桩。
-        可切换标签页与来源、调整模型参数、切换主题。
+        下面加载实际面板代码，使用虚构演示数据，支持来源切换、模型设置和主题预览，不读取本机账号或令牌。
       </p>
     </div>
 
     <div class="toolbar">
-      <span class="label">来源</span>
-      <div class="seg" id="segSource">
-        <button type="button" data-source="workbuddy" aria-pressed="true">WorkBuddy</button>
-        <button type="button" data-source="trae" aria-pressed="false">Trae</button>
-        <button type="button" data-source="qoder" aria-pressed="false">Qoder</button>
-      </div>
-      <span class="label">视图</span>
-      <div class="seg" id="segView">
-        <button type="button" data-tab="pool" aria-pressed="true">账号池</button>
-        <button type="button" data-tab="models" aria-pressed="false">模型</button>
-        <button type="button" data-tab="check" aria-pressed="false">连接检查</button>
-      </div>
-      <span class="spacer"></span>
       <span class="label">主题</span>
       <div class="seg" id="segBase">
-        <button type="button" data-base="dark" aria-pressed="true">暗色</button>
-        <button type="button" data-base="light" aria-pressed="false">亮色</button>
+        <button type="button" data-base="light" aria-pressed="true">亮色</button>
+        <button type="button" data-base="dark" aria-pressed="false">暗色</button>
       </div>
     </div>
 
     <div class="stage">
-      <div class="caption"><span class="dot"></span>发布版面板 · 演示数据</div>
-      <iframe id="panel" src="./preview-panel.html" title="pi-desktop-xdpool 面板预览"></iframe>
+      <div class="caption"><span class="dot"></span>实际面板代码 · 演示数据</div>
+      <iframe id="panel" src="./preview-panel.html" title="WTQ Pool 面板预览"></iframe>
     </div>
 
     <footer class="foot">
@@ -160,9 +144,7 @@
       "use strict";
       var frame = document.getElementById("panel");
       var root = document.documentElement;
-      var source = "workbuddy";
-      var view = "pool";
-      var base = "dark";
+      var base = "light";
 
       function press(segId, attr, value) {
         var buttons = document.getElementById(segId).querySelectorAll("button");
@@ -171,15 +153,9 @@
         }
       }
 
-      /* The iframe is same-origin, so the wrapper drives the panel's own tab
-         buttons. */
+      /* The panel ships its own source and view tabs, so the wrapper only has to
+         hand it the theme. The frame is same-origin, hence the direct call. */
       function apply() {
-        var doc = frame.contentDocument;
-        if (!doc) return;
-        var tab = doc.querySelector('#sourceTabs .tab[data-source="' + source + '"]');
-        if (tab) tab.click();
-        var sub = doc.querySelector('#viewTabs .subtab[data-tab="' + view + '"]');
-        if (sub) sub.click();
         if (frame.contentWindow.__previewSetAppearance) {
           frame.contentWindow.__previewSetAppearance(base);
         }
@@ -194,9 +170,6 @@
           apply();
         });
       }
-
-      onSegment("segSource", "data-source", function (v) { source = v; });
-      onSegment("segView", "data-tab", function (v) { view = v; });
       onSegment("segBase", "data-base", function (v) { base = v; root.dataset.base = v; });
 
       root.dataset.base = base;

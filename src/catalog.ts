@@ -5,7 +5,7 @@
  * upstream call; when the live catalog arrives it replaces the fallback and the
  * provider rebuilds its model list from `visible()`.
  *
- * @module pi-desktop-xdpool/catalog
+ * @module pi-desktop-wtq-pool/catalog
  */
 
 import type { WorkBuddyUpstreamModel } from './upstream'
@@ -38,12 +38,6 @@ export interface WorkBuddyModelInfo {
   /** The level a new session opens on, when it is one of the offered levels. */
   defaultThinkingLevel?: string
   supportsImages: boolean
-}
-
-/** The label the picker shows: the user's alias when set, else the catalog name. */
-export function displayName(model: Pick<WorkBuddyModelInfo, 'name' | 'alias'>): string {
-  const alias = model.alias?.trim()
-  return alias === undefined || alias === '' ? model.name : alias
 }
 
 /** Static fallback used before the first live catalog fetch. */

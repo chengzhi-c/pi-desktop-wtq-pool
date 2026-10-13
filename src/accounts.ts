@@ -7,13 +7,13 @@
  * account is keyed by its billing identity (`uin`, falling back to `uid`), so
  * re-logging the same account refreshes in place instead of creating a duplicate.
  *
- * @module pi-desktop-xdpool/accounts
+ * @module pi-desktop-wtq-pool/accounts
  */
 
 import { createHash } from 'node:crypto'
 import { readFile, readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { basename, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { regionOf, type WorkBuddyRegion } from './upstream'
 import { encryptedFieldOpener, isEncryptedFieldWrapper } from './at-rest'
 
@@ -119,10 +119,46 @@ export function defaultDesktopAuthDirs(
   return []
 }
 
-/** Normalize an expiry that may arrive in seconds or milliseconds. */
+/**
+ * Any expiry past this is unusable input rather than a date: 2100-01-01.
+ *
+ * A saved sign-in whose `expiresAt` is a hand-edited or upstream-garbled
+ * sentinel (1e15, 1e16) otherwise reads as a token that never expires, so the
+ * pool skips its refresh forever and serves a dead token as live. Past
+ * 8.64e15 `new Date(…).toISOString()` also throws, which failed the whole
+ * panel document rather than the one row.
+ */
+const MAX_EXPIRY_MS = 4_102_444_800_000
+/**
+ * Normalize an expiry that may arrive in seconds or milliseconds.
+ *
+ * Anything past {@link MAX_EXPIRY_MS} is unusable input, not a date, so it
+ * reads as "no expiry" (0) - the same answer a sign-in without an `expiresAt`
+ * gives. The caller must not treat that as "fresh": see {@link refreshExpiryMs}.
+ */
 function expiryToMs(value: number): number {
-  if (value <= 0) return 0
-  return value > 1e12 ? value : value * 1000
+  if (!Number.isFinite(value) || value <= 0) return 0
+  const ms = value > 1e12 ? value : value * 1000
+  return ms > MAX_EXPIRY_MS ? 0 : ms
+}
+/**
+ * Absolute expiry for a refreshed token.
+ *
+ * `expiresIn` comes from the vendor's own answer, so it is bounded here rather
+ * than trusted: a garbled one (Infinity, 1e300) would otherwise store a
+ * timestamp past `Date`'s range, and the panel's `toISOString()` for that row
+ * then threw, failing the whole document rather than the one field. A value
+ * this function refuses falls back to the assumed lifetime, not to 0: 0 means
+ * "never expires", which would leave a token that really was not fresh being
+ * served as if it were.
+ */
+function refreshExpiryMs(expiresInSec: number | undefined): number {
+  const assumed = () => Date.now() + ASSUMED_TOKEN_LIFETIME_MS
+  if (typeof expiresInSec !== 'number' || !Number.isFinite(expiresInSec) || expiresInSec <= 0) {
+    return assumed()
+  }
+  const at = expiryToMs(Date.now() + expiresInSec * 1000)
+  return at === 0 ? assumed() : at
 }
 
 function optionalString(value: unknown): string | undefined {
@@ -161,8 +197,7 @@ export function parseWorkBuddyAuth(
     identity = document
   }
 
-  const accessField = decryptableString(auth['accessToken'], decrypt)
-  const accessToken = accessField.value
+  const accessToken = decryptableString(auth['accessToken'], decrypt)
   if (accessToken === '') return undefined
 
   const refreshExpiresAtMs =
@@ -174,11 +209,11 @@ export function parseWorkBuddyAuth(
   const lastRefreshAtMs = typeof auth['lastRefreshTime'] === 'number'
     ? expiryToMs(auth['lastRefreshTime'])
     : undefined
-  const nickname = optionalString(decryptableString(identity['nickname'], decrypt).value)
+  const nickname = optionalString(decryptableString(identity['nickname'], decrypt))
 
   return {
     accessToken,
-    refreshToken: decryptableString(auth['refreshToken'], decrypt).value,
+    refreshToken: decryptableString(auth['refreshToken'], decrypt),
     expiresAtMs: typeof auth['expiresAt'] === 'number' ? expiryToMs(auth['expiresAt']) : 0,
     ...refreshExpiresAtMs === undefined ? {} : { refreshExpiresAtMs },
     ...lastRefreshAtMs === undefined ? {} : { lastRefreshAtMs },
@@ -202,17 +237,14 @@ export function parseWorkBuddyAuth(
 function decryptableString(
   value: unknown,
   decrypt?: (value: unknown) => string,
-): { value: string; encrypted: boolean; failed: boolean } {
-  if (typeof value === 'string') return { value, encrypted: false, failed: false }
-  if (isEncryptedFieldWrapper(value)) {
-    if (decrypt === undefined) return { value: '', encrypted: true, failed: true }
+): string {
+  if (typeof value === 'string') return value
+  if (isEncryptedFieldWrapper(value) && decrypt !== undefined) {
     try {
-      return { value: decrypt(value), encrypted: true, failed: false }
-    } catch {
-      return { value: '', encrypted: true, failed: true }
-    }
+      return decrypt(value)
+    } catch { /* an unavailable key leaves this field unreadable */ }
   }
-  return { value: '', encrypted: false, failed: false }
+  return ''
 }
 
 /**
@@ -298,12 +330,13 @@ function disambiguateLabels(accounts: readonly WorkBuddyAccount[]): void {
  * Filenames are plain strings, and the ordering here is only a first pass —
  * `isFresher` makes the real call once each file has been parsed.
  */
-async function authFilesIn(dir: string): Promise<string[]> {
+async function authFilesIn(dir: string): Promise<string[] | undefined> {
   let entries: string[]
   try {
     entries = await readdir(dir)
   } catch {
-    return []
+    // Unreadable is not "empty": the caller keeps accounts it already has from here.
+    return undefined
   }
   const files = entries.filter(name => name.endsWith('.info'))
   // Newest snapshot first so the freshest token wins when uids collide.
@@ -323,6 +356,8 @@ async function readCredential(path: string): Promise<WorkBuddyCredential | undef
 }
 
 
+/** Refresh a credential this long before its expiry, so a request never rides one that dies mid-flight. */
+const REFRESH_MARGIN_MS = 5 * 60 * 1000
 /**
  * Longest one penalize may cool an account: same 2h ceiling as the parse
  * layer, so a raw caller-supplied timestamp cannot sleep a pool all day.
@@ -331,7 +366,7 @@ const PENALIZE_CAP_MS = 2 * 60 * 60 * 1000
 /**
  * Lifetime assumed for a refreshed token whose answer carries no `expiresIn`.
  *
- * It must exceed {@link WorkBuddyAccountPool.refreshMarginMs}, or the refreshed
+ * It must exceed {@link REFRESH_MARGIN_MS}, or the refreshed
  * credential would read as already-expiring and every request would refresh
  * again. An hour is comfortably past the five-minute margin and far short of the
  * two-hour cap, so a token with a real lifetime always replaces it in time.
@@ -363,7 +398,7 @@ export function candidateAuthDirs(env: NodeJS.ProcessEnv = process.env): string[
     // The env var may name the file or its directory; accept both.
     dirs.push(override.toLowerCase().endsWith('.info') ? resolve(override, '..') : override)
   }
-  dirs.push(...defaultDesktopAuthDirs(process.env['DSH_TEST_PLATFORM'] as NodeJS.Platform | undefined))
+  dirs.push(...defaultDesktopAuthDirs())
   return dirs
 }
 
@@ -388,10 +423,8 @@ export interface AccountPoolOptions {
   authDirs?: readonly string[]
   /** How long a rate-limited account stays out of rotation. */
   cooldownMs?: number
-  /** Upstream client used to refresh near-expiry tokens. */
+  /** Upstream client consulted to refresh near-expiry tokens. */
   client?: TokenRefresher
-  /** Refresh this long before actual expiry; default five minutes. */
-  refreshMarginMs?: number
   /**
    * How requests are spread across the pool.
    *
@@ -419,7 +452,6 @@ export class WorkBuddyAccountPool {
   private authDirs: readonly string[]
   private cooldownMs: number
   private readonly client: TokenRefresher | undefined
-  private readonly refreshMarginMs: number
   private accounts: WorkBuddyAccount[] = []
   private distribution: AccountDistribution
   /**
@@ -471,7 +503,6 @@ export class WorkBuddyAccountPool {
     this.authDirs = options.authDirs ?? candidateAuthDirs()
     this.cooldownMs = options.cooldownMs ?? 60_000
     this.client = options.client
-    this.refreshMarginMs = options.refreshMarginMs ?? 5 * 60 * 1000
     // Priority is the default: users pool their own accounts to spend one
     // before touching the next, not to split every request evenly.
     this.distribution = options.distribution ?? 'priority'
@@ -562,8 +593,15 @@ export class WorkBuddyAccountPool {
   /** Rescan the auth directories and merge newly discovered accounts. */
   async scan(): Promise<WorkBuddyAccount[]> {
     const found: WorkBuddyCredential[] = []
+    // Directories that answered. An account is dropped only when its own directory
+    // answered and no longer contains it — a directory that could not be read
+    // keeps the accounts already held, cooldown included.
+    const readableDirs = new Set<string>()
     for (const dir of this.authDirs) {
-      for (const file of await authFilesIn(dir)) {
+      const files = await authFilesIn(dir)
+      if (files === undefined) continue
+      readableDirs.add(resolve(dir))
+      for (const file of files) {
         const credential = await readCredential(file)
         if (credential !== undefined) found.push(credential)
       }
@@ -593,6 +631,12 @@ export class WorkBuddyAccountPool {
       // over here: every label is rebuilt from the credential in force below,
       // which is also what keeps the prefix from stacking up on a rescan.
       if (isFresher(credential, existing.credential)) existing.credential = credential
+    }
+
+    const foundIds = new Set(found.map(credential => workbuddyAccountId(credential)))
+    for (const [id, account] of byId) {
+      const home = resolve(dirname(account.credential.sourcePath))
+      if (readableDirs.has(home) && !foundIds.has(id)) byId.delete(id)
     }
 
     // A stable, predictable order is what makes "prefer the first account"
@@ -748,7 +792,7 @@ export class WorkBuddyAccountPool {
   private async ensureFresh(account: WorkBuddyAccount, forced = false): Promise<void> {
     if (this.client === undefined) return
     const credential = account.credential
-    const expiring = forced || credential.expiresAtMs <= 0 || credential.expiresAtMs <= Date.now() + this.refreshMarginMs
+    const expiring = forced || credential.expiresAtMs <= 0 || credential.expiresAtMs <= Date.now() + REFRESH_MARGIN_MS
     if (!expiring) return
     const existing = this.refreshInflight.get(account.id)
     if (existing !== undefined) {
@@ -759,7 +803,7 @@ export class WorkBuddyAccountPool {
       if (credential.refreshToken === '') {
         // Nothing to refresh with; only worth failing if already expired.
         if (credential.expiresAtMs > Date.now() + 30_000) return
-        this.logger?.warn(`pi-desktop-xdpool: ${account.label} token expired with no refresh token; sign in again`)
+        this.logger?.warn(`pi-desktop-wtq-pool: ${account.label} token expired with no refresh token; sign in again`)
         return
       }
       try {
@@ -776,17 +820,15 @@ export class WorkBuddyAccountPool {
           // `expiresAt` (0) permanently "expiring", which re-runs this whole
           // round trip on every single request. The assumed lifetime must clear
           // the margin above, or `ensureFresh` would still see it as expiring.
-          expiresAtMs: outcome.expiresInSec !== undefined
-            ? Date.now() + outcome.expiresInSec * 1000
-            : Date.now() + ASSUMED_TOKEN_LIFETIME_MS,
+          expiresAtMs: refreshExpiryMs(outcome.expiresInSec),
           ...outcome.domain === undefined || outcome.domain === '' ? {} : { domain: outcome.domain },
         }
-        this.logger?.info?.(`pi-desktop-xdpool: refreshed token for ${account.label}`)
+        this.logger?.info?.(`pi-desktop-wtq-pool: refreshed token for ${account.label}`)
       } catch (error: unknown) {
         if (credential.expiresAtMs > Date.now() + 30_000) {
-          this.logger?.warn?.(`pi-desktop-xdpool: token refresh failed but token still valid for ${account.label}`, error)
+          this.logger?.warn?.(`pi-desktop-wtq-pool: token refresh failed but token still valid for ${account.label}`, error)
         } else {
-          this.logger?.error?.(`pi-desktop-xdpool: token refresh failed and token expired for ${account.label}`, error)
+          this.logger?.error?.(`pi-desktop-wtq-pool: token refresh failed and token expired for ${account.label}`, error)
         }
       }
     })()
@@ -818,14 +860,14 @@ export class WorkBuddyAccountPool {
     if (modelId !== undefined && modelId !== '') {
       account.modelCooldowns[modelId] = Math.max(account.modelCooldowns[modelId] ?? 0, until)
       this.logger?.warn(
-        `pi-desktop-xdpool: ${account.label} rate-limited on model ${modelId}; ` +
+        `pi-desktop-wtq-pool: ${account.label} rate-limited on model ${modelId}; ` +
           `cooling that model until ${new Date(until).toISOString()}`,
       )
       return
     }
     account.cooldownUntilMs = Math.max(account.cooldownUntilMs, until)
     this.logger?.warn(
-      `pi-desktop-xdpool: account ${account.label} rate-limited; cooling until ${new Date(until).toISOString()}`,
+      `pi-desktop-wtq-pool: account ${account.label} rate-limited; cooling until ${new Date(until).toISOString()}`,
     )
   }
 

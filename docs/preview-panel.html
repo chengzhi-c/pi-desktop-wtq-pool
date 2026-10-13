@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>pi-desktop-xdpool panel preview</title>
+  <title>WTQ Pool panel preview</title>
   <style>
     /* PI-Desktop owns a 46px drag band above every panel and the panel offsets
        itself by that much. This frame has no host band, so the offset is zero -
@@ -24,12 +24,12 @@
     (function () {
       "use strict";
       var data = window.__previewData;
-      var appearance = { base: "dark", locale: "zh-CN" };
+      var appearance = { base: "light", locale: "zh-CN" };
       var handlers = {};
       function copy(value) { return JSON.parse(JSON.stringify(value)); }
 
       window.pluginBridge = {
-        invoke: function (channel) {
+        invoke: function (channel, payload) {
           if (channel === "xd.state") return Promise.resolve(copy(data.state));
           if (channel === "xd.doctor") return Promise.resolve(copy(data.doctor));
           if (channel === "app.getAppearance") {
@@ -42,6 +42,10 @@
             return Promise.resolve({ state: copy(data.state), claimed: 0 });
           }
           if (channel === "xd.copyReport") return Promise.resolve({ ok: true });
+          if (channel === "shell.openExternal") {
+            window.open(payload.url, "_blank", "noopener,noreferrer");
+            return Promise.resolve();
+          }
           // Every other channel is a write, and a write answers with the whole
           // status document - which is what the panel redraws from.
           return Promise.resolve(copy(data.state));

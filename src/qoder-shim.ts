@@ -9,6 +9,7 @@
 import { randomUUID } from 'node:crypto'
 import { QODER_EFFORT_ORDER, type QoderChatModel } from './qoder-client'
 import { QoderFrameDecoder, decodeQoderFrame, type QoderFrame } from './qoder-sse'
+import { redactSecrets } from './loopback'
 
 /** What the gateway must answer when Qoder refuses inside the stream. */
 export interface QoderFailure {
@@ -100,8 +101,14 @@ export function classifyQoderFailure(failure: QoderFailure): { status: number; k
   const code = failure.code.trim()
   const text = `${code} ${failure.message}`
   if (code === '110' || /daily.*(limit|quota)|quota.*daily|allowance.*spent/i.test(text)) {
-    const seconds = /"retryAfterSeconds"\s*:\s*(\d+)/.exec(failure.message)?.[1]
-    const retryAfter = seconds !== undefined ? Number(seconds) : 0
+    // The same reader the queue branches use, so a hint carried as a field is
+    // honoured as well as one embedded in the message text. Regexing the text
+    // alone dropped the top-level `retryAfterSeconds`, so a spent allowance
+    // answered with no `Retry-After` at all - the client then retried at once
+    // against the same exhausted quota instead of failing over.
+    const retryAfter = queueSeconds({
+      type: 'failure', code, detail: failure.message, retryAfterSeconds: failure.retryAfterSeconds ?? 0,
+    })
     return {
       status: 429,
       kind: 'hard_credit',
@@ -219,6 +226,14 @@ export interface QoderRelayOptions {
   /** Injected for reproducible chunk ids. */
   id?: string
   created?: number
+  /**
+   * Told about a failure that arrived after output had already started.
+   *
+   * The stream itself ends in a shape the client can finish on, so the error
+   * never reaches it as a stream error and would otherwise leave nothing
+   * behind at all. This is how the gateway still records it.
+   */
+  onFailure?: (error: unknown) => void
 }
 
 /**
@@ -243,7 +258,6 @@ export function bridgeQoderStream(
   const frames = new QoderFrameDecoder()
   let sawToolCalls = false
   let emittedFinishReason = false
-  let upstreamError: Error | undefined
   let usage: Record<string, unknown> | undefined
   const reader = source.getReader()
   let cancelled = false
@@ -269,8 +283,7 @@ export function bridgeQoderStream(
     if (decoded.type === 'unknown') return
     if (decoded.type === 'failure') {
       const { error } = classifyQoderFailure({ code: decoded.code, message: decoded.detail, retryAfterSeconds: decoded.retryAfterSeconds })
-      upstreamError = error
-      return
+      throw error
     }
     const inner = decoded.chunk as Record<string, unknown>
     const choices = inner['choices']
@@ -292,10 +305,6 @@ export function bridgeQoderStream(
         if (typeof finish === 'string' && finish !== '' && finish !== 'null') {
           if (!emittedFinishReason) {
             emittedFinishReason = true
-            if (upstreamError !== undefined) {
-              controller.error(upstreamError)
-              return
-            }
             controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : finish))
           }
         }
@@ -310,17 +319,15 @@ export function bridgeQoderStream(
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       try {
-        while (true) {
+        while (!cancelled) {
           const next = await reader.read()
+          if (cancelled) return
           if (next.done) break
           for (const payload of frames.push(decoder.decode(next.value, { stream: true }))) consume(payload, controller)
+          if (frames.ended) break
         }
         if (cancelled) return
         for (const payload of frames.finish()) consume(payload, controller)
-        if (upstreamError !== undefined) {
-          controller.error(upstreamError)
-          return
-        }
         // A clean EOF is a valid termination even without an explicit finish
         // chunk, and even when nothing was produced at all: the client still
         // needs a non-null finish_reason and a [DONE]. Trae and WorkBuddy close
@@ -333,9 +340,48 @@ export function bridgeQoderStream(
         }
         controller.enqueue(encoder.encode('data: [DONE]\n\n'))
         controller.close()
-      } catch (error) {
-        if (!cancelled) controller.error(error)
+      } catch (error: unknown) {
+        // A failure after output started cannot change the 200 the client
+        // already has, so the stream has to end the way a client can act on:
+        // an in-band error frame, the terminal finish chunk, then [DONE].
+        // Erroring the controller instead left the caller with a truncated
+        // body that had neither a `finish_reason` nor `[DONE]`, so every client
+        // keyed on either one waited out its own timeout on a turn that had
+        // already failed.
+        //
+        // A caller hang-up is the one case that stays an error: nobody is left
+        // to read the frames. It arrives as an AbortError BEFORE the stream's
+        // own `cancel` runs, so `cancelled` is still false at this point and
+        // the error itself is the only signal that this is not a real
+        // upstream failure - reported as one, it wrote a line per cancelled
+        // turn and buried the failures worth reading.
+        if (cancelled) controller.error(error)
+        else {
+          if (!(error instanceof Error && error.name === 'AbortError')) options.onFailure?.(error)
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            id,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            choices: [],
+            // Redacted here because this frame is the one place a stream error's
+            // text reaches the client without passing through `writeOpenAIError`.
+            error: { message: redactSecrets(error instanceof Error ? error.message : String(error)), type: 'upstream_error' },
+          })}\n\n`))
+          if (!emittedFinishReason) {
+            emittedFinishReason = true
+            controller.enqueue(chunk({}, sawToolCalls ? 'tool_calls' : 'stop'))
+          }
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+          controller.close()
+        }
       } finally {
+        // The reader is released here rather than in the catch: a stream that
+        // ran to EOF closes its controller instead of erroring, and that exit
+        // skips the catch entirely - so the cancel and the unlock only ever
+        // ran for a failed turn, and a normal one left the upstream reader
+        // locked and its source uncancelled.
+        await reader.cancel().catch(() => {})
         reader.releaseLock()
       }
     },
@@ -426,19 +472,28 @@ export async function openQoderResponse(
       } else if (decoded.type === 'failure') {
         failure ??= { code: decoded.code, message: decoded.detail, retryAfterSeconds: decoded.retryAfterSeconds }
       }
+      if (sawOutput || failure !== undefined) break
     }
   }
-  while (buffered.length < PEEK_MAX_CHUNKS && bufferedBytes < PEEK_MAX_BYTES) {
-    const next = await reader.read()
-    if (next.done) {
-      ended = true
-      inspect(frames.finish())
-      break
+  try {
+    while (buffered.length < PEEK_MAX_CHUNKS && bufferedBytes < PEEK_MAX_BYTES) {
+      const next = await reader.read()
+      if (next.done) {
+        ended = true
+        inspect(frames.finish())
+        break
+      }
+      buffered.push(next.value)
+      bufferedBytes += next.value.byteLength
+      inspect(frames.push(decoder.decode(next.value, { stream: true })))
+      if (sawOutput || failure !== undefined || frames.ended) break
     }
-    buffered.push(next.value)
-    bufferedBytes += next.value.byteLength
-    inspect(frames.push(decoder.decode(next.value, { stream: true })))
-    if (sawOutput || failure !== undefined) break
+  } catch (error: unknown) {
+    // An upstream that resets mid-peek rejects the read, and the decoder throws
+    // on an over-long line. Either way the reader has to be released, or the
+    // upstream socket stays open after the caller has already been answered.
+    await reader.cancel().catch(() => {})
+    throw error
   }
   // Nothing has been forwarded yet, so a failure found here can still become a
   // real status code. Once output has started, the stream is already committed.

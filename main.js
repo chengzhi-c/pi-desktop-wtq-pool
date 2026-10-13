@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * pi-desktop-xdpool - PI-Desktop plugin entry.
+ * pi-desktop-wtq-pool - PI-Desktop plugin entry.
  *
  * PI-Desktop port of `dsh-workbuddy-xdpool` (MIT). Same behaviour as the
  * original, rewritten against the PI-Desktop plugin host:
@@ -31,7 +31,6 @@ const { WorkBuddyAccountPool, candidateAuthDirs } = require("./lib/accounts");
 const {
   WorkBuddyCatalog,
   applyOverride,
-  displayName,
   hasOverride,
 } = require("./lib/catalog");
 const { createWorkBuddyShim } = require("./lib/shim");
@@ -47,7 +46,7 @@ const { QoderUpstreamClient, qoderClaimableCampaignIdOf, qoderCheckinStateFrom, 
 const { redactSecrets } = require("./lib/loopback");
 
 /** The ids this plugin used before it was renamed, newest first; only the migration reads them. */
-const PREVIOUS_PLUGIN_IDS = ["local.pi-desktop-xdpool", "local.pi-desktop-workbuddy", "local.pi-workbuddy-xdpool"];
+const PREVIOUS_PLUGIN_IDS = ["io.github.chengzhi-c.pi-desktop-xdpool", "local.pi-desktop-xdpool", "local.pi-desktop-workbuddy", "local.pi-workbuddy-xdpool"];
 // Read from the package rather than written here, so the fallback below can
 // never drift a few versions behind the manifest it stands in for.
 const PLUGIN_VERSION = require("./package.json").version;
@@ -65,8 +64,8 @@ const COMMAND_CHECKIN = "xdpool.checkin";
 const REGIONS = ["cn", "global"];
 const PROVIDER_ID_BY_REGION = { cn: "xdpool-cn", global: "xdpool-global" };
 const PROVIDER_NAME_BY_REGION = {
-  cn: "pi-desktop-xdpool（国内版）",
-  global: "pi-desktop-xdpool（国际版）",
+  cn: "WTQ Pool (CN)",
+  global: "WTQ Pool (Global)",
 };
 /** The settings key each source's switch is stored under. */
 const SOURCE_SETTING_KEYS = {
@@ -74,9 +73,21 @@ const SOURCE_SETTING_KEYS = {
   trae: "sourceTrae",
   qoder: "sourceQoder",
 };
+/**
+ * The settings key behind one source name, or undefined for anything else.
+ *
+ * The own-property test is load-bearing: a bare `SOURCE_SETTING_KEYS[source]`
+ * answers for `toString`, `constructor` and `__proto__` from the prototype, so a
+ * crafted `source` would save under a junk key instead of being refused.
+ */
+function sourceSettingKey(source) {
+  return typeof source === "string" && Object.hasOwn(SOURCE_SETTING_KEYS, source)
+    ? SOURCE_SETTING_KEYS[source]
+    : undefined;
+}
 /** Whether one source is switched on in settings. Unknown sources stay off, so a typo can never enable a gateway. */
 function sourceEnabled(source) {
-  const key = SOURCE_SETTING_KEYS[source];
+  const key = sourceSettingKey(source);
   return key !== undefined && settings.enabled !== false && settings[key] !== false;
 }
 /**
@@ -126,8 +137,8 @@ const REGION_PORTS = { cn: 41831, global: 41841 };
 const TRAE_REGIONS = ["cn", "ai"];
 const TRAE_PROVIDER_ID_BY_REGION = { cn: "xdpool-trae-cn", ai: "xdpool-trae-ai" };
 const TRAE_PROVIDER_NAME_BY_REGION = {
-  cn: "pi-desktop-xdpool Trae（国内）",
-  ai: "pi-desktop-xdpool Trae（国际）",
+  cn: "WTQ Pool Trae (CN)",
+  ai: "WTQ Pool Trae (Global)",
 };
 /** Fixed ports, clear of 41811/41812, 41821/41822 and the WorkBuddy pair. */
 const TRAE_PORTS = { cn: 41851, ai: 41861 };
@@ -146,8 +157,8 @@ function activeTraeRegions() {
 const QODER_REGIONS = ["cn", "global"];
 const QODER_PROVIDER_ID_BY_REGION = { cn: "xdpool-qoder-cn", global: "xdpool-qoder-global" };
 const QODER_PROVIDER_NAME_BY_REGION = {
-  cn: "pi-desktop-xdpool Qoder（国内）",
-  global: "pi-desktop-xdpool Qoder（国际）",
+  cn: "WTQ Pool Qoder (CN)",
+  global: "WTQ Pool Qoder (Global)",
 };
 /** Fixed ports, clear of 41811/41812, 41821/41822 and the two pairs above. */
 const QODER_PORTS = { cn: 41871, global: 41881 };
@@ -177,16 +188,15 @@ const MAX_MODELS = 64;
 const MAX_TOKEN_BUDGET = 0xffffffff;
 const CONSERVATIVE_CONTEXT_WINDOW = 128000;
 const DEFAULT_MAX_TOKENS = 32000;
-const DEFAULT_REFRESH_MINUTES = 30;
-const MIN_REFRESH_MINUTES = 5;
+const CATALOG_TTL_MS = 30 * 60 * 1000;
 /** Used until a shim binds: the host rejects a provider with no base URL. */
 const PLACEHOLDER_BASE_URL = "http://127.0.0.1:1/v1";
 
 /**
  * How long one account's billing answers (credits, check-in) are reused.
  *
- * Opening the panel used to await both calls for every account before it could
- * render anything; they are now cached and refreshed behind the first paint.
+ * The panel renders from these cached answers and they refresh behind the first
+ * paint, so opening it never waits on a billing call per account.
  */
 const PROBE_TTL_MS = 60000;
 /**
@@ -208,6 +218,18 @@ const MODELS_TIMEOUT_MS = 10000;
 const LOAD_ROSTER_BUDGET_MS = 6000;
 const SERVICE_ROSTER_BUDGET_MS = 3000;
 /**
+ * The share of the same two budgets the steps in front of the roster read may
+ * take: the gateway reconcilers, the account scan, and the runtime starts.
+ *
+ * Those steps are disk and port work that can stall on a pathological machine,
+ * and without a bound of their own they could spend the whole hook before the
+ * roster read even starts. A step that outruns the budget keeps running behind
+ * the answer; the refresh after `service.start` reconciles whatever it missed
+ * and republishes the declaration.
+ */
+const LOAD_BOOTSTRAP_BUDGET_MS = 5000;
+const SERVICE_BOOTSTRAP_BUDGET_MS = 1500;
+/**
  * One whole refresh pass, and how long a forced one waits for the pass it found
  * already running.
  *
@@ -220,12 +242,30 @@ const REFRESH_PASS_BUDGET_MS = 18000;
 const REFRESH_HANDOVER_MS = 2000;
 
 let settings = {};
+/**
+ * Bumped by every local mutation of `settings`.
+ *
+ * A refresh pass reads the document from the host and then awaits for seconds;
+ * a save landing in that window is newer than the document the read returns.
+ * Comparing this counter across the read is what stops the pass from reverting
+ * a switch the user just flipped.
+ */
+let settingsRevision = 0;
 let dataPath = "";
 /** The package root, so the declaration can rewrite this plugin's manifest. */
 let packageRoot = "";
 /** One runtime per gateway: its shim and catalog. */
 const runtimes = new Map();
 
+/**
+ * True while no background service is running.
+ *
+ * `onServiceStop` clears `runtimes`, but a refresh pass already in flight goes on
+ * to create its own runtimes and writes them back - and `runtimes.clear()` has
+ * already run, so nothing would ever close those shims again. Every creator reads
+ * this flag first, the way it reads `runtime.stopped` after an await.
+ */
+let serviceStopped = true;
 /** Shared upstream client and account pool, built in onLoad. */
 const core = { client: null, pool: null };
 
@@ -271,6 +311,10 @@ const TRAE_ACCOUNT_DELAY_MS = 5000;
 const TRAE_ACCOUNT_JITTER_MS = 2000;
 /** Wait after the adopt preflight report before calling buddy/first. */
 const TRAVEL_ADOPT_GAP_MS = 1050;
+/** Between the check-in burst and the growth burst on the same accounts. */
+const GROWTH_AFTER_CHECKIN_MS = 1500;
+/** Between one domestic account and the next inside the growth pass. */
+const GROWTH_ACCOUNT_DELAY_MS = 400;
 /** Account ids that hit the adopt conversation threshold today (CST day). */
 const travelAdoptTried = new Map();
 
@@ -346,12 +390,42 @@ async function adoptPreviousDataDir() {
   return false;
 }
 
+/**
+ * Read the settings document.
+ *
+ * `undefined` means the read failed, which is not the same answer as an empty
+ * document and must not be treated as one - see {@link adoptHostSettings}.
+ */
 async function loadSettings() {
   try {
     return (await pi.plugin.getSettings()) || {};
   } catch {
-    return {};
+    return undefined;
   }
+}
+
+/**
+ * Replace this process's settings with a fresh read, unless that read failed or
+ * a local write landed while it was in flight. Returns whether it replaced them.
+ *
+ * Two failures are ruled out here. A failed read is not an empty document:
+ * returning `{}` let one transient host RPC error wipe this process's copy of
+ * `disabledAccountIds`, `removedAccounts`, `creditReserves`, `modelSelection`
+ * and the parked regions, and because the panel's save helpers spread that copy
+ * before writing one key, the next save made the loss permanent. A read that
+ * raced a save is also older than that save by definition, so taking it reverted
+ * the switch the user had just flipped.
+ */
+async function adoptHostSettings() {
+  const revision = settingsRevision;
+  const next = await loadSettings();
+  if (next === undefined) {
+    log("warn", "could not read settings; keeping the last known document");
+    return false;
+  }
+  if (settingsRevision !== revision) return false;
+  settings = next;
+  return true;
 }
 
 /**
@@ -364,6 +438,7 @@ async function saveSettings(patch) {
   try {
     await pi.plugin.setSettings(patch);
     settings = { ...settings, ...patch };
+    settingsRevision += 1;
     return true;
   } catch (error) {
     log("warn", "could not save settings: " + messageOf(error));
@@ -383,13 +458,18 @@ async function saveSettings(patch) {
 async function onHostSettingsChanged(next) {
   if (next === null || typeof next !== "object" || Array.isArray(next)) return false;
   settings = { ...settings, ...next };
+  settingsRevision += 1;
   applySettingsToCore();
   traeAccountRows = traeAccountRows.filter((row) => regionEnabled("trae", row.region));
   qoderAccountRows = qoderAccountRows.filter((row) => regionEnabled("qoder", row.region));
   // A parked region must lose its gateway now, not at the next refresh: its
   // port would otherwise stay bound and its endpoint would keep serving.
-  await reconcileTraeGateways();
-  await reconcileQoderGateways();
+  // Skipped while no service runs - `applySettingsToCore` above already retired
+  // what was there, and reconciling would start gateways for a stopped plugin.
+  if (!serviceStopped) {
+    await reconcileTraeGateways();
+    await reconcileQoderGateways();
+  }
   syncDeclaration();
   probeCache.clear();
   scheduleRefresh("settings");
@@ -415,12 +495,6 @@ function subscribeToHostSettings() {
   }
   settingsChangedHandler = null;
   return false;
-}
-
-function refreshMinutes() {
-  const value = Number(settings.catalogRefreshMinutes);
-  if (!Number.isFinite(value) || value <= 0) return DEFAULT_REFRESH_MINUTES;
-  return Math.max(MIN_REFRESH_MINUTES, Math.min(24 * 60, Math.round(value)));
 }
 
 function cooldownMs() {
@@ -497,11 +571,15 @@ function autoCheckinEnabled() {
  * still collects when it wakes instead of waiting for tomorrow. The earliest
  * unconsumed hour wins, so two configured hours still give two passes a day.
  */
+function checkinSlotId(day, hour) {
+  return day + "T" + String(hour).padStart(2, "0");
+}
+
 function dueCheckinSlot(now, hours, fired) {
   const { day, hour } = zonedDayHour(now);
   for (const candidate of [...hours].sort((a, b) => a - b)) {
     if (candidate > hour) continue;
-    const slot = day + "T" + String(candidate).padStart(2, "0");
+    const slot = checkinSlotId(day, candidate);
     if (!fired.has(slot)) return slot;
   }
   return undefined;
@@ -598,8 +676,13 @@ function packUrgency(source, label, now) {
   return typeof at === "number" && at > now ? at : Infinity;
 }
 
-/** Where each source region's rotation stands, advanced once per request. */
+/** Where each source region's rotation stands. Advanced once per chat, never by a directory or health read. */
 const sourceRotation = new Map();
+
+/** A sign-in with no expiry is still usable. Only a timestamp that has passed is dead. */
+function sourceCredentialExpired(credential, now) {
+  return typeof credential.expiresAtMs === "number" && credential.expiresAtMs > 0 && credential.expiresAtMs <= now;
+}
 
 /**
  * One source region's credentials, in the order its gateway should try them:
@@ -612,31 +695,43 @@ const sourceRotation = new Map();
  *
  * A picked account is what the user asked to spend, so it leads in every mode;
  * only "automatic" leaves the choice to the usage mode. Round-robin then walks
- * the list one account per request instead of draining the first one.
+ * the list one account per chat. `rotate` is false for model-list and health
+ * reads: advancing the cursor there would make the account a chat lands on
+ * depend on whichever read ran last.
+
  */
-function orderSourceCredentials(source, region, credentials, labelOf) {
-  const preferred = preferredSourceAccount(source, region);
+function orderSourceCredentials(source, region, credentials, labelOf, rotate) {
+  const now = Date.now();
+  const stored = preferredSourceAccount(source, region);
+  // A stored label only counts while some credential still carries it. The
+  // label is the account's own name (`accountName ?? email ?? userId`), so
+  // renaming or re-signing in retires it; treating the retired label as a live
+  // preference returned here before rotation and the expiry sort could run, and
+  // the panel went on showing round-robin while one account served every chat.
+  const preferred = stored !== "" && credentials.some((credential) => labelOf(credential) === stored)
+    ? stored
+    : "";
   const rank = (credential) => {
     const wanted = preferred !== "" && labelOf(credential) === preferred ? 0 : 1;
-    const expired = credential.expiresAtMs > Date.now() ? 0 : 1;
+    const expired = sourceCredentialExpired(credential, now) ? 1 : 0;
     return wanted * 2 + expired;
   };
   const ordered = credentials.slice().sort((left, right) => rank(left) - rank(right));
   if (preferred === "" && sourceDistribution(source) === "expiry") {
-    const now = Date.now();
-    const live = ordered.filter((credential) => credential.expiresAtMs > now);
-    const rest = ordered.filter((credential) => credential.expiresAtMs <= now);
+    const live = ordered.filter((credential) => !sourceCredentialExpired(credential, now));
+    const rest = ordered.filter((credential) => sourceCredentialExpired(credential, now));
     live.sort((left, right) => packUrgency(source, labelOf(left), now) - packUrgency(source, labelOf(right), now));
     return live.concat(rest);
   }
   // Rotation may only shuffle the accounts that can still answer: leading with
   // an expired token would spend the request on a failure first.
-  const live = ordered.filter((credential) => credential.expiresAtMs > Date.now());
-  if (preferred !== "" || live.length < 2 || sourceDistribution(source) !== "round-robin") return ordered;
+  const live = ordered.filter((credential) => !sourceCredentialExpired(credential, now));
+  if (rotate !== true || preferred !== "" || live.length < 2 || sourceDistribution(source) !== "round-robin") return ordered;
   const key = sourceRegionKey(source, region);
   const step = (sourceRotation.get(key) ?? 0) % live.length;
   sourceRotation.set(key, step + 1);
-  return live.slice(step).concat(live.slice(0, step), ordered.slice(live.length));
+  const rest = ordered.filter((credential) => sourceCredentialExpired(credential, now));
+  return live.slice(step).concat(live.slice(0, step), rest);
 }
 
 /** Account ids switched off on the panel; the pool never picks them. */
@@ -730,6 +825,10 @@ function sourceModelView(key, model, native) {
     nativeMaxOutputTokens: native.maxTokens,
     supportsImages: typeof override.supportsImages === "boolean" ? override.supportsImages : native.supportsImages,
     nativeSupportsImages: native.supportsImages,
+    // The upstream cost, read-only: it is the gateway's price, not a setting, so
+    // there is no override and no `nativeMultiplier` beside it. WorkBuddy models
+    // carry the same field, which is what the panel's cost chip reads.
+    ...native.multiplier === undefined ? {} : { multiplier: native.multiplier },
     advanced: Object.keys(override).length > 0,
   };
 }
@@ -800,7 +899,10 @@ function normalizeSelection(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const out = {};
   if (Array.isArray(value.enabledModelIds)) out.enabledModelIds = value.enabledModelIds;
-  const overrides = {};
+  // Null prototype: an id of `__proto__` is an own key of a JSON-parsed document
+  // but assigns the prototype on a plain `map[id] = …`, so that edit vanished
+  // while both the save and the read reported success.
+  const overrides = Object.create(null);
   if (value.overrides && typeof value.overrides === "object" && !Array.isArray(value.overrides)) {
     for (const [id, entry] of Object.entries(value.overrides)) {
       if (typeof id === "string" && id !== "" && entry && typeof entry === "object" && !Array.isArray(entry)) {
@@ -815,7 +917,11 @@ function normalizeSelection(value) {
   }
   const budgets = value.contextBudgets && typeof value.contextBudgets === "object" ? value.contextBudgets : {};
   for (const [id, budget] of Object.entries(budgets)) {
-    if (typeof id === "string" && id !== "" && typeof budget === "number" && budget > 0) {
+    // The same bar `parseOverride` applies on a panel save: a non-integer or an
+    // unbounded value is refused there, so accepting one here reads back a
+    // figure no save could have produced.
+    if (typeof id === "string" && id !== "" && typeof budget === "number"
+      && Number.isInteger(budget) && budget > 0 && budget <= MAX_TOKEN_BUDGET) {
       overrides[id] = { ...(overrides[id] || {}), contextWindow: budget };
     }
   }
@@ -1151,26 +1257,20 @@ function syncDeclaration() {
       : result;
     return runtimeState.write;
   }
-  // A run in which nothing connected must not erase a declaration an earlier
-  // successful run wrote: a transient failure would otherwise strip a model
-  // list the user is already using.
-  if (publishable.length === 0 && publishableTrae.length === 0 && publishableQoder.length === 0) {
-    const activeIds = new Set([
-      ...activeRegions().map((region) => PROVIDER_ID_BY_REGION[region]),
-      ...activeTraeRegions().map((region) => TRAE_PROVIDER_ID_BY_REGION[region]),
-      ...activeQoderRegions().map((region) => QODER_PROVIDER_ID_BY_REGION[region]),
-    ]);
-    const result = writeDeclaration(manifestProviders().filter((provider) => activeIds.has(provider.id)));
-    runtimeState.write = result.ok
-      ? { ...result, skipped: "no gateway is connected yet; enabled gateways keep their last model list" }
-      : result;
-    return runtimeState.write;
-  }
-  const result = writeDeclaration([
+  const activeIds = new Set([
+    ...activeRegions().map((region) => PROVIDER_ID_BY_REGION[region]),
+    ...activeTraeRegions().map((region) => TRAE_PROVIDER_ID_BY_REGION[region]),
+    ...activeQoderRegions().map((region) => QODER_PROVIDER_ID_BY_REGION[region]),
+  ]);
+  const current = [
     ...publishable.map(descriptorFor),
     ...publishableTrae.map(descriptorForTrae),
     ...publishableQoder.map(descriptorForQoder),
-  ]);
+  ];
+  const currentIds = new Set(current.map((provider) => provider.id));
+  // One warming or unreachable gateway must not lose its saved roster when a sibling connects.
+  const retained = manifestProviders().filter((provider) => activeIds.has(provider.id) && !currentIds.has(provider.id));
+  const result = writeDeclaration([...current, ...retained]);
   runtimeState.write = result;
   return result;
 }
@@ -1181,16 +1281,14 @@ function syncDeclaration() {
  * The message is overwritten either way round: a directory that failed while
  * load was still opening the other gateways and answers a minute later must
  * not keep reporting the first failure for the rest of the process. That is
- * what WorkBuddy's `connect` already does by clearing before every attempt;
- * these two gateways used to set the message once and never look again.
+ * what WorkBuddy's `connect` also does, by clearing before every attempt.
  */
 async function warmSourceDirectory(entry, signal) {
   if (signal && signal.aborted) return false;
-  // The timeout is not optional. It used to be folded into the composite signal,
-  // which quietly dropped it for the caller that passes no lifecycle signal — the
-  // user-invoked refresh — and left that path bounded only by the outer pass
-  // budget. So the timeout always applies, and the lifecycle signal is added on
-  // top when there is one.
+  // The timeout is not optional: folded into the composite signal it would be
+  // dropped for a caller that passes no lifecycle signal — the user-invoked
+  // refresh — leaving that path bounded only by the outer pass budget. So it
+  // always applies, and the lifecycle signal is added on top when there is one.
   const bounds = [AbortSignal.timeout(DIRECTORY_WARM_TIMEOUT_MS)];
   if (signal) bounds.push(signal);
   try {
@@ -1299,11 +1397,12 @@ async function createTraeRuntime(region) {
     // Only this region's sign-ins: the two gateways are not interchangeable, so
     // a CN request must never be answered by an international token. The list
     // is ordered by the panel's account pick and usage mode.
-    credentials: async () => orderSourceCredentials(
+    credentials: async (purpose) => orderSourceCredentials(
       "trae",
       region,
       (await discoverTraeCredentials()).credentials.filter((credential) => traeRegionOfCredential(credential) === region),
       traeRowLabel,
+      purpose === "chat",
     ),
     identity: (credential) => resolveTraeIdentity(desktopCandidates, credential.edition),
     listedIds: () => traeDeclarationModels(region).map((model) => model.id),
@@ -1341,9 +1440,18 @@ async function reconcileTraeGateways() {
     }
   }
   for (const region of active) {
-    if (traeGateways.has(region)) continue;
+    // A stopped service, a source switch flipped off while the directory read
+    // was awaited, or a gateway another pass already installed: the entry this
+    // call just created would otherwise keep the port bound with nobody left to
+    // close it. Same resolution as `startRuntimes`.
+    if (serviceStopped || !regionEnabled("trae", region) || traeGateways.has(region)) continue;
     try {
-      traeGateways.set(region, await createTraeRuntime(region));
+      const entry = await createTraeRuntime(region);
+      if (serviceStopped || !regionEnabled("trae", region) || traeGateways.has(region)) {
+        await entry.gateway.close();
+      } else {
+        traeGateways.set(region, entry);
+      }
     } catch (error) {
       log("warn", "[trae:" + region + "] gateway could not start: " + messageOf(error));
     }
@@ -1362,6 +1470,10 @@ function traeNativeOf(model) {
     // directory states it rather than guessed from a model name. A row that
     // states nothing stays false.
     supportsImages: model.supportsImages === true,
+    // The directory's own effective (post-discount) rate, the same figure the
+    // IDE prints beside a model. A row that states none stays unlabelled rather
+    // than being given a guessed cost, so this is spread rather than defaulted.
+    ...Number.isFinite(model.creditMultiplier) ? { multiplier: model.creditMultiplier } : {},
   };
 }
 
@@ -1390,7 +1502,9 @@ function traeDeclarationModels(region) {
       .filter((level) => HOST_THINKING_LEVELS.includes(level));
     models.push({
       id: view.id,
-      name: view.name,
+      // Same label rule as WorkBuddy's declaration: the user's alias verbatim,
+      // otherwise the catalog name with its cost suffix.
+      name: modelLabel(view),
       contextWindow: view.contextWindow,
       maxTokens: view.maxOutputTokens,
       supportsImages: view.supportsImages,
@@ -1448,10 +1562,10 @@ async function createQoderRuntime(region) {
     region,
     // Only this region's sign-ins, in the order the panel's account pick and
     // usage mode ask for: the gateway serves the first usable one.
-    credentials: async () => {
+    credentials: async (purpose) => {
       const found = await discoverQoderCredentials();
       const mine = found.credentials.filter((credential) => credential.region === region);
-      return orderSourceCredentials("qoder", region, mine, qoderRowLabel).map(qoderClientCredential);
+      return orderSourceCredentials("qoder", region, mine, qoderRowLabel, purpose === "chat").map(qoderClientCredential);
     },
     listedIds: () => qoderDeclarationModels(region).map((model) => model.id),
     port: bound,
@@ -1482,9 +1596,15 @@ async function reconcileQoderGateways() {
     }
   }
   for (const region of active) {
-    if (qoderGateways.has(region)) continue;
+    // Same resolution as the Trae loop above.
+    if (serviceStopped || !regionEnabled("qoder", region) || qoderGateways.has(region)) continue;
     try {
-      qoderGateways.set(region, await createQoderRuntime(region));
+      const entry = await createQoderRuntime(region);
+      if (serviceStopped || !regionEnabled("qoder", region) || qoderGateways.has(region)) {
+        await entry.gateway.close();
+      } else {
+        qoderGateways.set(region, entry);
+      }
     } catch (error) {
       log("warn", "[qoder:" + region + "] gateway could not start: " + messageOf(error));
     }
@@ -1582,10 +1702,7 @@ async function createRuntime(region) {
     lastWarning: "",
     portFallback: false,
     connecting: null,
-    timer: null,
     catalogFetchedAtMs: 0,
-    /** The period the live timer was armed with, so a changed setting can re-arm it. */
-    timerPeriodMs: 0,
   };
   applyEffectiveSelection(region, runtime);
   // The preferred port is reserved before the listener is created, so a run
@@ -1630,36 +1747,27 @@ async function createRuntime(region) {
  * regions cost one bound rather than two, which is why the reads run together.
  */
 async function startRuntimes() {
+  if (serviceStopped) return;
   await Promise.all(activeRegions().map(async (region) => {
     if (runtimes.has(region)) return;
     try {
-      runtimes.set(region, await createRuntime(region));
+      const runtime = await createRuntime(region);
+      // The stop may have landed while the shim was binding; its close already
+      // ran over an empty map, so this one is ours to release.
+      if (serviceStopped || runtimes.has(region)) await stopRuntime(runtime);
+      else runtimes.set(region, runtime);
     } catch (error) {
       log("warn", "[workbuddy:" + region + "] gateway could not start: " + messageOf(error));
     }
   }));
 }
 
-/**
- * (Re)arm one gateway's periodic catalog refresh at the interval now in force.
- *
- * Setting changes call this too, which is why it clears first: two intervals
- * for the same runtime would silently halve the period.
- */
-function scheduleRuntimeRefresh(runtime) {
-  if (runtime.timer) clearInterval(runtime.timer);
-  runtime.timer = setInterval(() => {
-    refreshRuntime(runtime, "timer", true).catch((error) => log("warn", "scheduled refresh failed: " + messageOf(error)));
-  }, runtime.timerPeriodMs = refreshMinutes() * 60 * 1000);
-}
-
-function stopRuntime(runtime) {
-  if (runtime.timer) {
-    clearInterval(runtime.timer);
-    runtime.timer = null;
-  }
-  if (runtime.shim) runtime.shim.close().catch(() => {});
+async function stopRuntime(runtime) {
+  runtime.stopped = true;
   runtime.signedIn = false;
+  if (runtime.shim) await runtime.shim.close().catch((error) => {
+    log("warn", "[workbuddy:" + runtime.region + "] gateway did not close cleanly: " + messageOf(error));
+  });
 }
 
 /**
@@ -1686,9 +1794,7 @@ async function connect(runtime, force) {
     return false;
   }
   runtime.signedIn = true;
-  // The roster is only re-read when it is actually stale. Re-fetching it on
-  // every connect is a large part of why opening the panel felt slow, and the
-  // list does not move minute to minute; `xd.rescan` and the timer force it.
+  // Cached opens reuse the roster; a manual refresh still bypasses its TTL.
   if (force === true || !catalogFresh(runtime)) {
     try {
       const models = await core.client.fetchModels(
@@ -1705,17 +1811,17 @@ async function connect(runtime, force) {
       runtime.catalogFetchedAtMs = Date.now();
     }
   }
+  if (runtime.stopped) return false;
   // Re-check the saved selection against the roster now in force: a re-read may
   // have retired ids it names, and a failure leaves the previous roster up.
   applyEffectiveSelection(runtime.region, runtime);
-  if (runtime.timer === null) scheduleRuntimeRefresh(runtime);
   return true;
 }
 
-/** True while one gateway's model roster is still inside its refresh window. */
+/** True while one gateway's model roster is still inside its cache lifetime. */
 function catalogFresh(runtime) {
   if (runtime.catalogFetchedAtMs === 0) return false;
-  return Date.now() - runtime.catalogFetchedAtMs < refreshMinutes() * 60 * 1000;
+  return Date.now() - runtime.catalogFetchedAtMs < CATALOG_TTL_MS;
 }
 
 /**
@@ -1728,6 +1834,10 @@ function catalogFresh(runtime) {
  * and is what keeps the poll alive until the numbers actually land.
  */
 function refreshNeeded() {
+  // A stopped service has nothing left to refresh, and the passes that would
+  // have cleared this state are refused while it is stopped - so answering
+  // "still detecting" here left the panel's header busy for good.
+  if (serviceStopped) return false;
   if (refreshInflight !== null) return true;
   for (const runtime of runtimes.values()) {
     if (runtime.connecting) return true;
@@ -1800,6 +1910,11 @@ async function refreshAll(reason, force) {
     if (!wantForce || current.force) return await current.promise;
     await settleWithin(current.promise.catch(() => {}), REFRESH_HANDOVER_MS);
   }
+  // A stopped service owns no gateways, so there is nothing to refresh and
+  // nothing that may be created: answering the cached document is what the
+  // caller expects (`xd.state` spreads it). Falls through to `statusDocument`
+  // so the answer keeps the shape of every other pass.
+  if (serviceStopped) return await statusDocument({ allowNetwork: false });
   const run = async () => {
     // One deadline for the whole pass. The host allows a panel call 30 s, and
     // the stages below would otherwise add their own budgets up to well past
@@ -1809,18 +1924,31 @@ async function refreshAll(reason, force) {
     // at worst when another process holds the preferred ports.
     const deadline = Date.now() + REFRESH_PASS_BUDGET_MS;
     const left = () => Math.max(0, deadline - Date.now());
-    settings = await loadSettings();
+    await adoptHostSettings();
     applySettingsToCore();
     for (const region of activeRegions()) {
       if (runtimes.has(region)) continue;
-      const runtime = await settleWithin(createRuntime(region), left());
-      if (runtime !== undefined) runtimes.set(region, runtime);
+      // A pass that runs out of budget mid-start must not leak what it built:
+      // by the time `createRuntime` awaits it has already reserved a port and
+      // bound a shim, and the late runtime arrives with nobody to own it. The
+      // started work is kept so it can be released instead of abandoned.
+      const started = createRuntime(region);
+      const runtime = await settleWithin(started, left());
+      if (runtime === undefined) {
+        started.then((late) => stopRuntime(late), () => { /* it failed; nothing was bound */ });
+        continue;
+      }
+      // The stop can land while the shim binds: `runtimes.clear()` has already
+      // run by then, so this runtime would stay open forever. Same rule as
+      // `startRuntimes`.
+      if (serviceStopped || runtimes.has(region)) await stopRuntime(runtime);
+      else runtimes.set(region, runtime);
     }
     // Trae gateways follow the same switch, and are reconciled before the
     // declaration is written so their rows can join this run's publish.
-    await reconcileTraeGateways();
+    await settleWithin(reconcileTraeGateways(), left());
     // Qoder gateways follow the same switch on the same terms.
-    await reconcileQoderGateways();
+    await settleWithin(reconcileQoderGateways(), left());
     // The Trae and Qoder strips list their own local sign-ins, which no pool
     // cache holds; read them here so the panel can show who is found. A failed
     // read leaves the previous list rather than claiming "no sign-in".
@@ -1911,7 +2039,7 @@ const SOURCE_PROBE_TIMEOUT_MS = 8000;
  * row's figures — a flaky network is not "no quota".
  */
 async function traeRowProbe(credential, previous) {
-  if (credential.expiresAtMs <= Date.now()) return previous;
+  if (sourceCredentialExpired(credential, Date.now())) return previous;
   try {
     const desktopCandidates = traeStorageCandidates().filter((entry) => entry.source === "desktop");
     const client = new TraeSoloUpstreamClient({
@@ -1980,7 +2108,7 @@ function traeSourceCredits(usage) {
 
 /** Read one Qoder account's quota and today's campaign, reduced for the card. */
 async function qoderRowProbe(credential, previous) {
-  if (credential.expiresAtMs <= Date.now()) return previous;
+  if (sourceCredentialExpired(credential, Date.now())) return previous;
   try {
     const client = new QoderUpstreamClient({ region: credential.region, credential: async () => qoderClientCredential(credential) });
     // Usage is the row the card cannot do without. The campaign only answers
@@ -2079,7 +2207,7 @@ async function refreshSourceAccounts() {
           app: traeAppLabelOf(credential),
           ...credential.email === undefined || credential.email === label ? {} : { email: credential.email },
           expiresAt: credential.expiresAtMs,
-          expired: credential.expiresAtMs <= now,
+          expired: sourceCredentialExpired(credential, now),
           ...(probe?.checkin ? { checkin: probe.checkin } : {}),
           ...(probe?.usage ? { usage: probe.usage } : {}),
         };
@@ -2113,7 +2241,7 @@ async function refreshSourceAccounts() {
           label,
           region: credential.region,
           expiresAt: credential.expiresAtMs,
-          expired: credential.expiresAtMs <= now,
+          expired: sourceCredentialExpired(credential, now),
           ...(probe?.checkin ? { checkin: probe.checkin } : {}),
           ...(probe?.usage ? { usage: probe.usage } : {}),
         });
@@ -2148,15 +2276,6 @@ function applySettingsToCore() {
   // The daily check-in timer follows the switch, so a settings change takes
   // effect without a reload.
   applyAutoCheckin();
-  // Likewise for the catalog refresh interval: the timer is armed with a period,
-  // so a changed setting has to re-arm it rather than wait for a restart. Only
-  // re-armed on a real change, so repeated events do not churn the timers.
-  const periodMs = refreshMinutes() * 60 * 1000;
-  for (const runtime of runtimes.values()) {
-    if (runtime.timer !== null && runtime.timerPeriodMs !== periodMs) {
-      scheduleRuntimeRefresh(runtime);
-    }
-  }
 }
 
 /**
@@ -2502,7 +2621,6 @@ async function statusDocument(options) {
     declaration: runtimeState.write,
     addressDrift: addressDrift(),
     shims: { cn: shimInfo("cn"), global: shimInfo("global") },
-    refreshMinutes: refreshMinutes(),
     // A gateway whose roster could not be re-read keeps serving the previous
     // list on purpose, but that list is then as old as the last success. Saying
     // so is what keeps the panel from presenting it as current.
@@ -2828,7 +2946,7 @@ async function doctor() {
 
   const ok = findings.every((finding) => finding.ok);
   const report = [
-    "pi-desktop-xdpool doctor",
+    "WTQ Pool doctor",
     new Date().toISOString(),
     "overall: " + (ok ? "PASS" : "FAIL"),
     "",
@@ -2877,7 +2995,10 @@ function parseSelection(body) {
   const overrides = body.overrides;
   if (overrides !== undefined) {
     if (typeof overrides !== "object" || overrides === null || Array.isArray(overrides)) return undefined;
-    const map = {};
+    // Null prototype: `map["__proto__"] = …` on a plain object assigns the
+    // prototype instead of the entry, so that id reported a successful save and
+    // stored nothing.
+    const map = Object.create(null);
     for (const [id, raw] of Object.entries(overrides)) {
       if (typeof id !== "string" || id === "") return undefined;
       const parsed = parseOverride(raw);
@@ -2969,12 +3090,15 @@ async function onPanelInvoke(channel, payload) {
       // inside the host's 30 s and still answers from what has arrived.
       const deadline = Date.now() + RESCAN_BUDGET_MS;
       const left = () => Math.max(0, deadline - Date.now());
-      if (activeRegions().length > 0) await core.pool.scan();
-      await startRuntimes();
-      // Trae/Qoder sign-ins are read from their own app files, not from a pool
-      // cache, so a deliberate re-scan has to re-read them as well: a login made
-      // while the panel was open must appear on this button too, not only on
-      // Refresh or after the next timed pass.
+      // The scan and the gateway starts sit inside the same deadline: a scan
+      // may refresh tokens over the network, and a gateway's `ready` is
+      // unbounded, so without this a slow disk or vendor could spend the whole
+      // pass before the first roster read even starts. A step that outruns the
+      // deadline keeps running behind the answer and lands on the next read.
+      if (activeRegions().length > 0) await settleWithin(core.pool.scan(), left());
+      await settleWithin(startRuntimes(), left());
+      // Trae/Qoder sign-ins live in their own app files, so a deliberate scan
+      // re-reads them to pick up logins made while the panel was open.
       await settleWithin(refreshSourceAccounts(), left());
       // Concurrent, as in the refresh pass: end to end, two rosters read can
       // spend a whole panel call on their own.
@@ -2987,9 +3111,6 @@ async function onPanelInvoke(channel, payload) {
       core.pool.resetCooldowns();
       return await statusDocument({ allowNetwork: false });
 
-    // The only mutating channel that spends anything. Guarded by an explicit
-    // accountId and a pre-claim status re-check, so a double click or a stale
-    // panel can never collect a reward twice.
     case "xd.checkin": {
       const accountId = typeof payload?.accountId === "string" ? payload.accountId : "";
       if (accountId === "") throw panelError("accountId is required", "INVALID");
@@ -3150,6 +3271,16 @@ async function onPanelInvoke(channel, payload) {
     case "xd.checkinAll": {
       const source = typeof payload?.source === "string" ? payload.source : "";
       const want = (name) => source === "" || source === name;
+      // The same flag the scheduled pass and the host command use. Without it a
+      // click here runs a second pass beside the one already going - over the
+      // same accounts, both writing `autoCheckinLast` - which is the symptom
+      // `runCheckinPass` documents as fixed. The answer is the same shape a
+      // truncated pass gets, so the panel says one is running rather than
+      // reading the missing counts as "everything was already collected".
+      if (checkinPassRunning) {
+        return { state: await statusDocument({ allowNetwork: true, budgetMs: DOCUMENT_BUDGET_MS }), running: true };
+      }
+      checkinPassRunning = true;
       // Concurrent where the sources are independent, and bounded like every
       // other network pass here: a pass that outruns the budget keeps going and
       // says so, rather than the host cutting the call off mid-flight.
@@ -3158,13 +3289,20 @@ async function onPanelInvoke(channel, payload) {
       // the two must not collapse into the same "no result".
       const failed = { failed: true }
       const finished = (async () => {
-        const [pool, travel, qoder, trae] = await Promise.all([
-          want("workbuddy") ? claimAllCheckins() : Promise.resolve(0),
-          want("workbuddy") ? travelAllAccounts() : Promise.resolve(undefined),
-          want("qoder") ? qoderCheckinAll() : Promise.resolve(undefined),
-          want("trae") ? traeCheckinAll() : Promise.resolve(undefined),
-        ]);
-        return { claimed: pool, travel, qoder, trae };
+        try {
+          const [pool, travel, qoder, trae] = await Promise.all([
+            want("workbuddy") ? claimAllCheckins() : Promise.resolve({ claimed: 0, skipped: 0, failed: 0 }),
+            want("workbuddy") ? travelAllAccounts() : Promise.resolve(undefined),
+            want("qoder") ? qoderCheckinAll() : Promise.resolve(undefined),
+            want("trae") ? traeCheckinAll() : Promise.resolve(undefined),
+          ]);
+          return { claimed: pool.claimed, travel, qoder, trae };
+        } finally {
+          // Released when the fan-out itself settles, not when this call
+          // answers: a pass that outran the budget is still running, and the
+          // flag has to cover it for as long as that is true.
+          checkinPassRunning = false;
+        }
       })().catch((error) => {
         log("warn", "check-in pass failed: " + messageOf(error));
         return failed;
@@ -3330,7 +3468,7 @@ async function onPanelInvoke(channel, payload) {
      * comes back with its gateways and accounts, not an empty strip.
      */
     case "xd.setSource": {
-      const key = typeof payload?.source === "string" ? SOURCE_SETTING_KEYS[payload.source] : undefined;
+      const key = sourceSettingKey(payload?.source);
       if (key === undefined) throw panelError("unknown source", "UNSUPPORTED");
       const stored = await saveSettings({ [key]: payload?.enabled === true });
       if (stored !== true) {
@@ -3380,43 +3518,38 @@ async function registerCommands() {
       log("warn", "could not register command " + id + ": " + messageOf(error));
     }
   };
-  await register(COMMAND_OPEN, "pi-desktop-xdpool: Open Panel", ["workbuddy", "pool", "池", "模型"], async () => {
+  await register(COMMAND_OPEN, "WTQ Pool: Open Panel", ["workbuddy", "pool", "池", "模型"], async () => {
     await pi.ui.openPanel();
   });
-  await register(COMMAND_RESCAN, "pi-desktop-xdpool: Detect Accounts Again", ["workbuddy", "rescan", "重新检测"], async () => {
+  await register(COMMAND_RESCAN, "WTQ Pool: Detect Accounts Again", ["workbuddy", "rescan", "重新检测"], async () => {
     const state = await onPanelInvoke("xd.rescan", {});
-    await pi.ui.showToast("pi-desktop-xdpool - " + state.accounts.length + " account(s) in the pool", "info");
+    await pi.ui.showToast("WTQ Pool - " + state.accounts.length + " account(s) in the pool", "info");
   });
-  await register(COMMAND_RESET, "pi-desktop-xdpool: Clear All Cooldowns", ["workbuddy", "cooldown", "清除冷却"], async () => {
+  await register(COMMAND_RESET, "WTQ Pool: Clear All Cooldowns", ["workbuddy", "cooldown", "清除冷却"], async () => {
     core.pool.resetCooldowns();
-    await pi.ui.showToast("pi-desktop-xdpool - all cooldowns cleared", "info");
+    await pi.ui.showToast("WTQ Pool - all cooldowns cleared", "info");
   });
-  await register(COMMAND_DOCTOR, "pi-desktop-xdpool: Run Connection Check", ["workbuddy", "doctor", "诊断"], async () => {
+  await register(COMMAND_DOCTOR, "WTQ Pool: Run Connection Check", ["workbuddy", "doctor", "诊断"], async () => {
     const result = await doctor();
     await pi.ui.showToast(
-      result.ok ? "pi-desktop-xdpool check passed" : "pi-desktop-xdpool check found problems - see the panel",
+      result.ok ? "WTQ Pool check passed" : "WTQ Pool check found problems - see the panel",
       result.ok ? "info" : "warn",
     );
   });
-  await register(COMMAND_CHECKIN, "pi-desktop-xdpool: Daily Check-in (All Accounts)", ["workbuddy", "trae", "qoder", "checkin", "签到"], async () => {
+  await register(COMMAND_CHECKIN, "WTQ Pool: Daily Check-in (All Accounts)", ["workbuddy", "trae", "qoder", "checkin", "签到"], async () => {
     // One pass over every source's accounts is minutes on a machine with several
     // sign-ins, and the host allows a command 30 s. So the pass starts now, the
     // command answers as soon as the numbers exist or the budget ends, and a pass
     // still running reports itself when it finishes - the numbers are the only
     // reason the user asked for it. The same pass the scheduler and the panel run,
     // so a second entry point cannot start a parallel one.
-    const finished = runCheckinPass().then((result) => checkinSummaryText(
-      result.claimed,
-      result.travel,
-      result.qoder,
-      result.trae,
-    ));
+    const finished = runCheckinPass().then((result) => checkinSummaryText(result));
     const summary = await settleWithin(finished, CHECKIN_BUDGET_MS);
     if (summary !== undefined) {
       await pi.ui.showToast(summary, "info");
       return;
     }
-    await pi.ui.showToast("pi-desktop-xdpool - check-in running in the background", "info");
+    await pi.ui.showToast("WTQ Pool - check-in running in the background", "info");
     finished
       .then((late) => pi.ui.showToast(late, "info"))
       .catch((error) => log("warn", "background check-in failed: " + messageOf(error)));
@@ -3427,35 +3560,67 @@ async function registerCommands() {
  * Run one check-in pass and record it in `autoCheckinLast`.
  *
  * All three entry points — the scheduled tick, the host command and the panel's
- * "run now" — come through here, so the re-entry guard lives in one place. It
- * used to sit only in the panel channel, which let the tick and the host command
+ * "run now" — come through here, so the re-entry guard lives in one place. In
+ * the panel channel alone it would miss the tick and the host command, which can
  * start a second pass alongside a manual one: no double claiming, because every
- * step reads `todayCheckedIn` before it writes, but the log ended up describing
- * whichever pass finished last rather than what the user had actually asked for.
+ * step reads `todayCheckedIn` before it writes, but the log would then describe
+ * whichever pass finished last rather than what the user asked for.
  *
  * `manual` marks a pass the user started, so the panel's status line can say so.
  */
 async function runCheckinPass(options) {
   const manual = options?.manual === true;
-  if (checkinPassRunning) return autoCheckinLast;
+  if (checkinPassRunning) return { running: true };
   checkinPassRunning = true;
-  const slot = dueCheckinSlot(new Date(), checkinHours(), new Set())
-    ?? zonedDayHour(new Date()).day + "T" + zonedDayHour(new Date()).hour;
-  const started = { slot, claimed: 0, at: new Date().toISOString(), ...manual ? { manual: true } : {} };
+  // A scheduled tick hands in the slot it already decided was due. A hand-started
+  // pass must consult the slots already recorded: ignoring them always named the
+  // earliest hour of the day, so an evening "run now" re-marked the morning and
+  // left the evening slot for the next tick, which ran the whole pass again.
+  const zoned = zonedDayHour(new Date());
+  const slot = typeof options?.slot === "string" && options.slot !== ""
+    ? options.slot
+    : dueCheckinSlot(new Date(), checkinHours(), autoCheckinSlots)
+      ?? checkinSlotId(zoned.day, zoned.hour);
+  const started = { slot, claimed: 0, pending: true, at: new Date().toISOString(), ...manual ? { manual: true } : {} };
   autoCheckinLast = started;
+  // Recorded up front, not after the pass: a pass that runs long must not be
+  // started again by the next tick. A manual run spends the hour that is due
+  // now — pressing "run now" at 09:10 is that morning's pass, and at 21:10 it
+  // is the evening's, not another copy of the morning.
+  autoCheckinSlots.add(slot);
   scheduleRefresh(manual ? "manual-checkin" : "auto-checkin");
   try {
     // Concurrent where the sources are independent, which is what the host
     // command has always done: Trae alone paces its accounts five seconds apart,
     // so a serial pass over several sign-ins takes minutes.
-    const [claimed, travel, qoder, trae] = await Promise.all([
+    // Growth stays out of that group: it and the daily check-in both talk to the
+    // same domestic accounts, so running them together stacks requests on one
+    // account. A task can also be scored off the check-in, so growth follows it,
+    // after a pause so the two bursts are not back to back.
+    const [pool, travel, qoder, trae] = await Promise.all([
       claimAllCheckins(),
       travelAllAccounts(),
       qoderCheckinAll(),
       traeCheckinAll(),
     ]);
-    Object.assign(started, { claimed, travel, qoder, trae });
-    log((manual ? "manual" : "automatic") + " check-in collected " + claimed + " account(s) for " + slot);
+    // Qoder's round may open after this hour (10:00 Beijing). Its answer carries
+    // that opening time, and the tick below re-runs Qoder alone when it comes:
+    // without this write-back the opening time is dropped with the pass, the
+    // slot counts as spent, and that day's Qoder credits are never collected.
+    qoderRetryAt = typeof qoder.opensAt === "number" && qoder.opensAt > Date.now() ? qoder.opensAt : 0;
+    // Published before the growth pause. "Run now" only waits 18s, and the panel
+    // was painting this stub — claimed still 0, no source rows — as a finished pass.
+    Object.assign(started, {
+      claimed: pool.claimed,
+      skipped: pool.skipped,
+      failed: pool.failed,
+      travel,
+      qoder,
+      trae,
+    });
+    await delay(GROWTH_AFTER_CHECKIN_MS);
+    started.growth = await claimAllGrowth();
+    log((manual ? "manual" : "automatic") + " check-in collected " + pool.claimed + " account(s) for " + slot);
   } catch (error) {
     started.error = safeMessage(error);
     log("warn", (manual ? "manual" : "automatic") + " check-in failed for " + slot + ": " + started.error);
@@ -3463,6 +3628,7 @@ async function runCheckinPass(options) {
     // On every path, including a pass that threw: without this the guard stays
     // set and no further pass can start for the rest of the process.
     checkinPassRunning = false;
+    delete started.pending;
   }
   autoCheckinLast = started;
   scheduleRefresh(manual ? "manual-checkin" : "auto-checkin");
@@ -3490,37 +3656,169 @@ const PANEL_STEP_BUDGET_MS = 20000;
 const DOCUMENT_BUDGET_MS = 4000;
 
 /** The one line a check-in pass reports, whichever way it finished. */
-function checkinSummaryText(claimed, travel, qoder, trae) {
-  return "pi-desktop-xdpool - checked in " + claimed + " account(s), travel " + JSON.stringify(travel)
-    + ", Qoder " + JSON.stringify(qoder) + ", Trae " + JSON.stringify(trae);
+function checkinSummaryText(result) {
+  if (result == null || result.running === true) {
+    return "WTQ Pool - a check-in pass is already running";
+  }
+  const growth = result.growth;
+  const growthText = growth === undefined ? ""
+    : ", streak " + (Number(growth.streak) || 0) + " tier(s), tasks " + (Number(growth.tasks) || 0)
+      + " (+" + (Number(growth.credit) || 0) + " credits)";
+  return "WTQ Pool - checked in " + result.claimed + " account(s), travel " + JSON.stringify(result.travel)
+    + growthText + ", Qoder " + JSON.stringify(result.qoder) + ", Trae " + JSON.stringify(result.trae);
+}
+
+/**
+ * Redeem every unlocked streak tier of one account.
+ *
+ * A locked tier is the normal state until enough days accumulate, and a claimed
+ * one needs no action, so neither is a failure. Returns how many tiers were
+ * redeemed and what they paid, so the panel can say so.
+ */
+async function redeemAccountStreak(account) {
+  const status = await core.client.growthStreakFull(account.credential);
+  let claimed = 0;
+  let credit = 0;
+  let energy = 0;
+  // A tier that fails is logged and left there. The upstream scheduler does not
+  // count that as a failed account: locked and already-claimed tiers are normal,
+  // and one redeem error must not paint the whole check-in as a failure.
+  for (const tier of status.tiers) {
+    if (tier.status !== "unlocked") continue;
+    try {
+      await core.client.redeemStreakTier(account.credential, tier.tier);
+      claimed += 1;
+      credit += tier.credit;
+      energy += tier.energy;
+      log("info", "streak " + account.label + ": redeemed " + tier.tier + " (+" + tier.credit + "c +" + tier.energy + "e)");
+    } catch (error) {
+      log("warn", "streak " + account.label + ": redeem " + tier.tier + " failed: " + messageOf(error));
+    }
+  }
+  return { claimed, credit, energy };
+}
+
+/**
+ * Collect every claimable task reward of one account.
+ *
+ * Enrolment comes first: a task that was never accepted cannot be claimed, and
+ * accepting an already-accepted task succeeds, so replaying the pass is safe.
+ * The list is read again afterwards, because accepting can change what is
+ * claimable. A repeat claim answers `already_claimed` and pays nothing.
+ */
+async function claimAccountTasks(account) {
+  const credential = account.credential;
+  const first = await core.client.listTasks(credential);
+  const open = first.filter((task) => task.acceptStatus === "not_accepted" && !task.locked).map((task) => task.taskCode);
+  if (open.length > 0) await core.client.acceptTasks(credential, open);
+  const tasks = await core.client.listTasks(credential);
+  let claimed = 0;
+  let credit = 0;
+  let energy = 0;
+  // Same as the streak pass: one task failing keeps the rewards already
+  // collected, and only a pass that collected nothing reports the failure.
+  let failed = 0;
+  for (const task of tasks) {
+    if (!task.claimable || task.locked) continue;
+    try {
+      const reward = await core.client.claimTaskReward(credential, task.taskCode);
+      if (reward.credit > 0 || reward.energy > 0) {
+        claimed += 1;
+        credit += reward.credit;
+        energy += reward.energy;
+        log("info", "task " + account.label + ": " + task.title + " +" + reward.credit + "c +" + reward.energy + "e");
+      }
+    } catch (error) {
+      failed += 1;
+      log("warn", "task " + account.label + ": " + task.taskCode + " failed: " + messageOf(error));
+    }
+  }
+  if (claimed === 0 && failed > 0) throw panelError("the task rewards could not be claimed", "UPSTREAM");
+  return { claimed, credit, energy };
+}
+
+/**
+ * Collect the streak bonus and the task rewards of every domestic account.
+ *
+ * Both are idempotent, so a pass that finds nothing to collect costs the reads
+ * and no mutation, and running it on the daily schedule cannot double-pay. One
+ * account failing never stops the rest. International accounts have no growth
+ * centre, so they are skipped without a call.
+ */
+async function claimAllGrowth() {
+  const counts = { streak: 0, tasks: 0, credit: 0, failed: 0 };
+  let first = true;
+  for (const account of core.pool.list()) {
+    if (core.pool.isDisabled(account.id) || !regionEnabled("workbuddy", regionOf(account.credential.domain))) continue;
+    if (regionOf(account.credential.domain) !== "cn") continue;
+    if (!first) await delay(GROWTH_ACCOUNT_DELAY_MS);
+    first = false;
+    let collected = false;
+    try {
+      const streak = await redeemAccountStreak(account);
+      counts.streak += streak.claimed;
+      counts.credit += streak.credit;
+      if (streak.claimed > 0) collected = true;
+    } catch (error) {
+      counts.failed += 1;
+      log("warn", "streak failed for " + account.label + ": " + messageOf(error));
+    }
+    try {
+      const tasks = await claimAccountTasks(account);
+      counts.tasks += tasks.claimed;
+      counts.credit += tasks.credit;
+      if (tasks.claimed > 0) collected = true;
+    } catch (error) {
+      counts.failed += 1;
+      log("warn", "tasks failed for " + account.label + ": " + messageOf(error));
+    }
+    // Either claim changed this account's balance, so its cached probe is stale.
+    if (collected) probeCache.delete(account.id);
+  }
+  return counts;
+}
+
+/**
+ * "Already checked in today" is an idempotent success upstream.
+ * Counting it as a failure is what made a collected day look broken.
+ */
+function isAlreadyCheckin(error) {
+  const message = messageOf(error);
+  return message.includes("已签到") || message.toLowerCase().includes("already");
 }
 
 /**
  * Collect every account's daily reward.
  *
- * One account failing must not stop the rest: each is queried first, so an
- * account that is already checked in costs one read and no mutation, and a
- * rejection is logged and skipped. Returns how many rewards were collected.
+ * `claimed` is a reward collected on this pass. Already checked in is `skipped`,
+ * including the upstream error that means the day was already collected.
+ * `failed` is only a real error. Disabled accounts, switched-off regions and
+ * inactive check-ins are left out.
  */
 async function claimAllCheckins() {
-  let claimed = 0;
+  const counts = { claimed: 0, skipped: 0, failed: 0 };
   for (const account of core.pool.list()) {
-    // A disabled account is one the user took out of the pool on purpose, so the
-    // scheduled pass must not collect its reward. `list()` filters removed
-    // accounts but not disabled ones, and the travel patrol right below already
-    // checks this — the claim was the one place that forgot to.
     if (core.pool.isDisabled(account.id) || !regionEnabled("workbuddy", regionOf(account.credential.domain))) continue;
     try {
       const before = await core.client.fetchCheckinStatus(account.credential);
-      if (!before.active || before.todayCheckedIn) continue;
+      if (!before.active) continue;
+      if (before.todayCheckedIn) {
+        counts.skipped += 1;
+        continue;
+      }
       await core.client.claimDailyCheckin(account.credential);
       probeCache.delete(account.id);
-      claimed += 1;
+      counts.claimed += 1;
     } catch (error) {
+      if (isAlreadyCheckin(error)) {
+        counts.skipped += 1;
+        continue;
+      }
+      counts.failed += 1;
       log("warn", "check-in failed for " + account.label + ": " + messageOf(error));
     }
   }
-  return claimed;
+  return counts;
 }
 
 /**
@@ -3749,10 +4047,10 @@ async function traeCheckinAll() {
  */
 async function traeClaimFor(credential, desktopCandidates) {
   const label = traeRowLabel(credential);
-  if (credential.expiresAtMs <= Date.now()) {
+  if (sourceCredentialExpired(credential, Date.now())) {
     const reason = "token expired (open Trae to refresh it)";
     log("warn", "[trae:cn] check-in skipped for " + label + ": " + reason);
-    return { outcome: "failed", reason };
+    return { outcome: "skipped", reason };
   }
   const client = new TraeSoloUpstreamClient({
     credential: async () => credential,
@@ -3760,6 +4058,11 @@ async function traeClaimFor(credential, desktopCandidates) {
   });
   try {
     const status = await client.fetchCheckinStatus();
+    // An account whose check-in program is off has nothing to claim. The panel
+    // reads the same flag to disable its button, and the WorkBuddy batch gates
+    // on `active` too; without this the batch would send a pointless mutation
+    // and count a refusal against an account that is simply not enrolled.
+    if (status.code === 0 && status.enable !== true) return { outcome: "skipped" };
     // The account's own reward for today already exists: nothing to do.
     if (status.code === 0 && status.checkedIn) return { outcome: "skipped" };
     // One check-in per device per day: when this machine already claimed for
@@ -3824,11 +4127,24 @@ async function autoCheckinTick(now) {
   // A source whose round opens later than the configured hour (Qoder opens at
   // 10:00 Beijing) is collected here, by the same timer, at its opening time.
   if (qoderRetryAt !== 0 && when.getTime() >= qoderRetryAt && activeQoderRegions().length > 0) {
-    qoderRetryAt = 0;
-    const retry = await qoderCheckinAll();
-    qoderRetryAt = typeof retry.opensAt === "number" && retry.opensAt > Date.now() ? retry.opensAt : 0;
-    autoCheckinLast = { ...autoCheckinLast, qoder: retry, at: new Date().toISOString() };
-    log("info", "deferred Qoder check-in: " + JSON.stringify(retry));
+    // Guarded like the slot path below, for the same reason: this branch also
+    // fans out over every Qoder account and writes `autoCheckinLast`, so a pass
+    // the user started by hand must not run beside it. The retry time is left
+    // set rather than cleared, so the next tick collects it.
+    if (checkinPassRunning) {
+      log("info", "deferred Qoder check-in deferred: a pass is already running");
+      return autoCheckinLast;
+    }
+    checkinPassRunning = true;
+    try {
+      qoderRetryAt = 0;
+      const retry = await qoderCheckinAll();
+      qoderRetryAt = typeof retry.opensAt === "number" && retry.opensAt > Date.now() ? retry.opensAt : 0;
+      autoCheckinLast = { ...autoCheckinLast, qoder: retry, at: new Date().toISOString() };
+      log("info", "deferred Qoder check-in: " + JSON.stringify(retry));
+    } finally {
+      checkinPassRunning = false;
+    }
     scheduleRefresh("auto-checkin");
     return autoCheckinLast;
   }
@@ -3842,36 +4158,10 @@ async function autoCheckinTick(now) {
     log("info", "scheduled check-in deferred: a pass is already running");
     return autoCheckinLast;
   }
-  autoCheckinSlots.add(slot);
-  checkinPassRunning = true;
-  autoCheckinLast = { slot, claimed: 0, at: new Date().toISOString() };
-  try {
-    autoCheckinLast.claimed = await claimAllCheckins();
-    log("info", "automatic check-in collected " + autoCheckinLast.claimed + " account(s) for " + slot);
-    // The travel patrol rides the same slot: one trip per eligible account,
-    // right after its daily reward. No separate timer or switch.
-    autoCheckinLast.travel = await travelAllAccounts();
-    log("info", "automatic travel patrol for " + slot + ": " + JSON.stringify(autoCheckinLast.travel));
-    // Qoder's daily round rides the same slot, on its own source switch. Its
-    // round opens at 10:00, so an earlier slot leaves a retry behind instead of
-    // recording the day as collected.
-    autoCheckinLast.qoder = await qoderCheckinAll();
-    qoderRetryAt = typeof autoCheckinLast.qoder.opensAt === "number" && autoCheckinLast.qoder.opensAt > Date.now()
-      ? autoCheckinLast.qoder.opensAt
-      : 0;
-    log("info", "automatic Qoder check-in for " + slot + ": " + JSON.stringify(autoCheckinLast.qoder));
-    // Trae's daily credits (CN only) ride the same slot, on its own source switch.
-    autoCheckinLast.trae = await traeCheckinAll();
-    log("info", "automatic Trae check-in for " + slot + ": " + JSON.stringify(autoCheckinLast.trae));
-  } catch (error) {
-    autoCheckinLast.error = safeMessage(error);
-    log("warn", "automatic check-in failed for " + slot + ": " + autoCheckinLast.error);
-  } finally {
-    // On every path: a pass that left the flag set would stop every later one.
-    checkinPassRunning = false;
-  }
-  scheduleRefresh("auto-checkin");
-  return autoCheckinLast;
+  // The same pass "run now" and the command palette run, which is what collects
+  // the streak bonus and the task rewards. It records the slot and the log, and
+  // it owns the re-entry guard, so this tick must not keep a second copy of either.
+  return await runCheckinPass({ slot });
 }
 
 function startAutoCheckin() {
@@ -3903,11 +4193,11 @@ function applyAutoCheckin() {
  * earliest point the plugin runs means a restart is always enough, and the
  * panel says so when the declaration could not be written.
  *
- * Note this is the only place the roster is fetched during load: opening the
- * panel no longer triggers detection of its own.
+ * Note this is the only place the roster is fetched during load; opening the
+ * panel does not trigger detection of its own.
  */
 async function publishDeclarationEarly() {
-  settings = await loadSettings();
+  await adoptHostSettings();
   if (settings.enabled === false) return;
   applySettingsToCore();
   reconcileRuntimes();
@@ -3915,10 +4205,15 @@ async function publishDeclarationEarly() {
   // gateways are only reconciled by a background refresh, so a fresh load
   // would declare the WorkBuddy pair alone and the host - which reads the
   // manifest before the process starts - would never see the other four rows.
-  await reconcileTraeGateways();
-  await reconcileQoderGateways();
-  if (activeRegions().length > 0) await core.pool.scan();
-  await startRuntimes();
+  // Bounded like the roster read below: a step that outruns the budget keeps
+  // running behind the answer, and the refresh after `service.start` publishes
+  // whatever it finished.
+  const bootstrapDeadline = Date.now() + LOAD_BOOTSTRAP_BUDGET_MS;
+  const bootstrapLeft = () => Math.max(0, bootstrapDeadline - Date.now());
+  await settleWithin(reconcileTraeGateways(), bootstrapLeft());
+  await settleWithin(reconcileQoderGateways(), bootstrapLeft());
+  if (activeRegions().length > 0) await settleWithin(core.pool.scan(), bootstrapLeft());
+  await settleWithin(startRuntimes(), bootstrapLeft());
   // Bounded like every other read: the host gives `onLoad` seconds, and a roster
   // that does not answer inside them still leaves a declaration to publish -
   // the fallback roster plus the saved selection - while the read it cut short
@@ -3939,22 +4234,28 @@ async function publishDeclarationEarly() {
 }
 
 async function onServiceStart() {
-  settings = await loadSettings();
+  serviceStopped = false;
+  if (warmAbort.signal.aborted) warmAbort = new AbortController();
+  await adoptHostSettings();
   if (settings.enabled === false) {
     log("info", "plugin disabled in settings; the provider host stays down");
     return;
   }
   applySettingsToCore();
   reconcileRuntimes();
-  await reconcileTraeGateways();
-  await startRuntimes();
+  // Bounded like the load path above: the host allows this hook 5 s, and the
+  // reconcilers must not be the part of it that runs unbounded.
+  const bootstrapDeadline = Date.now() + SERVICE_BOOTSTRAP_BUDGET_MS;
+  const bootstrapLeft = () => Math.max(0, bootstrapDeadline - Date.now());
+  await settleWithin(reconcileTraeGateways(), bootstrapLeft());
+  await settleWithin(reconcileQoderGateways(), bootstrapLeft());
+  await settleWithin(startRuntimes(), bootstrapLeft());
   // Concurrent and bounded: the host allows this hook 5 s, and it is the path
   // that finishes what `onLoad` left behind. A gateway whose read is cut short
   // is marked stale by `connect` itself, so the refresh below repeats it.
   await settleWithin(Promise.all(Array.from(runtimes.values()).map(async (runtime) => {
     try {
-      // Skipped when onLoad already seeded a fresh roster moments ago; the
-      // per-gateway timer takes over from there.
+      // Skip the fetch when onLoad already seeded a fresh roster.
       await connect(runtime, !catalogFresh(runtime));
     } catch (error) {
       runtime.lastError = safeMessage(error);
@@ -3968,30 +4269,33 @@ async function onServiceStart() {
 }
 
 async function onServiceStop() {
-  for (const runtime of runtimes.values()) stopRuntime(runtime);
-  for (const entry of Array.from(traeGateways.values())) {
-    try {
-      await entry.gateway.close();
-    } catch (error) {
-      log("warn", "[trae:" + entry.region + "] gateway did not close cleanly: " + messageOf(error));
-    }
+  serviceStopped = true;
+  if (refreshTimer !== null) {
+    clearTimeout(refreshTimer);
+    refreshTimer = null;
+  }
+  stopAutoCheckin();
+  abortWarmups();
+  const closing = Array.from(runtimes.values()).map(stopRuntime);
+  runtimes.clear();
+  for (const entry of [...traeGateways.values(), ...qoderGateways.values()]) {
+    closing.push(entry.gateway.close().catch((error) => {
+      log("warn", "[" + entry.source + ":" + entry.region + "] gateway did not close cleanly: " + messageOf(error));
+    }));
   }
   traeGateways.clear();
-  for (const entry of Array.from(qoderGateways.values())) {
-    try {
-      await entry.gateway.close();
-    } catch (error) {
-      log("warn", "[qoder:" + entry.region + "] gateway did not close cleanly: " + messageOf(error));
-    }
-  }
   qoderGateways.clear();
+  await Promise.all(closing);
 }
 
 async function onLoad() {
+  // Cleared here, not only in `onServiceStart`: `publishDeclarationEarly` below
+  // starts the gateways, and every creator refuses to run while this is set.
+  serviceStopped = false;
   // A previous load's warm-ups were aborted on the way out; this one gets a
   // controller of its own so its warm-ups can be stopped the same way.
   warmAbort = new AbortController();
-  settings = await loadSettings();
+  await adoptHostSettings();
   try {
     packageRoot = __dirname;
   } catch {
@@ -4006,7 +4310,7 @@ async function onLoad() {
   // Reload right away when a previous id's file was taken over: the settings
   // were read above, before the copy existed, and a load that publishes the
   // declaration first would publish it with the defaults.
-  if (await adoptPreviousDataDir()) settings = await loadSettings();
+  if (await adoptPreviousDataDir()) await adoptHostSettings();
   // The client is built first because the pool refreshes tokens through it.
   core.client = new WorkBuddyUpstreamClient();
   core.pool = new WorkBuddyAccountPool({
@@ -4029,13 +4333,7 @@ async function onLoad() {
 }
 
 async function onUnload() {
-  if (refreshTimer !== null) {
-    clearTimeout(refreshTimer);
-    refreshTimer = null;
-  }
   stopAutoCheckin();
-  // Before the gateways close, so a warm-up still in flight stops on the signal
-  // rather than on the connection error it would raise from a closed socket.
   abortWarmups();
   // Publish the current declaration one last time. The host reads the manifest
   // when it next loads the plugin, so writing here means a selection changed in
@@ -4046,20 +4344,7 @@ async function onUnload() {
   } catch (error) {
     log("warn", "could not publish the declaration during unload: " + messageOf(error));
   }
-  for (const runtime of runtimes.values()) stopRuntime(runtime);
-  runtimes.clear();
-  for (const entry of Array.from(traeGateways.values())) {
-    entry.gateway.close().catch((error) => {
-      log("warn", "[trae:" + entry.region + "] gateway did not close cleanly: " + messageOf(error));
-    });
-  }
-  traeGateways.clear();
-  for (const entry of Array.from(qoderGateways.values())) {
-    entry.gateway.close().catch((error) => {
-      log("warn", "[qoder:" + entry.region + "] gateway did not close cleanly: " + messageOf(error));
-    });
-  }
-  qoderGateways.clear();
+  await onServiceStop();
   probeCache.clear();
   try {
     if (pi.events && typeof pi.events.off === "function" && settingsChangedHandler !== null) {
@@ -4174,7 +4459,11 @@ function sourceComposerAccounts(source, region) {
   }
   return rows.map((row) => {
     const credits = row.usage?.credits;
+    // The label is this source's identity - the preference is stored by label -
+    // so the popup's row marking keys on the same value. Without it the client
+    // reads an empty id and can never tell which row a notice is about.
     return {
+      id: row.label,
       label: row.label,
       active: active !== undefined && active.label === row.label,
       ...typeof credits?.total === "number" ? { total: credits.total } : {},
@@ -4184,11 +4473,12 @@ function sourceComposerAccounts(source, region) {
   });
 }
 
-/** Cached credits for the model the composer is showing. No upstream read. */
+/** Cache-first credits; missing balances are refreshed in the background. */
 function composerPoints(args) {
   if (!composerPointsEnabled()) return { show: false };
   const hit = matchComposerModel(args?.chip);
   if (hit === undefined) return { show: false };
+  if (hit.source === "workbuddy" && probesStale()) scheduleRefresh("composer");
   const accounts = hit.source === "workbuddy"
     ? workbuddyComposerAccounts(hit.region, hit.id)
     : sourceComposerAccounts(hit.source, hit.region);
@@ -4211,8 +4501,11 @@ async function composerPrefer(args) {
   if (source === "workbuddy") {
     const accountId = typeof args?.accountId === "string" ? args.accountId : "";
     if (!REGIONS.includes(region)) return { show: false };
+    // A sign-in that is gone is a refusal, exactly as the Trae/Qoder branch below
+    // treats it: answering with the current snapshot (`show: true`) made the chip
+    // close as though the switch had landed.
     if (accountId !== "" && !core.pool.list(region).some((account) => account.id === accountId)) {
-      return composerPoints(args);
+      return { show: false };
     }
     const preferredAccountIds = {};
     for (const key of REGIONS) {
@@ -4223,7 +4516,27 @@ async function composerPrefer(args) {
     else preferredAccountIds[region] = accountId;
     if (await saveSettings({ preferredAccountIds }) !== true) throw panelError("the account choice could not be saved", "SAVE_FAILED");
     core.pool.prefer(accountId || undefined, region);
-    return composerPoints(args);
+    // Listed is not the same as usable. A cooling, switched-off or reserve-held
+    // account is still on the card and still clickable, but the pool skips it, so
+    // storing the preference changes nothing this session. The choice is still
+    // worth storing - it applies the moment the account recovers - and reporting
+    // that back is what stops the popup from closing on a click that did not
+    // switch anything.
+    // Judged against the same question the popup marked the rows with - the
+    // roster of this model - so a model-level cooldown reads the same in both
+    // places. `undefined` here would call an account servable that the popup
+    // has just left unmarked.
+    const servable = accountId === ""
+      || core.pool.available(Date.now(), hit.id, region).some((account) => account.id === accountId);
+    // `saved` separates "the choice is stored and already in force" from
+    // "nothing was stored": every refusal returned above, so everything past
+    // `saveSettings` succeeded. It is reported separately because the snapshot
+    // can be missing for reasons that have nothing to do with the click - the
+    // credits chip can be switched off in the panel between the popup's read
+    // and this call, leaving an answer with no rows - which a reader would
+    // otherwise take for a refusal even though the save landed.
+    const answer = composerPoints(args);
+    return { ...answer, saved: true, ...(servable ? {} : { unavailable: true }) };
   }
   if (source !== "trae" && source !== "qoder") return { show: false };
   if (!(source === "trae" ? TRAE_REGIONS : QODER_REGIONS).includes(region)) return { show: false };
@@ -4233,12 +4546,50 @@ async function composerPrefer(args) {
   if (accountLabel === "") delete next[sourceRegionKey(source, region)];
   else next[sourceRegionKey(source, region)] = accountLabel;
   if (await saveSettings({ preferredSourceAccounts: next }) !== true) throw panelError("the account choice could not be saved", "SAVE_FAILED");
+  // Same contract as the WorkBuddy branch: past the save the choice is in
+  // force, so it is reported as stored even if the snapshot is unavailable.
+  return { ...composerPoints(args), saved: true };
+}
+
+/**
+ * Re-read the credits behind the composer popup, then answer with them.
+ *
+ * The popup lists one route's accounts. A WorkBuddy region drops its probe
+ * cache and reads it back; a Trae or Qoder region re-probes each of its rows,
+ * keeping the figures it already has when a read fails. The polled readout
+ * stays cache-only — this is the one call the click is allowed to wait on.
+ */
+async function composerRefresh(args) {
+  const hit = matchComposerModel(args?.chip);
+  if (hit === undefined) return composerPoints(args);
+  if (hit.source === "workbuddy") {
+    for (const account of core.pool.list(hit.region)) probeCache.delete(account.id);
+    await settleWithin(statusDocument({ allowNetwork: true, budgetMs: PANEL_STEP_BUDGET_MS }), PANEL_STEP_BUDGET_MS);
+    return composerPoints(args);
+  }
+  const rows = hit.source === "trae" ? traeAccountRows : qoderAccountRows;
+  const found = hit.source === "trae" ? await discoverTraeCredentials() : await discoverQoderCredentials();
+  for (const row of rows) {
+    if (row.region !== hit.region) continue;
+    const credential = found.credentials.find((item) => {
+      const itemLabel = hit.source === "trae" ? traeRowLabel(item) : qoderRowLabel(item);
+      const itemRegion = hit.source === "trae" ? traeRegionOfCredential(item) : item.region;
+      return itemLabel === row.label && itemRegion === row.region;
+    });
+    if (credential === undefined) continue;
+    const probe = hit.source === "trae"
+      ? await traeRowProbe(credential, row)
+      : await qoderRowProbe(credential, row);
+    if (probe?.usage) row.usage = probe.usage;
+    if (probe?.checkin) row.checkin = probe.checkin;
+  }
   return composerPoints(args);
 }
 
 async function onRendererCall(method, args) {
   if (method === "xd.composerPoints") return composerPoints(args || {});
   if (method === "xd.composerPrefer") return composerPrefer(args || {});
+  if (method === "xd.composerRefresh") return composerRefresh(args || {});
   const error = new Error("unknown renderer method");
   error.code = "PLUGIN_CALL_UNKNOWN";
   throw error;

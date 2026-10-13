@@ -1,5 +1,5 @@
 /**
- * Build script for pi-desktop-xdpool.
+ * Build script for pi-desktop-wtq-pool.
  *
  * Compiles the host-agnostic core modules in `src/*.ts` to CommonJS in `lib/`,
  * one output file per input (`bundle: false`), so the PI-Desktop host can

@@ -1,6 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 
 let host;
+const REFRESH_INTERVAL_MS = 300000;
+const WARMUP_INTERVAL_MS = 5000;
+const WARMUP_WINDOW_MS = 60000;
 
 const CSS = `
 .xd-points{position:relative;display:inline-flex;align-items:center;min-width:0}
@@ -10,7 +13,7 @@ const CSS = `
    colour is one step stronger than tertiary: it is the account's balance, the
    one thing on that row worth a glance, and it has to be findable first. A dot
    carries that meaning without borrowing an icon set the host does not give. */
-.xd-points-mark{display:inline-block;width:6px;height:6px;flex:0 0 auto;border-radius:50%;background:#3dd68c}
+.xd-points-mark{display:inline-block;width:6px;height:6px;flex:0 0 auto;border-radius:50%;background:#4f9f7c}
 .xd-points-panel{position:fixed;z-index:40;min-width:240px;max-width:360px;max-height:320px;overflow:auto;padding:8px;border-radius:12px;background:var(--ds-bg-elevated,var(--ds-bg,#1c1d21));color:var(--ds-text,#e8e8ea);box-shadow:0 8px 28px rgba(0,0,0,.28);border:1px solid var(--ds-border,rgba(127,127,127,.25))}
 .xd-points-table{width:100%;border-collapse:collapse;font-size:12px}
 .xd-points-table th{text-align:left;font-weight:600;padding:4px 6px;color:var(--ds-text-secondary,#8b8d93)}
@@ -18,8 +21,12 @@ const CSS = `
 .xd-points-row{cursor:pointer}
 .xd-points-row:hover{background:var(--ds-bg-muted,rgba(127,127,127,.12))}
 .xd-points-row.is-active{cursor:default}
-.xd-points-dot{display:inline-block;width:6px;height:6px;margin-right:6px;border-radius:50%;background:#3dd68c;vertical-align:middle}
+.xd-points-dot{display:inline-block;width:6px;height:6px;margin-right:6px;border-radius:50%;background:#4f9f7c;vertical-align:middle}
 .xd-points-packs{margin:2px 0 0;padding:0;list-style:none;color:var(--ds-text-secondary,#8b8d93)}
+.xd-points-bar{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
+.xd-points-refresh{border:0;background:transparent;color:var(--ds-text-secondary,#8b8d93);font:inherit;font-size:12px;padding:3px 8px;border-radius:999px;cursor:pointer}
+.xd-points-refresh:hover:not(:disabled){background:var(--ds-bg-muted,rgba(127,127,127,.12));color:var(--ds-text,#e8e8ea)}
+.xd-points-refresh:disabled{opacity:.5;cursor:default}
 `;
 
 export async function onLoad(pi) {
@@ -45,11 +52,19 @@ const WORDS = {
     planQuota: "套餐", addOnQuota: "资源包", credits: "积分",
     never: "不过期", monthly: "月度", days: (days) => days + "天",
     title: "查看账号积分", account: "账号", balance: "积分",
+    refresh: "刷新积分", refreshing: "正在刷新…",
+    refused: "这个账号无法切换，刷新后重试",
+    saved: "已设为优先；积分面板暂不可用，恢复后自动生效",
+    unavailable: "已设为优先，但该账号现在不能服务（冷却或已停用），恢复后自动生效",
   },
   en: {
     planQuota: "Plan", addOnQuota: "Add-on", credits: "Credits",
     never: "never expires", monthly: "monthly", days: (days) => days + " days",
     title: "Account credits", account: "Account", balance: "Credits",
+    refresh: "Refresh credits", refreshing: "Refreshing…",
+    refused: "That account cannot be switched; refresh and try again",
+    saved: "Set as preferred; the credits panel is unavailable right now and it takes over once it recovers",
+    unavailable: "Set as preferred, but that account cannot serve right now (cooling or switched off); it takes over once it recovers",
   },
 };
 function currentLocale() {
@@ -107,12 +122,18 @@ function ComposerPoints() {
   const [open, setOpen] = useState(false);
   const [place, setPlace] = useState(null);
   const [error, setError] = useState("");
+  // The account a stored-but-not-serving notice is about. A cooling account
+  // recovers on its own, so without this the notice outlived the condition it
+  // described and eventually contradicted the active dot beside it.
+  const [errorFor, setErrorFor] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
   const [, setLocale] = useState(currentLocale());
   const W = words();
   const rootRef = useRef(null);
   const panelRef = useRef(null);
   const chipRef = useRef(chip);
   chipRef.current = chip;
+  const restartPollRef = useRef(() => {});
 
   // The host prints the selected model on the chip it renders beside this slot
   // as `alias?.trim() || modelId`, and for this plugin the alias is the name
@@ -138,17 +159,43 @@ function ComposerPoints() {
     setData(null);
     setOpen(false);
     setError("");
+    setErrorFor("");
     if (!host || chip === "") return undefined;
     let stop = false;
+    let timer = 0;
+    let startedAt = Date.now();
+    const schedule = (next) => {
+      const warming = next && next.show === true && typeof next.total !== "number"
+        && Date.now() - startedAt < WARMUP_WINDOW_MS;
+      clearTimeout(timer);
+      timer = setTimeout(pull, warming ? WARMUP_INTERVAL_MS : REFRESH_INTERVAL_MS);
+    };
     const pull = () => {
       host.dispatch("plugin.call", { method: "xd.composerPoints", args: { chip } })
-        .then((next) => { if (!stop) setData(next && next.show === true ? next : null); })
-        .catch(() => { if (!stop) setData(null); });
+        .then((next) => {
+          if (stop) return;
+          setData(next && next.show === true ? next : null);
+          schedule(next);
+        })
+        .catch(() => { if (!stop) { setData(null); schedule(null); } });
     };
+    restartPollRef.current = () => { clearTimeout(timer); startedAt = Date.now(); pull(); };
     pull();
-    const timer = setInterval(pull, 300000);
-    return () => { stop = true; clearInterval(timer); };
+    return () => { stop = true; clearTimeout(timer); restartPollRef.current = () => {}; };
   }, [chip]);
+
+  // A cooling account recovers by itself, so the notice that named it has to go
+  // when that account starts serving: it described a state that no longer
+  // holds, and it is this popup's own marking that says so.
+  useEffect(() => {
+    if (errorFor === "" || data === null) return undefined;
+    const row = (data.accounts || []).find((account) => account.id === errorFor);
+    if (row && row.active === true) {
+      setError("");
+      setErrorFor("");
+    }
+    return undefined;
+  }, [data, errorFor]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -203,9 +250,35 @@ function ComposerPoints() {
           role: "dialog",
           "aria-label": W.title,
           style: { left: place.left + "px", top: place.top + "px", transform: "translateY(-100%)" },
-        }, error ? h("p", { role: "alert" }, error) : null, accountTable(h, data, (account) => {
+        },
+        h("div", { className: "xd-points-bar" },
+          h("span", null, W.title),
+          h("button", {
+            type: "button",
+            className: "xd-points-refresh",
+            disabled: refreshing,
+            onClick: () => {
+              if (!host || refreshing) return;
+              setRefreshing(true);
+              setError("");
+              const requestedChip = chip;
+              host.dispatch("plugin.call", { method: "xd.composerRefresh", args: { chip } })
+                .then((next) => {
+                  if (chipRef.current !== requestedChip) return;
+                  if (next && next.show === true) setData(next);
+                })
+                .catch((failure) => {
+                  if (chipRef.current !== requestedChip) return;
+                  setError(String(failure && failure.message ? failure.message : failure));
+                })
+                .finally(() => { setRefreshing(false); });
+            },
+          }, refreshing ? W.refreshing : W.refresh),
+        ),
+        error ? h("p", { role: "alert" }, error) : null, accountTable(h, data, (account) => {
           if (!host || account.active === true) return;
           setError("");
+          setErrorFor("");
           const requestedChip = chip;
           host.dispatch("plugin.call", {
             method: "xd.composerPrefer",
@@ -217,15 +290,33 @@ function ComposerPoints() {
               accountLabel: account.label || "",
             },
           }).then((next) => {
-            // The main process refuses a label it cannot honour - a sign-in that
-            // expired between the two reads, say - and says so with show:false.
-            // Closing regardless would leave the user believing the account
-            // changed, so the panel stays open and the chip keeps reading as it
-            // did before the click.
-            if (chipRef.current === requestedChip && next && next.show === true) {
-              setData(next);
-              setOpen(false);
+            if (chipRef.current !== requestedChip) return;
+            // `saved` is the main process's word for "the preference is stored
+            // and already in force", so it is the one thing that separates a
+            // refusal from a snapshot that merely went missing between the
+            // popup's read and this click.
+            if (!next || next.saved !== true) {
+              setError(W.refused);
+              setErrorFor("");
+              return;
             }
+            if (next.show !== true) {
+              setError(W.saved);
+              setErrorFor(account.id || "");
+              return;
+            }
+            setData(next);
+            restartPollRef.current();
+            // `unavailable` means the preference was stored but the account
+            // cannot serve yet - the pool skips a cooling, switched-off or
+            // reserve-held one - so the marked row is still someone else and the
+            // click would look ignored if the popup closed on it.
+            if (next.unavailable === true) {
+              setError(W.unavailable);
+              setErrorFor(account.id || "");
+              return;
+            }
+            setOpen(false);
           }).catch((failure) => {
             if (chipRef.current === requestedChip) setError(String(failure && failure.message ? failure.message : failure));
           });

@@ -12,7 +12,7 @@
  * shape. The guards follow corrinehu/dsh-workbuddy-connect (MIT, Copyright
  * (c) 2026 Corrine Hu), which designed and validated them.
  *
- * @module pi-desktop-xdpool/shim
+ * @module pi-desktop-wtq-pool/shim
  */
 
 import { createHash } from 'node:crypto'
@@ -21,6 +21,7 @@ import { Readable } from 'node:stream'
 import type { WorkBuddyAccountPool } from './accounts'
 import type { WorkBuddyCatalog } from './catalog'
 import { parseRateLimitReset, WorkBuddyUpstreamClient, type UpstreamErrorKind, type WorkBuddyRegion } from './upstream'
+import { SseDecoder } from './trae-sse'
 
 export interface ShimLogger {
   info?(...args: unknown[]): void
@@ -60,15 +61,13 @@ export interface WorkBuddyShimOptions {
    * Absent means the whole directory.
    */
   listedIds?: () => readonly string[]
-  /** Max accounts to try per request before giving up. */
-  maxAttempts?: number
 }
 
 /**
  * Loopback guards and the request body bound live in `./loopback` — one copy,
  * shared with the Trae and Qoder gateways.
  */
-import { answerRequest, bearerAccepted, hostIsLoopback, isJsonContentType, listedModels, originIsLoopback, readRequestBody, writeJson, writeOpenAIError } from './loopback'
+import { answerRequest, guardsPass, isJsonContentType, listedModels, readRequestBody, writeJson, writeOpenAIError } from './loopback'
 /** HTTP status each upstream failure class surfaces as. */
 const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
   hard_credit: 402,
@@ -116,7 +115,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
   const { pool, client, catalog } = options
   const region = options.region
   const logger = options.logger
-  const maxAttempts = options.maxAttempts ?? 8
+  const maxAttempts = 8
 
 
   const server: Server = createServer((req, res) => {
@@ -132,7 +131,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
   // and a listener per call would pile up on a server that is already down.
   // An unhandled 'error' on the server would take the plugin's process with it.
   server.on('error', (error: unknown) => {
-    logger?.warn?.('pi-desktop-xdpool: workbuddy shim server error', error)
+    logger?.warn?.('pi-desktop-wtq-pool: workbuddy shim server error', error)
   })
 
   /** The bound port, or 0 before `listening` (or after close). */
@@ -149,18 +148,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
   }
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (!hostIsLoopback(req.headers.host)) {
-      writeOpenAIError(res, 403, 'host_not_allowed', 'Host header must name the loopback interface')
-      return
-    }
-    if (!originIsLoopback(req.headers.origin)) {
-      writeOpenAIError(res, 403, 'origin_not_allowed', 'Origin must be a loopback origin')
-      return
-    }
-    if (!bearerAccepted(req)) {
-      writeOpenAIError(res, 401, 'unauthorized', 'missing or invalid Authorization bearer')
-      return
-    }
+    if (!guardsPass(req, res)) return
     const url = req.url ?? '/'
     if (req.method === 'GET' && (url === '/healthz' || url === '/healthz/')) {
       writeJson(res, 200, { ok: true, pool: pool.status() })
@@ -322,7 +310,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
           writeOpenAIError(res, 502, 'upstream_error', 'workbuddy returned no stream')
           return
         }
-        logger?.info?.(`pi-desktop-xdpool: served by ${account.label}`)
+        logger?.info?.(`pi-desktop-wtq-pool: served by ${account.label}`)
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
@@ -330,12 +318,17 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
           'X-Accel-Buffering': 'no',
         })
         let sawDone = false
+        const decoder = new TextDecoder()
+        const sse = new SseDecoder()
         const body = Readable.fromWeb(result.response.body as Parameters<typeof Readable.fromWeb>[0])
-        body.on('data', (chunk: Buffer) => {
-          if (chunk.includes('[DONE]')) sawDone = true
-        })
         body.on('error', (error: unknown) => {
-          logger?.warn('pi-desktop-xdpool: upstream stream failed mid-flight', error)
+          // The client hanging up aborts this read through `controller` — the
+          // abort is this shim working as designed, and it arrives here shaped
+          // like an upstream failure. Recorded, the thousands of them buried the
+          // failures that matter; the signal is what tells the two apart.
+          if (!controller.signal.aborted) {
+            logger?.warn('pi-desktop-wtq-pool: upstream stream failed mid-flight', error)
+          }
           res.destroy(error instanceof Error ? error : new Error(String(error)))
         })
         // The upstream can also just stop, without erroring and without having
@@ -349,10 +342,22 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         /** End the response with `[DONE]` unless the upstream already sent it. */
         function closeWithoutDone(): void {
           if (sawDone || !res.writable) return
-          logger?.warn?.('pi-desktop-xdpool: upstream stream ended without [DONE]')
+          logger?.warn?.('pi-desktop-wtq-pool: upstream stream ended without [DONE]')
           res.end('data: [DONE]\n\n')
         }
+        // Pipe first so the terminal frame reaches the client before we end it.
         body.pipe(res)
+        body.on('data', (chunk: Buffer) => {
+          try {
+            if (!sse.push(decoder.decode(chunk, { stream: true })).some(event => event.data === '[DONE]')) return
+            sawDone = true
+            body.unpipe(res)
+            res.end()
+            body.destroy()
+          } catch (error: unknown) {
+            body.destroy(error instanceof Error ? error : new Error(String(error)))
+          }
+        })
         return
       }
 
@@ -384,7 +389,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         pool.penalize(account.id)
       }
       logger?.warn(
-        `pi-desktop-xdpool: ${account.label} ${result.kind} on ${modelId} ` +
+        `pi-desktop-wtq-pool: ${account.label} ${result.kind} on ${modelId} ` +
           `(attempt ${attempt + 1}/${maxAttempts}); rotating`,
       )
     }

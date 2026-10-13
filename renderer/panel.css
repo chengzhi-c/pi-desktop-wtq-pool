@@ -1,5 +1,5 @@
 /*
- * pi-desktop-xdpool panel.
+ * pi-desktop-wtq-pool panel.
  *
  * Design language: quiet instrument. Hierarchy comes from borders, spacing and
  * weight — never from shadows (deliberately zero box-shadow in this panel) or
@@ -23,19 +23,19 @@
   --xd-fg: #1b1d21;
   --xd-muted: #6b7280;
   --xd-border: #e3e5ea;
-  /* The panel owns its accent: a hue of its own instead of a borrowed host
-     colour, so it reads the same in both bases. Teal 700 on light; --xd-on-accent
-     is the ink that sits on filled accent controls. */
-  --xd-accent: #0f766e;
+  /* The panel owns its accent: one hue per role, shared by both bases, so a
+     role reads as the same colour at two strengths instead of four vivid hues.
+     --xd-on-accent / --xd-on-danger are the inks that sit on filled controls. */
+  --xd-accent: #2e706a;
   --xd-on-accent: #ffffff;
   --xd-card: #ffffff;
   --xd-soft: color-mix(in srgb, var(--xd-fg) 4%, transparent);
   --xd-softer: color-mix(in srgb, var(--xd-fg) 2.5%, transparent);
   --xd-line: color-mix(in srgb, var(--xd-border) 60%, transparent);
-  --xd-danger: #c0392b;
+  --xd-danger: #7b352d;
   --xd-on-danger: #ffffff;
-  --xd-warn: #b7791f;
-  --xd-ok: #1e874b;
+  --xd-warn: #7a5c29;
+  --xd-ok: #2e664a;
   --xd-titlebar: var(--pi-plugin-titlebar-height, 46px);
   --xd-radius: 8px;
   --xd-radius-small: 6px;
@@ -62,12 +62,12 @@
   --xd-muted: #9aa1ad;
   --xd-border: #2c3038;
   --xd-card: #1c1f25;
-  --xd-accent: #2dd4bf;
-  --xd-on-accent: #0c3d37;
-  --xd-ok: #4ec98a;
-  --xd-danger: #f08080;
-  --xd-on-danger: #4a0d0a;
-  --xd-warn: #e0b055;
+  --xd-accent: #67c1b8;
+  --xd-on-accent: #163633;
+  --xd-ok: #64b98f;
+  --xd-danger: #c8736a;
+  --xd-on-danger: #341b18;
+  --xd-warn: #cba462;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-base="light"]) {
@@ -77,12 +77,12 @@
     --xd-muted: #9aa1ad;
     --xd-border: #2c3038;
     --xd-card: #1c1f25;
-    --xd-accent: #2dd4bf;
-    --xd-on-accent: #0c3d37;
-    --xd-ok: #4ec98a;
-    --xd-danger: #f08080;
-    --xd-on-danger: #4a0d0a;
-    --xd-warn: #e0b055;
+    --xd-accent: #67c1b8;
+    --xd-on-accent: #163633;
+    --xd-ok: #64b98f;
+    --xd-danger: #c8736a;
+    --xd-on-danger: #341b18;
+    --xd-warn: #cba462;
   }
 }
 
@@ -1014,6 +1014,23 @@ button.park:hover:not(:disabled) { filter: brightness(1.08); background: var(--x
   border-color: var(--xd-fg);
   font-weight: 600;
 }
+/*
+ * The selected preset is the sheet's one filled chip, so it needs its own
+ * pointer states: the generic `button:hover:not(:disabled)` rule is (0,2,1) and
+ * outranks `.preset.active` at (0,2,0), which replaced the fill with a
+ * near-transparent wash and left the inverted label on a background of its own
+ * colour - white on white in the light theme, black on black in the dark one.
+ * The other filled buttons (`.primary`, `.park`) already re-declare their fill
+ * for the same reason; this one keeps it and mixes a little of the page
+ * background in, which reads as feedback in both themes where a brightness
+ * filter would clip, since the dark fill is already near white.
+ */
+.preset.active:hover:not(:disabled),
+.preset.active:active:not(:disabled) {
+  background: color-mix(in srgb, var(--xd-fg) 88%, var(--xd-bg));
+  border-color: var(--xd-fg);
+  color: var(--xd-bg);
+}
 
 .default-level { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
 
@@ -1086,9 +1103,32 @@ button.park:hover:not(:disabled) { filter: brightness(1.08); background: var(--x
   padding-top: 10px;
   border-top: 1px solid var(--xd-line);
   display: flex;
+  align-items: center;
   gap: 10px;
   flex-wrap: wrap;
 }
+.foot-status { display: flex; gap: inherit; flex-wrap: wrap; }
+.foot-links { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+.foot a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 9px;
+  border: 1px solid color-mix(in srgb, var(--xd-accent) 35%, var(--xd-border));
+  border-radius: var(--xd-radius-small);
+  background: color-mix(in srgb, var(--xd-accent) 8%, var(--xd-bg));
+  color: var(--xd-accent);
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.foot a svg { width: 14px; height: 14px; flex-shrink: 0; }
+.foot a:hover {
+  border-color: var(--xd-accent);
+  background: color-mix(in srgb, var(--xd-accent) 14%, var(--xd-bg));
+}
+.foot a:focus-visible { outline: 2px solid var(--xd-accent); outline-offset: 2px; }
 
 /* Empty states: dashed outline, one drawn glyph, one sentence of guidance. */
 .empty {

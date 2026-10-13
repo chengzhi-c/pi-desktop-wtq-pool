@@ -12,7 +12,7 @@
  * is the only way a time-boxed offer can be encoded without someone having to
  * remember to delete it.
  *
- * @module pi-desktop-xdpool/promo
+ * @module pi-desktop-wtq-pool/promo
  */
 
 import type { WorkBuddyRegion } from './upstream'

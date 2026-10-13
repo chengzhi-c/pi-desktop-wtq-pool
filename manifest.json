@@ -1,13 +1,13 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.chengzhi-c.pi-desktop-xdpool",
-  "name": "pi-desktop-xdpool",
-  "version": "1.0.0",
+  "id": "io.github.chengzhi-c.pi-desktop-wtq-pool",
+  "name": "WTQ Pool",
+  "version": "1.0.1",
   "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接进 PI-Desktop。WorkBuddy 被限流时自动换号，三家各有开关。",
   "author": "chengzhi-c (PI-Desktop port of XDTrees/dsh-workbuddy-xdpool)",
   "license": "MIT",
-  "homepage": "https://github.com/chengzhi-c/pi-desktop-xdpool",
-  "repository": "https://github.com/chengzhi-c/pi-desktop-xdpool",
+  "homepage": "https://github.com/chengzhi-c/pi-desktop-wtq-pool",
+  "repository": "https://github.com/chengzhi-c/pi-desktop-wtq-pool",
   "main": "main.js",
   "categories": [
     "productivity"
@@ -17,6 +17,7 @@
     "background.service",
     "provider.register",
     "renderer.extension",
+    "shell.openExternal",
     "clipboard.write"
   ],
   "renderer": "renderer/composer.mjs",
@@ -25,29 +26,30 @@
   ],
   "rendererCallMethods": [
     "xd.composerPoints",
-    "xd.composerPrefer"
+    "xd.composerPrefer",
+    "xd.composerRefresh"
   ],
   "engines": {
     "piDesktop": ">=0.15.0"
   },
   "i18n": {
     "en": {
-      "name": "pi-desktop-xdpool",
+      "name": "WTQ Pool",
       "description": "Bring this machine's WorkBuddy, Trae and Qoder desktop sign-ins into PI-Desktop. A rate-limited WorkBuddy account fails over to the next one. Each source has its own switch.",
-      "safetyNotes": "Reads the WorkBuddy, Trae and Qoder sign-ins already saved on this machine. If an install is not in its default location, only its uninstall registry entry is read to find it. Keys for encrypted fields stay in memory. Tokens go only to each vendor's own hosts: copilot.tencent.com / codebuddy.cn / codebuddy.ai / workbuddy.ai, api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai, gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh. Chat is served from 127.0.0.1."
+      "safetyNotes": "Reads the WorkBuddy, Trae and Qoder sign-ins already saved on this machine. If an install is not in its default location, only its uninstall registry entry is read to find it. Keys for encrypted fields stay in memory. Tokens go only to each vendor's own hosts: copilot.tencent.com / codebuddy.cn / codebuddy.ai / workbuddy.ai / www.workbuddy.cn, api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai, gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh. Chat is served from 127.0.0.1."
     },
     "zh-CN": {
-      "name": "pi-desktop-xdpool",
+      "name": "WTQ Pool",
       "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接进 PI-Desktop。WorkBuddy 被限流时自动换号，三家各有开关。",
-      "safetyNotes": "只读本机 WorkBuddy、Trae、Qoder 已保存的登录。默认位置找不到安装目录时，只读卸载项来定位。加密字段的密钥只留在内存。令牌只发往各家自己的接口：copilot.tencent.com / codebuddy.cn / codebuddy.ai / workbuddy.ai、api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai、gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh。对话由本机 127.0.0.1 上的端点转发。"
+      "safetyNotes": "只读本机 WorkBuddy、Trae、Qoder 已保存的登录。默认位置找不到安装目录时，只读卸载项来定位。加密字段的密钥只留在内存。令牌只发往各家自己的接口：copilot.tencent.com / codebuddy.cn / codebuddy.ai / workbuddy.ai / www.workbuddy.cn、api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai、gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh。对话由本机 127.0.0.1 上的端点转发。"
     }
   },
-  "safetyNotes": "Reads the WorkBuddy, Trae and Qoder sign-ins already saved on this machine. If an install is not in its default location, only its uninstall registry entry is read to find it. Keys for encrypted fields stay in memory. Tokens go only to each vendor's own hosts: copilot.tencent.com / codebuddy.cn / codebuddy.ai / workbuddy.ai, api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai, gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh. Chat is served from 127.0.0.1.",
+  "safetyNotes": "Reads the WorkBuddy, Trae and Qoder sign-ins already saved on this machine. If an install is not in its default location, only its uninstall registry entry is read to find it. Keys for encrypted fields stay in memory. Tokens go only to each vendor's own hosts: copilot.tencent.com / codebuddy.cn / codebuddy.ai / workbuddy.ai / www.workbuddy.cn, api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai, gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh. Chat is served from 127.0.0.1.",
   "ui": {
     "panel": "renderer/index.html",
     "title": {
-      "en": "pi-desktop-xdpool",
-      "zh-CN": "pi-desktop-xdpool"
+      "en": "WTQ Pool",
+      "zh-CN": "WTQ Pool"
     },
     "width": 900,
     "height": 900
@@ -59,7 +61,7 @@
     "commands": [
       {
         "id": "xdpool.open",
-        "title": "pi-desktop-xdpool: Open Panel",
+        "title": "WTQ Pool: Open Panel",
         "category": "Productivity",
         "keywords": [
           "workbuddy",
@@ -70,7 +72,7 @@
       },
       {
         "id": "xdpool.rescan",
-        "title": "pi-desktop-xdpool: Detect Accounts Again",
+        "title": "WTQ Pool: Detect Accounts Again",
         "category": "Productivity",
         "keywords": [
           "workbuddy",
@@ -80,7 +82,7 @@
       },
       {
         "id": "xdpool.resetCooldowns",
-        "title": "pi-desktop-xdpool: Clear All Cooldowns",
+        "title": "WTQ Pool: Clear All Cooldowns",
         "category": "Productivity",
         "keywords": [
           "workbuddy",
@@ -90,7 +92,7 @@
       },
       {
         "id": "xdpool.checkin",
-        "title": "pi-desktop-xdpool: Daily Check-in (All Accounts)",
+        "title": "WTQ Pool: Daily Check-in (All Accounts)",
         "category": "Productivity",
         "keywords": [
           "workbuddy",
@@ -102,7 +104,7 @@
       },
       {
         "id": "xdpool.doctor",
-        "title": "pi-desktop-xdpool: Run Connection Check",
+        "title": "WTQ Pool: Run Connection Check",
         "category": "Productivity",
         "keywords": [
           "workbuddy",
@@ -115,7 +117,7 @@
       {
         "key": "enabled",
         "type": "boolean",
-        "title": "启用 pi-desktop-xdpool",
+        "title": "启用 WTQ Pool",
         "default": true,
         "scope": "plugin"
       },
@@ -173,13 +175,6 @@
         "scope": "plugin"
       },
       {
-        "key": "catalogRefreshMinutes",
-        "type": "number",
-        "title": "模型列表刷新间隔（分钟）",
-        "default": 30,
-        "scope": "plugin"
-      },
-      {
         "key": "authFile",
         "type": "string",
         "title": "WorkBuddy 登录文件路径（扫描同目录，高级）",
@@ -197,7 +192,7 @@
     "services": [
       {
         "id": "provider-host",
-        "label": "pi-desktop-xdpool provider host"
+        "label": "WTQ Pool provider host"
       }
     ],
     "providers": []

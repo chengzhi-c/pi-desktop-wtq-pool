@@ -16,7 +16,7 @@
  * (VS Code style SQLite store whose secret rows are OSCrypt blobs), key
  * wrapper in `<appDir>/Local State` under `os_crypt.encrypted_key`.
  *
- * @module pi-desktop-xdpool/qoder-discovery
+ * @module pi-desktop-wtq-pool/qoder-discovery
  */
 
 import { createDecipheriv } from 'node:crypto'
