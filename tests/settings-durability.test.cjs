@@ -1,12 +1,11 @@
 /**
- * Regressions for the settings-document and credential-expiry defects.
+ * Regressions for the settings document and credential expiry.
  *
- * Every case here was a real fault in the shipped engine, and each is stated as
- * the observable the user or the panel sees - not as "the function was called".
- * What they share is that the engine has to decide what to do with input it did
- * not author: a settings read that failed, a settings document a newer writer
- * replaced, an upstream that hands back an absurd timestamp, and a model id that
- * collides with an object prototype.
+ * Each case is stated as the observable the user or the panel sees - not as
+ * "the function was called". What they share is that the engine has to decide
+ * what to do with input it did not author: a settings read that failed, a
+ * settings document a newer writer replaced, an upstream that hands back an
+ * absurd timestamp, and a model id that collides with an object prototype.
  *
  * The `main.js` entry is loaded into a `vm` context rather than required, because
  * these paths are top-level functions of the plugin process. `loadEntry` puts the
@@ -266,11 +265,11 @@ test('a retired account name no longer disables rotation', async () => {
 })
 
 /**
- * An expiry past `Date`'s range used to fail the whole panel document.
+ * An expiry past `Date`'s range must not fail the whole panel document.
  *
  * `xd.state` formats each row's expiry with `toISOString()`, which throws for a
  * timestamp outside `Date`'s range. A hand-edited or upstream-garbled sentinel
- * (1e15, 1e16) is exactly that, and one bad row took the entire panel down
+ * (1e15, 1e16) is exactly that, and one bad row would take the entire panel down
  * instead of the one field - so the user could not even reach the switch that
  * would fix it. An expiry that absurd is also not a date: it has to read as
  * "no expiry" so the pool keeps refreshing the token.
@@ -278,8 +277,8 @@ test('a retired account name no longer disables rotation', async () => {
 test('an absurd stored expiry cannot fail the panel document', () => {
   const entry = loadEntry()
   try {
-    // The control first: this is the value that used to throw at the formatting
-    // site, so the assertions below are about genuinely unusable input.
+    // The control first: this is the value that throws at the formatting site,
+    // so the assertions below are about genuinely unusable input.
     assert.throws(() => new Date(1e16).toISOString(), RangeError)
 
     const parse = 'require("./lib/accounts").parseWorkBuddyAuth(JSON.stringify(DOC), "fixture").expiresAtMs'
@@ -374,10 +373,10 @@ test('a check-in whose program is off is skipped, not claimed', async () => {
  *
  * The popup marks the served row as active and keys the notice it raises
  * against the same value, so it can clear that notice the moment the chosen
- * account starts serving. These rows used to carry only a label, and the client
- * reads `id`: the notice's key came out empty, the clearing check returned early
- * on an empty key, and the "preference saved, not serving yet" line stayed on
- * screen while the row beside it was already marked active.
+ * account starts serving. The client reads `id`: a row carrying only a label
+ * leaves the notice's key empty, the clearing check returns early on an empty
+ * key, and the "preference saved, not serving yet" line stays on screen while
+ * the row beside it is already marked active.
  */
 test('a Trae or Qoder row carries the identity the popup marks it by', () => {
   const entry = loadEntry()

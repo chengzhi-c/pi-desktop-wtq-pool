@@ -5,6 +5,25 @@ const REFRESH_INTERVAL_MS = 300000;
 const WARMUP_INTERVAL_MS = 5000;
 const WARMUP_WINDOW_MS = 60000;
 
+/** The margin kept between the popup and the edge of the window, in px. */
+const PANEL_MARGIN = 8;
+
+/** The popup's own width cap, in px. */
+const PANEL_MAX_WIDTH = 360;
+
+/**
+ * The width the popup is padded out to, in px.
+ *
+ * The stylesheet sizes the box to its contents, and a real row is only an
+ * address and a balance, so the box collapsed to roughly 220px and read as
+ * cramped next to the composer. A floor keeps that space without forcing the
+ * box wide for rows that do not need it.
+ */
+const PANEL_MIN_WIDTH = 280;
+
+/** How tall the popup is allowed to get, in px. */
+const PANEL_MAX_HEIGHT = 320;
+
 const CSS = `
 .xd-points{position:relative;display:inline-flex;align-items:center;min-width:0}
 .xd-points-btn{border:0;background:transparent;color:var(--ds-text,var(--ds-text-secondary,#c9cbd1));font:inherit;font-size:12px;line-height:1;display:inline-flex;align-items:center;gap:5px;padding:4px 7px;border-radius:999px;cursor:pointer;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -14,10 +33,20 @@ const CSS = `
    one thing on that row worth a glance, and it has to be findable first. A dot
    carries that meaning without borrowing an icon set the host does not give. */
 .xd-points-mark{display:inline-block;width:6px;height:6px;flex:0 0 auto;border-radius:50%;background:#4f9f7c}
-.xd-points-panel{position:fixed;z-index:40;min-width:240px;max-width:360px;max-height:320px;overflow:auto;padding:8px;border-radius:12px;background:var(--ds-bg-elevated,var(--ds-bg,#1c1d21));color:var(--ds-text,#e8e8ea);box-shadow:0 8px 28px rgba(0,0,0,.28);border:1px solid var(--ds-border,rgba(127,127,127,.25))}
-.xd-points-table{width:100%;border-collapse:collapse;font-size:12px}
+.xd-points-panel{position:fixed;z-index:40;box-sizing:border-box;width:max-content;max-width:${PANEL_MAX_WIDTH}px;max-height:${PANEL_MAX_HEIGHT}px;overflow:auto;padding:8px;border-radius:12px;background:var(--ds-bg-elevated,var(--ds-bg,#1c1d21));color:var(--ds-text,#e8e8ea);box-shadow:0 8px 28px rgba(0,0,0,.28);border:1px solid var(--ds-border,rgba(127,127,127,.25))}
+.xd-points-table{width:100%;border-collapse:collapse;font-size:11px;line-height:1.4}
 .xd-points-table th{text-align:left;font-weight:600;padding:4px 6px;color:var(--ds-text-secondary,#8b8d93)}
 .xd-points-table td{padding:4px 6px;vertical-align:top}
+/* The row reuses the trigger's button, which is sized for a chip standing alone
+   in the composer: its 12px type, 1px leading and 220px cap all fight the cell,
+   and its padding would stack on the cell's and double the row's height. Those
+   are restated for the table, so the row follows the popup's own type and a long
+   account name is bounded by the cell instead of stretching the panel. */
+.xd-points-table .xd-points-btn{font-size:inherit;line-height:inherit;padding:0;max-width:250px}
+/* The selected row's name is a disabled button. The hosts disagree about how to
+   dim one - PI-Desktop has a global button:disabled rule that fades it, DeepSeek
+   Harness has none - so the fade is stated here and both read the same. */
+.xd-points-table .xd-points-btn:disabled{opacity:.5}
 .xd-points-row{cursor:pointer}
 .xd-points-row:hover{background:var(--ds-bg-muted,rgba(127,127,127,.12))}
 .xd-points-row.is-active{cursor:default}
@@ -217,7 +246,18 @@ function ComposerPoints() {
     if (!open || !rootRef.current) return undefined;
     const placePanel = () => {
       const rect = rootRef.current.getBoundingClientRect();
-      setPlace({ left: Math.max(8, rect.right - 280), top: Math.max(8, rect.top - 8) });
+      const right = Math.max(PANEL_MARGIN, window.innerWidth - rect.right);
+      // The cap counts the column the right anchor already took, so the box
+      // stops at the window's left edge instead of hanging past it. The floor
+      // is clamped the same way, so a narrow window shortens the box rather
+      // than pushing it off the edge.
+      const width = Math.max(0, Math.min(PANEL_MAX_WIDTH, window.innerWidth - right - PANEL_MARGIN));
+      setPlace({
+        right,
+        top: Math.max(PANEL_MARGIN, rect.top - PANEL_MARGIN),
+        minWidth: Math.min(PANEL_MIN_WIDTH, width),
+        maxWidth: width,
+      });
     };
     placePanel();
     window.addEventListener("resize", placePanel);
@@ -249,7 +289,7 @@ function ComposerPoints() {
           ref: panelRef,
           role: "dialog",
           "aria-label": W.title,
-          style: { left: place.left + "px", top: place.top + "px", transform: "translateY(-100%)" },
+          style: { right: place.right + "px", top: place.top + "px", minWidth: place.minWidth + "px", maxWidth: place.maxWidth + "px", transform: "translateY(-100%)" },
         },
         h("div", { className: "xd-points-bar" },
           h("span", null, W.title),
@@ -346,7 +386,9 @@ function accountTable(h, data, onPick) {
   },
     h("td", null,
       account.active ? h("span", { className: "xd-points-dot", "aria-hidden": "true" }) : null,
-      h("button", { type: "button", className: "xd-points-btn", disabled: account.active === true, onClick: () => onPick(account) }, account.label)),
+      // The name is bounded by the cell, so a long one is ellipsised rather than
+      // stretching the panel; the full value stays reachable on hover.
+      h("button", { type: "button", className: "xd-points-btn", title: account.label || "", disabled: account.active === true, onClick: () => onPick(account) }, account.label)),
     h("td", null,
       typeof account.total === "number" ? formatCredits(account.total) : (account.plan || "—"),
       qoder && Array.isArray(account.packages)

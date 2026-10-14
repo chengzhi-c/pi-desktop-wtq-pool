@@ -233,7 +233,7 @@ var EN = {
   "foot.shimOff": "endpoint not listening",
   "foot.rosterStale": "{region} needs attention: {detail}",
   "foot.github": "GitHub",
-  "foot.npm": "npm",
+  "foot.market": "Marketplace",
   "foot.docs": "Docs",
   "foot.license": "License",
   "err.bridge": "The panel bridge is unavailable.",
@@ -457,7 +457,7 @@ var ZH = {
   "foot.shimOff": "端点未监听",
   "foot.rosterStale": "{region} 需要注意：{detail}",
   "foot.github": "GitHub",
-  "foot.npm": "npm",
+  "foot.market": "插件市场",
   "foot.docs": "文档",
   "foot.license": "许可",
   "err.bridge": "面板桥不可用。",
@@ -647,6 +647,8 @@ var checkinBusy = null;
 var doctorResult = null;
 /** Account ids whose credit package list the user opened. Absent = collapsed. */
 var openCredits = {};
+/** The warning the header banner is currently showing, so it can be cleared. */
+var headerWarning = "";
 var reserveDrafts = {};
 
 // ----------------------------------------------------------------- render
@@ -702,12 +704,18 @@ function renderHeader() {
   // net::ERR_CONNECTION_REFUSED, and a model issue is invisible until it is
   // fixed anyway.
   var stale = state && state.staleSelectionRegions ? state.staleSelectionRegions : [];
-  if (state && state.addressDrift === true) {
-    note(t("models.addressDrift"), "warn");
-  } else if (state && state.declaration && state.declaration.ok === false) {
-    note(t("models.reload"), "warn");
-  } else if (stale.length > 0) {
-    note(t("models.staleSelection", { region: regionLabel(stale[0], false) }), "warn");
+  var warning = state && state.addressDrift === true ? t("models.addressDrift")
+    : state && state.declaration && state.declaration.ok === false ? t("models.reload")
+      : stale.length > 0 ? t("models.staleSelection", { region: regionLabel(stale[0], false) })
+        : "";
+  // Cleared, not just set: these conditions are all fixed from outside the panel
+  // - a restart, a re-save - so a banner left standing after one of them goes
+  // away would keep naming a problem the state document no longer reports. Only
+  // the banner this pass itself last showed is cleared, so a message another
+  // action put up is not wiped by the poll landing behind it.
+  if (warning !== headerWarning) {
+    headerWarning = warning;
+    note(warning === "" ? null : warning, "warn");
   }
 }
 
@@ -1508,6 +1516,10 @@ function paintAutoNote(host, auto) {
     line.appendChild(el("span", "log-text", row.text));
     host.appendChild(line);
   });
+  // The log is a scroll region capped at a few rows, so a fresh pass would
+  // otherwise leave the newest line - the one the user just waited for - below
+  // the fold.
+  host.scrollTop = host.scrollHeight;
 }
 function renderAccounts() {
   var host = $("accounts");
@@ -1928,53 +1940,76 @@ function checkinBlock(account) {
  * rides along in the document, and that offset travels with it too.
  */
 function placeOf(host) {
-  var keep = { line: host.scrollTop, page: pageScroll(), place: null };
   var active = document.activeElement;
+  var keep = { line: host.scrollTop, page: pageScroll(), place: null };
   if (!active || !host.contains(active)) return keep;
-  var kind = active.tagName === "INPUT" ? "input"
-    : active.tagName === "SELECT" ? "select"
-      : active.tagName === "BUTTON" ? "button" : null;
-  if (!kind) return keep;
+  keep.place = controlRecord(active, host);
+  return keep;
+}
+
+/**
+ * The record that finds `node` again inside `host` after a rebuild.
+ *
+ * By identity where the control has an id, by position where the population is
+ * unchanged, and by label otherwise - most controls here are built fresh on
+ * every render and never carry an id, so the label is the only handle a later
+ * pass has on the one the user actually pressed. Null for a control that is
+ * none of the three kinds this panel focuses.
+ */
+function controlRecord(node, host) {
+  var kind = node.tagName === "INPUT" ? "input"
+    : node.tagName === "SELECT" ? "select"
+      : node.tagName === "BUTTON" ? "button" : null;
+  if (!kind) return null;
   var group = host.querySelectorAll(kind);
-  // By identity where there is one, by position otherwise. A whole-panel render
-  // changes how many buttons exist, so an index recorded before it can point at
-  // a different control afterwards — the focus would land on the wrong button,
-  // which reads as the panel jumping somewhere the user never clicked.
-  var id = typeof active.id === "string" && active.id !== "" ? active.id : "";
-  var label = id === "" ? (active.textContent || "").trim() : "";
-  keep.place = {
+  // A whole-panel render changes how many buttons exist, so an index recorded
+  // before it can point at a different control afterwards - the focus would land
+  // on the wrong button, which reads as the panel jumping somewhere the user
+  // never clicked. The id, and failing that the label, is what survives that.
+  var id = typeof node.id === "string" && node.id !== "" ? node.id : "";
+  return {
     kind: kind,
-    at: Array.prototype.indexOf.call(group, active),
+    at: Array.prototype.indexOf.call(group, node),
     total: group.length,
     id: id,
-    label: label,
+    label: id === "" ? (node.textContent || "").trim() : "",
   };
-  return keep;
+}
+
+/**
+ * The control a record names, or null when this pass did not rebuild it.
+ *
+ * The id is matched by scanning the group rather than by building a `#id`
+ * selector: the ids here are derived from account ids, and one holding a
+ * character CSS reads specially would make the selector throw mid-render.
+ */
+function locateControl(host, place) {
+  if (!place) return null;
+  var group = host.querySelectorAll(place.kind);
+  if (place.id !== "") {
+    for (var at = 0; at < group.length; at += 1) {
+      if (group[at].id === place.id) return group[at];
+    }
+  }
+  if (group.length === place.total) return group[place.at] || null;
+  if (place.label === "") return null;
+  for (var i = 0; i < group.length; i += 1) {
+    if ((group[i].textContent || "").trim() === place.label) return group[i];
+  }
+  return null;
 }
 
 function restorePlace(host, keep) {
   host.scrollTop = keep.line;
   pageScrollTo(keep.page);
   if (!keep.place) return;
-  var group = host.querySelectorAll(keep.place.kind);
-  var again = null;
-  if (keep.place.id !== "") {
-    again = host.querySelector("#" + keep.place.id);
-  } else if (group.length === keep.place.total) {
-    again = group[keep.place.at];
-  } else if (keep.place.label !== "") {
-    // Fall back to the label: the count moved but the control the user pressed is
-    // still there, and it is the one that must take the focus back.
-    for (var i = 0; i < group.length; i += 1) {
-      if ((group[i].textContent || "").trim() === keep.place.label) { again = group[i]; break; }
-    }
-  }
+  var again = locateControl(host, keep.place);
   if (!again || !again.focus) return;
   // A control disabled by the very render pass that just ran cannot take focus:
   // the browser refuses it, the focus falls to the body, and the panel reads as
-  // having jumped. There is no synchronous way around it — clearing `disabled`
+  // having jumped. There is no synchronous way around it - clearing `disabled`
   // for the focus call does not make the element focusable, and neither does a
-  // temporary `tabindex` — so the focus is simply left where it is in that case.
+  // temporary `tabindex` - so the focus is simply left where it is in that case.
   // The shake itself is still gone, because the scroll position is restored
   // above; what is lost is the focus ring on a control the user just pressed and
   // which is now inert anyway.
@@ -1983,14 +2018,21 @@ function restorePlace(host, keep) {
 }
 
 /**
- * The id of the control the user last pressed, so a render pass that disabled it
- * can hand the focus back once it is live again. See `render`.
+ * The control the user last pressed, so a render pass that disabled it can hand
+ * the focus back once it is live again. See `render`.
  */
-var lastPressed = "";
+var lastPressed = null;
 
-/** Record a press, for the focus hand-back in `render`. */
+/**
+ * Record a press, for the focus hand-back in `render`.
+ *
+ * The whole locator is kept, not just the id: most controls here are built
+ * fresh on every render and never carry one, so an id-only memory silently
+ * skipped exactly the buttons the hand-back exists for.
+ */
 function notePress(node) {
-  lastPressed = typeof node.id === "string" ? node.id : "";
+  var body = document.body;
+  lastPressed = node && body && body.contains(node) ? controlRecord(node, body) : null;
 }
 
 /** The document's own offset: a column with no scroller rides along in it. */
@@ -2741,11 +2783,11 @@ function render() {
   // focus sat on the body after every click, and keyboard users lost their place.
   // The memory is cleared once the focus is back, so a later click on empty space
   // stays where it was instead of being pulled onto that button by the next poll.
-  if (lastPressed !== "" && document.activeElement === document.body) {
-    var back = document.getElementById(lastPressed);
+  if (lastPressed !== null && document.activeElement === document.body) {
+    var back = locateControl(document.body, lastPressed);
     if (back && back.disabled === false && back.focus) {
       back.focus({ preventScroll: true });
-      lastPressed = "";
+      lastPressed = null;
     }
   }
 }
@@ -2771,11 +2813,13 @@ function runBusy(id, work) {
     if (result && result.accounts) adopt(result);
     note(null);
     render();
+    pollCheckinLog(0);
     return result;
   }).catch(function (error) {
     busy = null;
     note(String(error && error.message ? error.message : error));
     render();
+    pollCheckinLog(0);
     throw error;
   });
 }

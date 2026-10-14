@@ -4552,25 +4552,46 @@ async function composerPrefer(args) {
 }
 
 /**
- * Re-read the credits behind the composer popup, then answer with them.
+ * How long the composer popup's refresh may wait before it answers.
  *
- * The popup lists one route's accounts. A WorkBuddy region drops its probe
- * cache and reads it back; a Trae or Qoder region re-probes each of its rows,
- * keeping the figures it already has when a read fails. The polled readout
- * stays cache-only — this is the one call the click is allowed to wait on.
+ * The host relays `plugin.call` under its own budget and refuses the call once
+ * that runs out, so this pass has to answer inside it rather than spend the
+ * panel's share. Nothing is cancelled: a probe that outlives the budget still
+ * writes its row or its probe-cache entry, and the popup's own poll picks the
+ * figures up, which is what keeps the click from turning into a timeout and
+ * eventually into a relay cooldown that disables every control in the popup.
+ */
+const COMPOSER_REFRESH_BUDGET_MS = 1500;
+
+/**
+ * Re-read the credits behind the composer popup.
+ *
+ * The popup lists one route's accounts, so the refresh covers exactly those: a
+ * WorkBuddy region drops its probe cache and reads it back, a Trae or Qoder
+ * region re-probes each of its rows, keeping the figures it already has when a
+ * read fails. The polled readout stays cache-only; this is the one call the
+ * click is allowed to wait on, and it waits only as long as the relay allows.
  */
 async function composerRefresh(args) {
   const hit = matchComposerModel(args?.chip);
-  if (hit === undefined) return composerPoints(args);
+  if (hit !== undefined) {
+    await settleWithin(composerRefreshWork(hit), COMPOSER_REFRESH_BUDGET_MS);
+  }
+  return composerPoints(args);
+}
+
+async function composerRefreshWork(hit) {
   if (hit.source === "workbuddy") {
     for (const account of core.pool.list(hit.region)) probeCache.delete(account.id);
-    await settleWithin(statusDocument({ allowNetwork: true, budgetMs: PANEL_STEP_BUDGET_MS }), PANEL_STEP_BUDGET_MS);
-    return composerPoints(args);
+    await statusDocument({ allowNetwork: true, budgetMs: COMPOSER_REFRESH_BUDGET_MS });
+    return;
   }
   const rows = hit.source === "trae" ? traeAccountRows : qoderAccountRows;
   const found = hit.source === "trae" ? await discoverTraeCredentials() : await discoverQoderCredentials();
+  const deadline = Date.now() + COMPOSER_REFRESH_BUDGET_MS;
   for (const row of rows) {
     if (row.region !== hit.region) continue;
+    if (Date.now() >= deadline) break;
     const credential = found.credentials.find((item) => {
       const itemLabel = hit.source === "trae" ? traeRowLabel(item) : qoderRowLabel(item);
       const itemRegion = hit.source === "trae" ? traeRegionOfCredential(item) : item.region;
@@ -4583,7 +4604,6 @@ async function composerRefresh(args) {
     if (probe?.usage) row.usage = probe.usage;
     if (probe?.checkin) row.checkin = probe.checkin;
   }
-  return composerPoints(args);
 }
 
 async function onRendererCall(method, args) {

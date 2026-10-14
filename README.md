@@ -1,35 +1,60 @@
-# WTQ账号池
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/logo.png">
+    <img src="https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/logo.png" width="240" alt="WTQ账号池">
+  </picture>
+</p>
+
+<h1 align="center">WTQ账号池</h1>
+
+<p align="center"><b>把本机已登录的 WorkBuddy、Trae、Qoder 账号接入 PI-Desktop，限流或额度用尽时自动换号。</b></p>
+
+<p align="center">
+  <a href="README.en.md">English</a> | <b>简体中文</b>
+</p>
+
+<p align="center">
+  <a href="#安装">安装</a> ·
+  <a href="#使用">使用</a> ·
+  <a href="#设置">设置</a> ·
+  <a href="CHANGELOG.md">更新日志</a> ·
+  <a href="https://github.com/chengzhi-c/pi-desktop-wtq-pool/issues">问题反馈</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/chengzhi-c/pi-desktop-wtq-pool/releases"><img src="https://img.shields.io/github/v/release/chengzhi-c/pi-desktop-wtq-pool?style=flat-square&amp;label=release" alt="release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/chengzhi-c/pi-desktop-wtq-pool?style=flat-square" alt="MIT license"></a>
+  <a href="https://github.com/chengzhi-c/pi-desktop-wtq-pool/stargazers"><img src="https://img.shields.io/github/stars/chengzhi-c/pi-desktop-wtq-pool?style=flat-square" alt="GitHub stars"></a>
+</p>
 
 把本机 WorkBuddy、Trae、Qoder 的桌面登录接入 PI-Desktop。WorkBuddy 被限流或额度用尽时自动换号；Trae、Qoder 按请求选择账号，不保证失败后重试。三个来源独立开关，国内与国际账号分别成组。
-
-[English](./README.en.md)
 
 ## 预览
 
 设置面板界面如下（默认亮色）：
 
-![账号池](docs/preview-pool.png)
+![账号池](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-pool.png)
 
 面板跟随 PI-Desktop 的外观设置，暗色与亮色各一套配色：
 
-![暗色主题](docs/preview-dark.png)
+![暗色主题](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-dark.png)
 
 模型页可以改显示名、上下文窗口、输出上限、思考等级和贴图。Trae 目录给出费率的模型会带上 `x0.79` 这样的费率标签，未给出费率的模型（以及 Qoder 全部模型）不标注：
 
-![模型设置](docs/preview-models.png)
+![模型设置](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-models.png)
 
 在线预览：<https://chengzhi-c.github.io/pi-desktop-wtq-pool/>。
 
 `docs/index.html` 加载实际面板代码并使用虚构演示数据，支持来源切换、模型设置和主题预览，不读取本机账号或令牌。
 
-![预览页](docs/preview-page.png)
+![预览页](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-page.png)
 
 开启 `showComposerPoints` 后，输入框工具栏显示当前模型的账号积分，点击可查看该组账号并切换账号。下图由实际输入框扩展离屏渲染，非对话测试截图：
 
-![输入框积分](docs/preview-composer.png)
+![输入框积分](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-composer.png)
 
-本地运行：`node docs/serve.cjs`，然后打开它输出的地址。
-（`docs/index.html` 需经本地服务器打开：`file://` 页面无法读取同目录的面板文件。）
+本地预览需先克隆仓库，再运行 `node docs/serve.cjs` 并打开它输出的地址。该页面不能用 `file://` 打开，浏览器不允许它读取同目录的面板文件。
 
 ## 安装
 
@@ -77,7 +102,7 @@ Trae       41851 / 41861
 Qoder      41871 / 41881
 ```
 
-宿主在插件进程启动前读取清单地址，因此端口固定。端口被占用时请先查看连接检查，不应连接其他进程的服务。国内模型仅使用国内账号。
+以上是首选端口。宿主在插件进程启动前就要读到地址，所以插件先按这些端口尝试绑定；被占用时改用系统分配的临时端口，并把本次实际地址写进运行时 provider 注册，面板与连接检查会显示回退结果。看到地址漂移时应先确认占用端口的是哪个进程，不要连接来源不明的服务。国内模型仅使用国内账号。
 
 ## 数据
 
@@ -94,7 +119,7 @@ Qoder      41871 / 41881
 | `shell.openExternal` | 面板页脚打开外部链接 |
 | `clipboard.write` | 连接检查页复制报告 |
 
-出网请求由插件进程直接发送，不经过宿主 `net.fetch` 通道。
+出网请求由插件进程直接调用 `fetch` 发送。宿主对插件入口进程尚未做操作系统级沙箱，因此 `manifest.net.domains` 只约束 `pi.net.fetch` 通道；本插件不申请该权限，也没声明该字段，实际可达范围由代码本身决定。下面这份主机清单就是全部出网目标，可与 `manifest.json` 的 `safetyNotes` 对照。
 
 令牌只会发往以下主机，与 `manifest.json` 的 `safetyNotes` 一致：
 

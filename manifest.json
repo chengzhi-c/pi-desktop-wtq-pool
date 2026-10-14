@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.chengzhi-c.pi-desktop-wtq-pool",
   "name": "WTQ Pool",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接进 PI-Desktop。WorkBuddy 被限流时自动换号，三家各有开关。",
   "author": "chengzhi-c (PI-Desktop port of XDTrees/dsh-workbuddy-xdpool)",
   "license": "MIT",
@@ -36,15 +36,15 @@
     "en": {
       "name": "WTQ Pool",
       "description": "Bring this machine's WorkBuddy, Trae and Qoder desktop sign-ins into PI-Desktop. A rate-limited WorkBuddy account fails over to the next one. Each source has its own switch.",
-      "safetyNotes": "Reads the WorkBuddy, Trae and Qoder sign-ins already saved on this machine. If an install is not in its default location, only its uninstall registry entry is read to find it. Keys for encrypted fields stay in memory. Tokens go only to each vendor's own hosts: copilot.tencent.com / codebuddy.cn / codebuddy.ai / workbuddy.ai / www.workbuddy.cn, api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai, gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh. Chat is served from 127.0.0.1."
+      "safetyNotes": "Reads the WorkBuddy, Trae and Qoder sign-ins already saved on this machine. If an install is not in its default location, only its uninstall registry entry is read to find it. Keys for encrypted fields stay in memory. Tokens go only to each vendor's own hosts: copilot.tencent.com / www.codebuddy.cn / www.codebuddy.ai / www.workbuddy.ai / www.workbuddy.cn, api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai, gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh. Chat is served from 127.0.0.1."
     },
     "zh-CN": {
       "name": "WTQ Pool",
       "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接进 PI-Desktop。WorkBuddy 被限流时自动换号，三家各有开关。",
-      "safetyNotes": "只读本机 WorkBuddy、Trae、Qoder 已保存的登录。默认位置找不到安装目录时，只读卸载项来定位。加密字段的密钥只留在内存。令牌只发往各家自己的接口：copilot.tencent.com / codebuddy.cn / codebuddy.ai / workbuddy.ai / www.workbuddy.cn、api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai、gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh。对话由本机 127.0.0.1 上的端点转发。"
+      "safetyNotes": "只读本机 WorkBuddy、Trae、Qoder 已保存的登录。默认位置找不到安装目录时，只读卸载项来定位。加密字段的密钥只留在内存。令牌只发往各家自己的接口：copilot.tencent.com / www.codebuddy.cn / www.codebuddy.ai / www.workbuddy.ai / www.workbuddy.cn、api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai、gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh。对话由本机 127.0.0.1 上的端点转发。"
     }
   },
-  "safetyNotes": "Reads the WorkBuddy, Trae and Qoder sign-ins already saved on this machine. If an install is not in its default location, only its uninstall registry entry is read to find it. Keys for encrypted fields stay in memory. Tokens go only to each vendor's own hosts: copilot.tencent.com / codebuddy.cn / codebuddy.ai / workbuddy.ai / www.workbuddy.cn, api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai, gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh. Chat is served from 127.0.0.1.",
+  "safetyNotes": "Reads the WorkBuddy, Trae and Qoder sign-ins already saved on this machine. If an install is not in its default location, only its uninstall registry entry is read to find it. Keys for encrypted fields stay in memory. Tokens go only to each vendor's own hosts: copilot.tencent.com / www.codebuddy.cn / www.codebuddy.ai / www.workbuddy.ai / www.workbuddy.cn, api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai, gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh. Chat is served from 127.0.0.1.",
   "ui": {
     "panel": "renderer/index.html",
     "title": {

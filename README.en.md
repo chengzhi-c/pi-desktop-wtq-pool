@@ -1,34 +1,60 @@
-# WTQ Pool
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/logo.png">
+    <img src="https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/logo.png" width="240" alt="WTQ Pool">
+  </picture>
+</p>
+
+<h1 align="center">WTQ Pool</h1>
+
+<p align="center"><b>Use local WorkBuddy, Trae and Qoder sign-ins in PI-Desktop, with automatic failover when an account is rate-limited or out of quota.</b></p>
+
+<p align="center">
+  <b>English</b> | <a href="README.md">简体中文</a>
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#usage">Usage</a> ·
+  <a href="#settings">Settings</a> ·
+  <a href="CHANGELOG.md">Changelog</a> ·
+  <a href="https://github.com/chengzhi-c/pi-desktop-wtq-pool/issues">Issues</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/chengzhi-c/pi-desktop-wtq-pool/releases"><img src="https://img.shields.io/github/v/release/chengzhi-c/pi-desktop-wtq-pool?style=flat-square&amp;label=release" alt="release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/chengzhi-c/pi-desktop-wtq-pool?style=flat-square" alt="MIT license"></a>
+  <a href="https://github.com/chengzhi-c/pi-desktop-wtq-pool/stargazers"><img src="https://img.shields.io/github/stars/chengzhi-c/pi-desktop-wtq-pool?style=flat-square" alt="GitHub stars"></a>
+</p>
 
 Use local WorkBuddy, Trae and Qoder desktop sign-ins in PI-Desktop. WorkBuddy fails over when an account is rate-limited or out of quota; Trae and Qoder select an account per request and do not guarantee retries after failure. Each source has its own switch, with domestic and international accounts grouped separately.
-
-[中文文档](./README.md)
 
 ## Preview
 
 The settings panel, in its default light theme:
 
-![Account pool](docs/preview-pool.png)
+![Account pool](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-pool.png)
 
 The panel follows PI-Desktop's appearance setting, with a palette for each theme:
 
-![Dark theme](docs/preview-dark.png)
+![Dark theme](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-dark.png)
 
 The model page edits the display name, context window, output limit, thinking levels and image support. A Trae model whose directory states a rate carries a cost tag such as `x0.79`; models that state none (and every Qoder model) stay unlabelled:
 
-![Model settings](docs/preview-models.png)
+![Model settings](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-models.png)
 
 Live preview: <https://chengzhi-c.github.io/pi-desktop-wtq-pool/>.
 
 `docs/index.html` loads the actual panel code with synthetic demo data. It supports source switching, model settings and theme previews without reading local accounts or tokens.
 
-![Preview page](docs/preview-page.png)
+![Preview page](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-page.png)
 
 With `showComposerPoints` enabled, the composer toolbar shows the current model's account credits. Click it to inspect the group and switch accounts. The image below is an off-screen render of the actual composer extension, not a conversation-test screenshot:
 
-![Composer credits](docs/preview-composer.png)
+![Composer credits](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-composer.png)
 
-Run it locally: `node docs/serve.cjs`, then open the address it prints. (`docs/index.html` has to be served over http: a `file://` page cannot read the panel files beside it.)
+Run it locally after cloning the repo: `node docs/serve.cjs`, then open the address it prints. (`docs/index.html` has to be served over http: a `file://` page cannot read the panel files beside it.)
 
 ## Install
 
@@ -76,7 +102,7 @@ Trae       41851 / 41861
 Qoder      41871 / 41881
 ```
 
-The host reads manifest addresses before the plugin process starts, so ports are fixed. If a port is occupied, inspect the connection report rather than connecting to another process's service. Domestic models only use domestic accounts.
+These are the preferred ports. The host reads manifest addresses before the plugin process starts, so the plugin tries to bind them first; when one is taken, the gateway binds an OS-assigned port and publishes that actual address in its runtime provider registration, and both the panel and the connection report show the fallback. On seeing an address drift, first establish which process holds the port rather than connecting to an unknown service. Domestic models only use domestic accounts.
 
 ## Data
 
@@ -93,7 +119,7 @@ The plugin only reads the vendors' local sign-in files. Tokens stay in the plugi
 | `shell.openExternal` | Open external links from the panel footer |
 | `clipboard.write` | Copy the report from the connection-check page |
 
-The plugin process sends outbound requests directly, without the host's `net.fetch` channel.
+The plugin process sends outbound requests directly with `fetch`. The host does not yet sandbox the plugin entry process at the OS level, so `manifest.net.domains` constrains only the `pi.net.fetch` channel; this plugin does not request that permission and declares no such field, which leaves the reachable set to the code itself. The host list below is the complete set of outbound targets, and it can be checked against `safetyNotes` in `manifest.json`.
 
 Tokens go only to the hosts below, matching `safetyNotes` in `manifest.json`:
 

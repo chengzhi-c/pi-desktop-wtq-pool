@@ -197,3 +197,29 @@ test('PI account selection restarts credit polling after a successful preference
   await vm.runInContext('(async () => {' + body + '\n})()', context)
   assert.equal(restarted, 1, 'a preference save must not leave unread credits on the old five-minute timer')
 })
+
+/**
+ * The selected row's fade is stated by the plugin, not inherited from the host.
+ *
+ * The two builds of this plugin run against hosts that disagree here: PI-Desktop
+ * carries a global `button:disabled` rule that dims the row, DeepSeek Harness
+ * has none outside its own update dialog. Relying on the host made the same row
+ * look selected in one build and unmarked in the other, so the rule lives in the
+ * popup's own stylesheet with the value PI-Desktop was already applying.
+ */
+test('PI composer states the selected row fade instead of inheriting one', () => {
+  const css = fs.readFileSync(path.join(root, 'renderer/composer.mjs'), 'utf8')
+  assert.match(css, /\.xd-points-table \.xd-points-btn:disabled\{opacity:\.5\}/,
+    'without this rule the selected row is undimmed wherever the host has no global rule')
+})
+
+/**
+ * The dot beside a row carries one colour, written out rather than read from a
+ * host token, so both builds of the panel paint the same green.
+ */
+test('PI composer paints the row marker in the shared colour', () => {
+  const css = fs.readFileSync(path.join(root, 'renderer/composer.mjs'), 'utf8')
+  const rule = css.split('\n').find(line => line.startsWith('.xd-points-dot{'))
+  assert.ok(rule, 'the row marker rule must exist')
+  assert.match(rule, /background:#4f9f7c/, 'the marker is a fixed colour shared with the DeepSeek Harness build')
+})

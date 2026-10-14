@@ -20,6 +20,48 @@ function writeManifestFixture(target) {
   fs.writeFileSync(path.join(target, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n')
 }
 
+/** The slice of an `<input>` the panel touches, with listeners a case can fire. */
+function fakeInput() {
+  const listeners = {}
+  return {
+    type: '', className: '', max: '', min: '', step: '', value: '',
+    addEventListener(type, handler) { (listeners[type] = listeners[type] || []).push(handler) },
+    dispatch(type) { for (const handler of listeners[type] || []) handler({ target: this }) },
+  }
+}
+
+/**
+ * Named panel declarations, evaluated together and callable.
+ *
+ * `renderer/panel.js` boots on load, so it cannot be evaluated whole. Lifting
+ * the named functions out with brace matching is what lets a case drive the real
+ * control rather than scan its text: a bound the page never wires up, or a guard
+ * whose `return` was dropped, then fails the case where a source match would
+ * still pass.
+ */
+function panelFunctions(names, source) {
+  const parts = []
+  for (const name of names) {
+    const from = source.indexOf(`function ${name}(`)
+    assert.notEqual(from, -1, `${name} must exist in the panel`)
+    let depth = 0
+    let index = source.indexOf('{', from)
+    for (; index < source.length; index += 1) {
+      if (source[index] === '{') depth += 1
+      else if (source[index] === '}') { depth -= 1; if (depth === 0) break }
+    }
+    parts.push(source.slice(from, index + 1))
+  }
+  const ceiling = /var MAX_TOKEN_BUDGET = 0x[0-9a-f]+;/.exec(source)
+  const context = vm.createContext({
+    document: { createElement: () => fakeInput() },
+    String, Number, Math, console,
+  })
+  if (ceiling) parts.unshift(ceiling[0])
+  vm.runInContext(parts.join('\n'), context)
+  return context
+}
+
 test('WorkBuddy refresh stays on demand across service restarts', async (t) => {
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'xdpool-test-'))
   const auth = path.join(temporary, 'auth')
@@ -1174,6 +1216,68 @@ test('every footer link label exists in both languages', () => {
     assert.ok(zh.has(`foot.${label}`), `foot.${label} is rendered but missing from ZH`)
     assert.ok(en.has(`foot.${label}`), `foot.${label} is rendered but missing from EN`)
   }
+})
+
+/**
+ * The model sheet's numeric fields must refuse a value the host will not store.
+ *
+ * `parseOverride` rejects the whole selection payload when one window exceeds
+ * the host's ceiling, so a single impossible number discarded every other edit
+ * in the same save and reported only "invalid selection payload". The browser
+ * bound keeps the figure inside the range the host can store, which is the only
+ * place the user can be told which field is at fault.
+ *
+ * The field is driven, not read: a bound the page never wires up, or a ceiling
+ * check that accepts everything, fails here even though the source still names
+ * both.
+ */
+test('a token budget past the host ceiling is refused by the field itself', () => {
+  const hostCeiling = /const MAX_TOKEN_BUDGET = (0x[0-9a-f]+)/.exec(
+    fs.readFileSync(path.join(root, 'main.js'), 'utf8'))
+  assert.ok(hostCeiling, 'the host must declare the ceiling it stores against')
+  const ceiling = Number(hostCeiling[1])
+
+  const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
+  const declared = /var MAX_TOKEN_BUDGET = (0x[0-9a-f]+)/.exec(source)
+  assert.ok(declared, 'the panel must carry the same ceiling the host enforces')
+  assert.equal(Number(declared[1]), ceiling,
+    'a panel ceiling that drifts from the host one rejects a figure the host would store, or offers one it will not')
+
+  const context = panelFunctions(['numberInput'], source)
+  const input = context.numberInput(1000, value => { input.accepted = value })
+  assert.equal(input.max, String(ceiling), 'without the attribute the browser offers no bound at all')
+  assert.equal(input.value, '1000', 'the field opens on the stored value')
+
+  input.value = String(ceiling + 1)
+  input.dispatch('change')
+  assert.equal(input.accepted, undefined,
+    'a value past the ceiling must not reach the save, or the host discards every other edit with it')
+  assert.equal(input.value, '1000', 'a refused value leaves the stored figure in the field')
+
+  input.value = '2000'
+  input.dispatch('change')
+  assert.equal(input.accepted, 2000, 'a value inside the ceiling must still save')
+})
+
+/**
+ * Switching the automatic check-in off must not depend on the hours box.
+ *
+ * The box can hold stale text from an earlier edit. Requiring it to parse before
+ * an OFF would report a failure and leave the timer running while the panel went
+ * on showing the schedule as off, which is the one state the user cannot see.
+ */
+test('switching the automatic check-in off survives an unreadable hours box', () => {
+  const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
+  const body = source.slice(source.indexOf('function setAutoCheckin('))
+  const handler = body.slice(0, body.indexOf('\n}\n') + 3)
+  assert.match(handler, /if \(enabled === true\)/,
+    'only switching ON may reject an unreadable hours box')
+  assert.match(handler, /autoCheckin\.hours|state\.autoCheckin/,
+    'switching OFF must fall back to the stored hours rather than give up')
+  const refused = handler.indexOf('auto.badHours')
+  const allowed = handler.indexOf('runBusy')
+  assert.ok(refused !== -1 && allowed !== -1 && refused < allowed,
+    'the refusal must be inside the ON branch, before the save it would otherwise skip')
 })
 
 /**
