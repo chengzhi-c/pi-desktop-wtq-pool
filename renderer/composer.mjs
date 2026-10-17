@@ -3,7 +3,7 @@ import React, { useEffect, useRef, useState } from "react";
 let host;
 const REFRESH_INTERVAL_MS = 300000;
 const WARMUP_INTERVAL_MS = 5000;
-const WARMUP_WINDOW_MS = 60000;
+const WARMUP_WINDOW_MS = 120000;
 
 /** The margin kept between the popup and the edge of the window, in px. */
 const PANEL_MARGIN = 8;
@@ -193,16 +193,31 @@ function ComposerPoints() {
     let stop = false;
     let timer = 0;
     let startedAt = Date.now();
-    const schedule = (next) => {
-      const warming = next && next.show === true && typeof next.total !== "number"
-        && Date.now() - startedAt < WARMUP_WINDOW_MS;
+    // Re-armed rather than fixed-interval: the readout asks again quickly while
+    // a balance of ours is still unread, and slowly once it has one - or once
+    // the model turns out not to be ours, in which case there is nothing coming
+    // and no reason to keep asking quickly.
+    const schedule = (current) => {
+      const ours = current !== null && current.ours === true;
+      const settled = current !== null && typeof current.total === "number";
+      const warming = ours && Date.now() - startedAt < WARMUP_WINDOW_MS;
       clearTimeout(timer);
-      timer = setTimeout(pull, warming ? WARMUP_INTERVAL_MS : REFRESH_INTERVAL_MS);
+      timer = setTimeout(pull, settled || !warming ? REFRESH_INTERVAL_MS : WARMUP_INTERVAL_MS);
     };
     const pull = () => {
       host.dispatch("plugin.call", { method: "xd.composerPoints", args: { chip } })
         .then((next) => {
           if (stop) return;
+          // The chip is switched off in the panel: `show: false` alone cannot
+          // say that, and without this the poll would keep asking every few
+          // minutes for the rest of the session about a feature nobody is
+          // using. The timer stops here; a model change remounts this effect
+          // and starts it again.
+          if (next && next.enabled === false) {
+            setData(null);
+            clearTimeout(timer);
+            return;
+          }
           setData(next && next.show === true ? next : null);
           schedule(next);
         })

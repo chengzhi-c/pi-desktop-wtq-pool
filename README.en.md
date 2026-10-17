@@ -16,6 +16,7 @@
 
 <p align="center">
   <a href="#install">Install</a> ·
+  <a href="#features">Features</a> ·
   <a href="#usage">Usage</a> ·
   <a href="#settings">Settings</a> ·
   <a href="CHANGELOG.md">Changelog</a> ·
@@ -28,7 +29,7 @@
   <a href="https://github.com/chengzhi-c/pi-desktop-wtq-pool/stargazers"><img src="https://img.shields.io/github/stars/chengzhi-c/pi-desktop-wtq-pool?style=flat-square" alt="GitHub stars"></a>
 </p>
 
-Use local WorkBuddy, Trae and Qoder desktop sign-ins in PI-Desktop. WorkBuddy fails over when an account is rate-limited or out of quota; Trae and Qoder select an account per request and do not guarantee retries after failure. Each source has its own switch, with domestic and international accounts grouped separately.
+Use local WorkBuddy, Trae and Qoder desktop sign-ins in PI-Desktop. WorkBuddy fails over when an account is rate-limited or out of quota; Trae and Qoder select an account per request and move on to the next sign-in on an authentication failure, a rate limit or exhausted quota, while a problem with the request itself (an unknown model, a malformed body) is answered exactly as the upstream answered it. Each source has its own switch, with domestic and international accounts grouped separately.
 
 ## Preview
 
@@ -46,22 +47,35 @@ The model page edits the display name, context window, output limit, thinking le
 
 Live preview: <https://chengzhi-c.github.io/pi-desktop-wtq-pool/>.
 
-`docs/index.html` loads the actual panel code with synthetic demo data. It supports source switching, model settings and theme previews without reading local accounts or tokens.
+`docs/index.html` drives the actual panel code with synthetic demo data. It supports source switching, model settings and theme previews without reading local accounts or tokens.
 
 ![Preview page](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-page.png)
 
-With `showComposerPoints` enabled, the composer toolbar shows the current model's account credits. Click it to inspect the group and switch accounts. The image below is an off-screen render of the actual composer extension, not a conversation-test screenshot:
+With `showComposerPoints` enabled, the composer toolbar shows the current model's account credits. Click it to inspect the group and switch accounts. The image below is an off-screen render of the actual composer extension:
 
 ![Composer credits](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-composer.png)
 
-Run it locally after cloning the repo: `node docs/serve.cjs`, then open the address it prints. (`docs/index.html` has to be served over http: a `file://` page cannot read the panel files beside it.)
+To run it locally, clone the repo, run `node docs/serve.cjs`, and open the address it prints. (`docs/index.html` has to be served over http: a `file://` page cannot read the panel files beside it.)
+
+## Features
+
+- Reuse the local sign-ins: the plugin only reads the sign-in files the three desktop apps already saved. It starts no OAuth flow of its own and asks for no extra authorization.
+- Register model groups by region: each of the three vendors' regions becomes its own provider, and they can be on at once; a region with no account is not registered.
+- Account distribution: WorkBuddy supports priority, round-robin, expiring credits first and conversation-sticky accounts, with failover on rate limits or exhausted quota. Trae and Qoder support round-robin and expiring credits first, and move on to the next sign-in on an authentication failure, a rate limit or exhausted quota. A rate limit cools for the wait the upstream stated, taking the response header when that is the only place it appears. Exhausted quota and a dead sign-in do not recover on their own, so that account leaves rotation until the balance is read again or the user signs in anew. When the upstream host cannot be reached at all, the next sign-in is tried.
+- Credit automation: automatic check-in is off by default. The scheduled run and "Run now" perform the same round: vendor check-ins, plus the domestic WorkBuddy streak bonus, task rewards and cat travel. The upstream advances the streak on a conversation, so the round reports one chat activity per domestic account before reading the streak tiers; a tier that comes due is unlocked and collected without the user having to open WorkBuddy and send a message.
+- Composer credits: with `showComposerPoints` on, the composer toolbar shows the balance of the account behind the current model; click it to switch accounts. Switching the feature off stops the readout's polling.
+- One panel: account state, pool state, model selection and the connection check all live in the plugin's own panel. The model catalog loads at startup and refreshes on demand once its cache expires; it does not poll while idle. An account switched off in the panel is never probed, so it does not hold the panel's polling open either.
+- Connection check: every finding carries a verdict. A gateway that is not listening, a catalog that could not be read, a published address that differs from the one bound, or a provider the host did not accept all count as failures and say what to change. A gateway whose start failed is reported with the reason and surfaced as address drift. When the check itself throws, the failure becomes a finding rather than taking the whole channel down.
 
 ## Install
 
 PI-Desktop → Plugins → Install local plugin, then select a locally built `.piplug`.
 
+Requires PI-Desktop 0.15.0 or later; see `engines.piDesktop` in `manifest.json`.
+
 Develop and verify with `npm ci && npm run typecheck && npm run build && npm test`. Rebuild `lib/` after changing `src/`.
-Package with PI-Desktop's `PluginCheck` / `PluginPack`, not a general-purpose ZIP tool, and pack a copy of the tree holding runtime files only (`src/`, `tests/`, `build.mjs`, `tsconfig.json` and `package-lock.json` left out) with `manifest.json`'s `contributes.providers` emptied first. `PluginPack` skips only `.git`, `node_modules` and `dist`, and that runtime declaration carries the model groups and port published on this machine, so packing the tree as it stands ships them.
+
+Pack with `pnpm pi-plugin pack <dir>` and validate with `pnpm pi-plugin check <dir>`, not a general-purpose ZIP tool. The artifact holds runtime files only (`lib/`, `renderer/`, `main.js`, `manifest.json`, `package.json` and the docs), and `manifest.json`'s `contributes.providers` stays empty: the plugin writes it at run time.
 
 ## Usage
 
@@ -69,28 +83,42 @@ Sign in inside each vendor's desktop app, then click "Detect accounts again" in 
 
 If the model groups do not appear, restart PI-Desktop as the note at the top of the panel says.
 
-The panel selects a source at the top level; below it are the account pool, the models and the connection check.
+The panel selects a source at the top level; below it are three screens: the account pool, the models and the connection check.
 
-- Account cards provide credit details, check-in, disable, removal and a preferred account per region. The composer popup can refresh the current model's group.
-- WorkBuddy supports priority, round-robin, expiring credits first and conversation-sticky accounts. Trae and Qoder support round-robin and expiring credits first.
-- Saving model settings updates the plugin declaration. If the host has not reloaded it, restart as the panel indicates. Each group publishes up to 64 models; additional selections are marked "not published" but remain available through the gateway.
-- Automatic check-in is off by default. When enabled, it runs at 09:00 Beijing time and catches missed slots on the next start. "Run now" performs the same round: vendor check-ins plus domestic WorkBuddy streak and task rewards and cat travel. Trae limits daily check-in per device; Qoder opens its new round at 10:00.
+- **Account pool**: each account's label, remaining credits, quota expiry, cooldown state and check-in progress. An account can be disabled on its own or removed, and a region can be pinned to prefer one account. WorkBuddy distributes by using one account first, round-robin, expiring credits first, or one account pinned per conversation; Trae and Qoder offer round-robin and expiring credits first.
+- **Models**: select which models this region exposes; anything unselected stays out of the model picker. The display name, context window, output limit, thinking levels and image support are editable. A model group publishes at most 64 models; any beyond that are marked "not published" while the gateway still serves them.
+- **Connection check**: reports one line at a time whether each gateway is listening, how many models its catalog returned, whether the published address matches the one actually bound, and whether the host accepted each provider, and can copy the whole report. A gateway whose start failed is reported with its reason, and the panel surfaces it as address drift.
+
+Check-in runs per account, or for a whole source from the title bar. Automatic check-in is off by default; when on it claims at 09:00 (Beijing time), and a slot missed earlier the same day is still claimed at the next start, while one from a previous day is not. "Run now" performs the same round: vendor check-ins, plus the domestic WorkBuddy streak bonus, task rewards and cat travel. Trae's daily check-in is once per device. Qoder's new round opens at 10:00 (Beijing time).
 
 ## Settings
 
-Editable from the plugin page:
+Editable from the plugin page. `manifest.json`'s `contributes.settings` declares these eight:
 
-| Key | Default | Meaning |
+| Key | Default (effective) | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | Off: the gateways do not start |
 | `sourceWorkbuddy` / `sourceTrae` / `sourceQoder` | `true` | Off: that source is not scanned, published or requested |
 | `distribution` | `priority` | How the WorkBuddy pool spreads requests: `priority` uses one account first, `round-robin` spreads evenly, `expiry` spends expiring credits first, `sticky` pins one account per conversation |
-| `sourceDistributions` | `{}` | Trae/Qoder distribution: `round-robin` / `expiry`; legacy `priority` is accepted |
 | `cooldownSeconds` | `60` | Rate-limit cooldown. A reset time the upstream reports takes precedence; Beijing time |
-| `creditReserves` | `{}` | Per-account credit floor, keyed by account id; an account below its floor is not distributed to |
 | `authFile` | `""` | WorkBuddy sign-in file path; every `.info` sign-in in its directory is scanned. Empty discovers it |
-| `autoCheckin` | `{"enabled":false,"hours":[9]}` | Automatic check-in switch and times; `hours` are Beijing-time hours, empty means 09:00 |
 | `showComposerPoints` | `false` | Show the active account's credits in the composer toolbar |
+
+Panel-managed keys. They are not declared in `manifest.json`'s `contributes.settings`, so the host's settings page does not list them and the panel is the only place to change them; they are still stored through the host's settings interface:
+
+| Key | Default (effective) | Meaning |
+| --- | --- | --- |
+| `sourceDistributions` | `{}` | Trae/Qoder distribution: `round-robin` / `expiry`; legacy `priority` is accepted |
+| `creditReserves` | `{}` | Per-account credit floor, keyed by account id; an account below its floor is not distributed to |
+| `autoCheckin` | `{"enabled":false,"hours":[9]}` | Automatic check-in switch and times; `hours` are Beijing-time hours, empty means 09:00 |
+| `disabledAccountIds` | `[]` | Account ids switched off in the panel |
+| `disabledRegions` | `[]` | Regions parked on their own, as `source:region` keys |
+| `modelSelection` | `{}` | Which models each gateway publishes, plus the display name, context window and other overrides |
+| `preferredAccountIds` | `{}` | Preferred WorkBuddy account per region |
+| `preferredSourceAccounts` | `{}` | Preferred Trae/Qoder account per region, keyed by `source:region` |
+| `removedAccounts` | `[]` | Accounts removed from the pool for good, with their label and region kept so the panel can offer a restore |
+
+Both default columns list effective values: `autoCheckin.hours` is stored as an empty array and normalises to `[9]`; an empty `authFile` means auto-discovery.
 
 Model selection and preferred accounts are saved by the panel. The command palette also opens the panel, detects accounts again, clears cooldowns, checks in everywhere and runs the connection check.
 
@@ -102,11 +130,15 @@ Trae       41851 / 41861
 Qoder      41871 / 41881
 ```
 
-These are the preferred ports. The host reads manifest addresses before the plugin process starts, so the plugin tries to bind them first; when one is taken, the gateway binds an OS-assigned port and publishes that actual address in its runtime provider registration, and both the panel and the connection report show the fallback. On seeing an address drift, first establish which process holds the port rather than connecting to an unknown service. Domestic models only use domestic accounts.
+These are the preferred ports. The host reads manifest addresses before the plugin process starts, so the plugin tries to bind them first, and the manifest keeps naming the preferred port; when one is taken, the gateway binds an OS-assigned port for that session, and both the panel and the connection report show the address actually bound and advise restarting PI-Desktop on drift. On seeing an address drift, first establish which process holds the port rather than connecting to an unknown service. Domestic models only use domestic accounts.
+
+When another process takes a port between the reservation and the listen, that gateway's start fails: its model group is dropped, the connection check reports the reason, and the panel advises restarting PI-Desktop. The host re-reads the manifest only on startup, on enable/disable and on uninstall, so requests reach the new address only after a restart.
 
 ## Data
 
-The plugin only reads the vendors' local sign-in files. Tokens stay in the plugin process and are sent to the relevant vendor endpoints. Gateways listen on `127.0.0.1`; other local processes can still call them and spend account quota. The host persists plugin settings, while model groups are written to this plugin's manifest. The plugin does not directly manage or delete host conversation records. If replies disappear after restart, check both stream completion and host persistence logs.
+The plugin only reads the vendors' local sign-in files and does not modify them. Tokens stay in the plugin process and are sent to the relevant vendor endpoints. Gateways listen on `127.0.0.1`; other local processes can still call them and spend account quota. The host persists plugin settings, while model groups are written to this plugin's manifest. The plugin does not directly manage or delete host conversation records. Its own data directory (the one `pi.plugin.getDataPath()` names) also holds two files: `checkin-slots.json`, the check-in slots already collected, written beside its target and renamed and kept for three days, and `doctor.txt`, the most recent connection report. If replies disappear after restart, check both stream completion and host persistence logs.
+
+The plugin sends no telemetry. Panel links open only when clicked.
 
 ## Permissions
 
@@ -119,7 +151,7 @@ The plugin only reads the vendors' local sign-in files. Tokens stay in the plugi
 | `shell.openExternal` | Open external links from the panel footer |
 | `clipboard.write` | Copy the report from the connection-check page |
 
-The plugin process sends outbound requests directly with `fetch`. The host does not yet sandbox the plugin entry process at the OS level, so `manifest.net.domains` constrains only the `pi.net.fetch` channel; this plugin does not request that permission and declares no such field, which leaves the reachable set to the code itself. The host list below is the complete set of outbound targets, and it can be checked against `safetyNotes` in `manifest.json`.
+The plugin process sends outbound requests directly with `fetch`. The host does not yet sandbox the plugin entry process at the OS level, so `manifest.net.domains` constrains only the `pi.net.fetch` channel; this plugin does not request that permission and declares no such field, so the outbound reach is decided solely by the targets in the code. The host list below is the complete set of outbound targets, and it can be checked against `safetyNotes` in `manifest.json`.
 
 Tokens go only to the hosts below, matching `safetyNotes` in `manifest.json`:
 
@@ -127,9 +159,33 @@ Tokens go only to the hosts below, matching `safetyNotes` in `manifest.json`:
 - Trae: `api.trae.cn`, `solo.trae.cn`, `trae-api-cn.mchost.guru`, `coresg-normal.trae.ai`, `growsg-normal.trae.ai`
 - Qoder: `gateway.qoder.com.cn`, `openapi.qoder.com.cn`, `api3.qoder.sh`, `openapi.qoder.sh`
 
+## Development
+
+```sh
+npm ci
+npm run typecheck   # tsc --noEmit
+npm run build       # compiles src/*.ts into lib/*.js
+npm test            # Node's own test runner, offline regressions
+```
+
+`main.js` is the plugin process entry: account scanning, the gateways, the panel RPC and the `contributes.providers` declaration all live there. `src/*.ts` is the host-agnostic core (the account pool, the model catalog, the upstream clients, the gateways), compiled by `build.mjs` with esbuild into `lib/*.js`. `renderer/` holds the panel and the composer readout in plain JavaScript, with no build step, and `tests/` holds the offline regressions.
+
+The host-agnostic core:
+
+| Module | Responsibility |
+| --- | --- |
+| `loopback.ts` | The loopback security model (Host/Origin checks, response writing, message redaction) |
+| `accounts.ts` | WorkBuddy sign-in parsing, token encryption, the account pool and its cooldowns |
+| `upstream.ts` | The WorkBuddy upstream client, error classification, rate-limit reset parsing |
+| `catalog.ts` | The model catalog and its static fallback list |
+| `shim.ts` | The WorkBuddy gateway's OpenAI-compatible endpoint |
+| `at-rest.ts` | Unsealing 5.6+ encrypted sign-in fields |
+| `promo.ts` | Promotion window matching |
+| `trae-*.ts` / `qoder-*.ts` | Sign-in discovery, protocol clients, SSE decoding and gateways for both vendors |
+
 ## Credits
 
-Several modules are ported from, or reference, the MIT projects below:
+Several modules are ported from or reference the MIT projects below:
 
 | Project | Copyright | Used for |
 | --- | --- | --- |

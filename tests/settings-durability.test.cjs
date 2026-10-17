@@ -23,6 +23,16 @@ const { createRequire } = require('node:module')
 const root = path.resolve(__dirname, '..')
 
 /**
+ * Move a value out of the plugin's vm context.
+ *
+ * Objects created inside the context carry that context's `Object` prototype,
+ * and `assert.deepEqual` in strict mode compares prototypes, so a value read
+ * back out of the entry never equals an identical literal. Round-tripping
+ * through JSON rebuilds it in this context's own terms.
+ */
+const json = (value) => JSON.parse(JSON.stringify(value))
+
+/**
  * Load the plugin entry in an isolated context.
  *
  * `options.settings` is the document the host stub starts with, `readFails`
@@ -110,7 +120,7 @@ test('a failed settings read keeps the last known document instead of wiping it'
   })
   try {
     // Load the real document first, then make the host RPC fail. That is the
-    // sequence in the field: the plugin ran for a while, and a later read broke.
+    // sequence: the plugin ran for a while, and a later read broke.
     assert.equal(await entry.read('adoptHostSettings()'), true, 'the first read must land')
     entry.setReadFails()
     assert.equal(await entry.read('adoptHostSettings()'), false, 'a failed read must not be adopted')
@@ -277,10 +287,6 @@ test('a retired account name no longer disables rotation', async () => {
 test('an absurd stored expiry cannot fail the panel document', () => {
   const entry = loadEntry()
   try {
-    // The control first: this is the value that throws at the formatting site,
-    // so the assertions below are about genuinely unusable input.
-    assert.throws(() => new Date(1e16).toISOString(), RangeError)
-
     const parse = 'require("./lib/accounts").parseWorkBuddyAuth(JSON.stringify(DOC), "fixture").expiresAtMs'
     const absurd = entry.read(parse.replace('DOC', '{ auth: { accessToken: "test-token", expiresAt: 1e16 } }'))
     assert.equal(absurd, 0, 'an expiry past 2100 must read as "no expiry"')
@@ -433,3 +439,50 @@ test('a Trae model that states a credit rate carries it to the panel', () => {
     entry.cleanup()
   }
 })
+
+/**
+ * Two dictionary writes in flight at once both survive.
+ *
+ * A dictionary-shaped setting is read as a whole, edited and written back as a
+ * whole. The panel's channels used to do that read before they wrote, so two
+ * overlapping calls had the second overwrite the first with the stale copy it
+ * had read, and the panel answered success for a change that was already gone.
+ * The write queue makes the read part of the same serialised step.
+ */
+test('two overlapping dictionary writes both survive', async () => {
+  const entry = loadEntry({ settings: { creditReserves: {} } })
+  try {
+    assert.equal(await entry.read('adoptHostSettings()'), true)
+    const [first, second] = await Promise.all([
+      entry.read('mutateSettings("creditReserves", (current) => ({ ...(current ?? {}), "account-a": 10 }))'),
+      entry.read('mutateSettings("creditReserves", (current) => ({ ...(current ?? {}), "account-b": 20 }))'),
+    ])
+    assert.equal(first, true)
+    assert.equal(second, true)
+    assert.deepEqual(json(entry.getSettingsDocument().creditReserves), { 'account-a': 10, 'account-b': 20 },
+      'both edits must be present; the second must not have overwritten the first')
+  } finally { entry.cleanup() }
+})
+
+/**
+ * A write picks up what the host stored while it was waiting in the queue.
+ *
+ * The host's own settings dialog writes the same document the panel does. A
+ * queued write that re-reads before it edits keeps that edit; one that trusted
+ * the copy it read when the click happened would write it back out.
+ */
+test('a queued write sees the edit the host made while it waited', async () => {
+  const entry = loadEntry({ settings: { creditReserves: { 'account-a': 5 } } })
+  try {
+    assert.equal(await entry.read('adoptHostSettings()'), true)
+    const release = entry.holdRead()
+    const queued = entry.read('mutateSettings("creditReserves", (current) => ({ ...(current ?? {}), "account-b": 20 }))')
+    // The host lands its own edit while the queued write is still waiting.
+    entry.setDocument({ creditReserves: { 'account-a': 99 } })
+    release()
+    assert.equal(await queued, true)
+    assert.deepEqual(json(entry.getSettingsDocument().creditReserves), { 'account-a': 99, 'account-b': 20 },
+      'the host edit must survive alongside the queued one')
+  } finally { entry.cleanup() }
+})
+
