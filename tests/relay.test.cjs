@@ -356,3 +356,33 @@ test('a timed-out gateway start is released instead of abandoned', async (t) => 
     fs.rmSync(temporary, { recursive: true, force: true })
   }
 })
+/**
+ * A vendor that finishes the text and keeps the socket open still ends the turn.
+ *
+ * Qoder sends its finish chunk and then nothing: no `[DONE]`, no close. The
+ * relay used to wait for the upstream read to end, which the vendor never does,
+ * so the client held a reply that was complete but was never marked finished.
+ * The bridge must close itself inside the tail grace.
+ */
+test('the qoder relay ends a turn whose upstream never closes', async () => {
+  const { bridgeQoderStream } = require('../lib/qoder-shim')
+  const encoder = new TextEncoder()
+  let upstreamCancelled = false
+  const source = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(
+        'data: {"choices":[{"delta":{"content":"OK"},"finish_reason":null}]}\n\n' +
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+      ))
+      // Intentionally never closed: this is the vendor's behaviour.
+    },
+    cancel() { upstreamCancelled = true },
+  })
+  const started = Date.now()
+  const body = await new Response(bridgeQoderStream(source, 'fixture-model')).text()
+  const elapsed = Date.now() - started
+  assert.match(body, /"finish_reason":"stop"/)
+  assert.match(body, /data: \[DONE\]/)
+  assert.ok(elapsed < 5000, `the turn must close on its own, took ${elapsed}ms`)
+  assert.ok(upstreamCancelled, 'the upstream socket must be released')
+})
