@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.chengzhi-c.pi-desktop-wtq-pool",
   "name": "WTQ Pool",
-  "version": "1.0.5",
+  "version": "1.0.51",
   "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接入 PI-Desktop。限流或额度用尽时自动换号，三家各有开关。",
   "author": "chengzhi-c (PI-Desktop port of XDTrees/dsh-workbuddy-xdpool)",
   "license": "MIT",
@@ -142,5 +142,5 @@
     ],
     "providers": []
   },
-  "changelog": "1.0.5：新增成长中心页签，读取状态或单独执行，覆盖两个 region 的账号，只做连续签到与档位兑换；面板可直接添加与删除 WorkBuddy 账号，删除按两次确认；挂起按原因区分、限流按连续次数翻倍冷却；Trae 的 Max 档与残缺目录合并、模型页预设带上模型自己的上限；签到一次只跑一轮，跑完才落盘；新增 tools/import-signins.cjs 导入账号文件。"
+  "changelog": "1.0.51：Qoder 不再列出 Ultimate、Efficient、Sonus、Cantus 四条内部路由，只保留有名称的模型。"
 }
