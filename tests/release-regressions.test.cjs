@@ -159,6 +159,7 @@ test('a Qoder gateway with no error and no roster is warming', () => {
   const fn = source.match(/^function warmingGatewayIds\(\) \{[^]*?^\}/m)[0]
   const context = vm.createContext({
     runtimes: new Map(), gatewayStartFailures: new Map(), activeRegions: () => [], PROVIDER_ID_BY_REGION: {},
+    sourceStartFailures: new Map(), sourceKey: (s, r) => s + ':' + r,
     traeGateways: new Map(), activeTraeRegions: () => [], TRAE_PROVIDER_ID_BY_REGION: {},
     qoderGateways: new Map([['cn', { region: 'cn', source: 'qoder', gateway: { models: () => [] }, lastError: '' }]]),
     activeQoderRegions: () => ['cn'], QODER_PROVIDER_ID_BY_REGION: { cn: 'xdpool-qoder-cn' },
@@ -180,6 +181,7 @@ test('a Qoder gateway whose directory read failed is not warming', () => {
   const fn = source.match(/^function warmingGatewayIds\(\) \{[^]*?^\}/m)[0]
   const context = vm.createContext({
     runtimes: new Map(), gatewayStartFailures: new Map(), activeRegions: () => [], PROVIDER_ID_BY_REGION: {},
+    sourceStartFailures: new Map(), sourceKey: (s, r) => s + ':' + r,
     traeGateways: new Map(), activeTraeRegions: () => [], TRAE_PROVIDER_ID_BY_REGION: {},
     qoderGateways: new Map([['cn', { region: 'cn', source: 'qoder', gateway: { models: () => [] }, lastError: 'boom' }]]),
     activeQoderRegions: () => ['cn'], QODER_PROVIDER_ID_BY_REGION: { cn: 'xdpool-qoder-cn' },
@@ -207,6 +209,8 @@ test('a gateway that could not bind is reported as address drift', () => {
     activeRegions: () => ['cn'], activeTraeRegions: () => [], activeQoderRegions: () => [],
     PROVIDER_ID_BY_REGION: { cn: 'xdpool-cn' },
     TRAE_PROVIDER_ID_BY_REGION: {}, QODER_PROVIDER_ID_BY_REGION: {},
+    sourceStartFailures: new Map(), sourceKey: (s, r) => s + ':' + r,
+    SOURCE_SPECS: { trae: { activeRegions: () => [] }, qoder: { activeRegions: () => [] } },
     traeGateways: new Map(), qoderGateways: new Map(),
     // The row is gone from this plugin's own manifest - `syncDeclaration` drops
     // the row of a gateway that is down - so only the host's cached copy is left.
@@ -225,6 +229,120 @@ test('a gateway that could not bind is reported as address drift', () => {
   context.hostDeclaredBaseUrl = () => 'http://127.0.0.1:37891/v1'
   assert.equal(drift(), true,
     'once the host holds the row, a gateway with no shim is drift')
+})
+
+/**
+ * A Trae or Qoder gateway that never bound is drift and a failed check, not health.
+ *
+ * The WorkBuddy half recorded its failed starts in `gatewayStartFailures` and the
+ * Trae/Qoder half recorded nothing, so a start that lost the port race read as
+ * "still warming": the saved roster was republished against a port nothing was
+ * listening on, `addressDrift` walked the gateways that existed and found none to
+ * complain about, the doctor pushed no finding at all and reported PASS, and the
+ * panel showed the region with no endpoint line. Both READMEs promise the
+ * opposite - "its model group is dropped, the connection check reports the
+ * reason" - so this is the test that keeps the promise true.
+ */
+test('a Trae or Qoder gateway that could not start is drift, not health', () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const fn = source.match(/^function addressDrift\(\) \{[^]*?^\}/m)[0]
+  const context = vm.createContext({
+    runtimes: new Map(), gatewayStartFailures: new Map(), activeRegions: () => [], PROVIDER_ID_BY_REGION: {},
+    TRAE_PROVIDER_ID_BY_REGION: { cn: 'xdpool-trae-cn' }, QODER_PROVIDER_ID_BY_REGION: {},
+    activeTraeRegions: () => ['cn'], activeQoderRegions: () => [],
+    sourceStartFailures: new Map(), sourceKey: (s, r) => s + ':' + r,
+    SOURCE_SPECS: { trae: { activeRegions: () => ['cn'] }, qoder: { activeRegions: () => [] } },
+    traeGateways: new Map(), qoderGateways: new Map(),
+    declaredBaseUrl: () => undefined, hostDeclaredBaseUrl: () => undefined,
+    // Publishing is what makes a failed start observable: with no row there is
+    // nothing for the host to send requests to.
+    declaredSourceBaseUrl: (region, idByRegion) => idByRegion[region] === undefined
+      ? undefined
+      : 'http://127.0.0.1:41851/v1',
+    shimInfo: () => ({ running: false }),
+  })
+  vm.runInContext(fn + '\naddressDrift()', context)
+  const drift = () => vm.runInContext('addressDrift()', context)
+
+  assert.equal(drift(), false, 'nothing failed and nothing bound: there is no drift yet')
+  context.sourceStartFailures = new Map([['trae:cn', 'listen EADDRINUSE']])
+  assert.equal(drift(), true,
+    'a Trae start that failed after its row was published is drift, not a roster in flight')
+
+  // And the same region is not reported as warming, which is what would keep the
+  // stale row published in the first place.
+  const warmingFn = source.match(/^function warmingGatewayIds\(\) \{[^]*?^\}/m)[0]
+  vm.runInContext(warmingFn + '\nwarmingGatewayIds()', context)
+  assert.deepEqual([...vm.runInContext('warmingGatewayIds()', context)], [],
+    'a region whose start failed must not be republished from its saved roster')
+})
+
+/**
+ * The start that failed is the thing that records the failure.
+ *
+ * The other tests drive `sourceStartFailures` directly, so deleting the `set` in
+ * the catch left every one of them green while the feature was dead again. This
+ * drives the reconcile pass itself with a gateway that refuses to start.
+ */
+test('a Trae start that throws is recorded before the pass returns', async () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const fn = source.match(/^async function reconcileSourceGateways\(source\) \{[^]*?^\}/m)[0]
+  const logged = []
+  const context = vm.createContext({
+    SOURCE_SPECS: { trae: { activeRegions: () => ['cn'], gateways: new Map() } },
+    loadGeneration: 1,
+    stillLoaded: () => true,
+    sourceStartFailures: new Map(), sourceKey: (s, r) => s + ':' + r,
+    serviceStopped: false,
+    regionEnabled: () => true,
+    createSourceRuntime: async () => { throw new Error('listen EADDRINUSE 127.0.0.1:41851') },
+    safeMessage: (error) => String(error?.message ?? error),
+    log: (level, message) => logged.push(message),
+  })
+  vm.runInContext(fn + '\nreconcileSourceGateways', context)
+  await vm.runInContext("reconcileSourceGateways('trae')", context)
+
+  const failures = vm.runInContext('sourceStartFailures', context)
+  assert.equal(failures.get('trae:cn'), 'listen EADDRINUSE 127.0.0.1:41851',
+    'the pass that caught the failure is the only place that knows it: without this entry ' +
+    'the failed region reads as one still warming and keeps its stale provider row')
+  assert.equal(logged.length, 1, 'and the log still says so')
+  assert.equal(vm.runInContext('SOURCE_SPECS.trae.gateways.size', context), 0,
+    'a failed start installs nothing')
+})
+
+/**
+ * The doctor names a failed Trae or Qoder start instead of passing the session.
+ *
+ * The report is the only surface a user checks when a model group stops
+ * answering, and it iterated the gateways that existed, so the one case that
+ * matters - a gateway with nothing behind it - produced no finding and
+ * `findings.every(f => f.ok)` came out true.
+ */
+test('the connection check names a Trae or Qoder start that failed', () => {  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const block = source.match(/for \(const \[source, gateways, idByRegion, nameByRegion, ports\] of \[[^]*?^  \}/m)
+  assert.ok(block !== null, 'the Trae/Qoder finding loop must exist to be checked')
+  const findings = []
+  const context = vm.createContext({
+    sourceStartFailures: new Map([['qoder:cn', 'listen EADDRINUSE']]),
+    sourceKey: (s, r) => s + ':' + r,
+    SOURCE_SPECS: { trae: { activeRegions: () => [] }, qoder: { activeRegions: () => ['cn'] } },
+    traeGateways: new Map(),
+    qoderGateways: new Map(),
+    TRAE_PROVIDER_ID_BY_REGION: {}, TRAE_PROVIDER_NAME_BY_REGION: {},
+    QODER_PROVIDER_ID_BY_REGION: { cn: 'xdpool-qoder-cn' },
+    QODER_PROVIDER_NAME_BY_REGION: { cn: 'WTQ Pool Qoder (CN)' },
+    TRAE_PORTS: {}, QODER_PORTS: { cn: 42871 },
+    push: (label, ok, detail) => findings.push({ label, ok, detail }),
+    declaredSourceBaseUrl: () => undefined,
+    samePublishedAddress: () => true,
+  })
+  vm.runInContext(block[0], context)
+
+  const endpoint = findings.find((finding) => finding.label === 'WTQ Pool Qoder (CN): endpoint')
+  assert.ok(endpoint !== undefined, 'a gateway that never bound must produce a finding')
+  assert.equal(endpoint.ok, false, 'and it must read as a failure, not as health')
+  assert.match(endpoint.detail, /EADDRINUSE/, 'carrying the reason the start gave')
 })
 
 for (const [source, terminal, expected] of [
@@ -267,7 +385,7 @@ test('WorkBuddy closes at a split terminal frame without treating content as a m
     cancel() { released = true },
   })
   const gateway = createWorkBuddyShim({ port: 0,
-    pool: { acquire: async () => ({ label: 'fixture', credential: {} }) }, catalog: {},
+    pool: { acquire: async () => ({ label: 'fixture', credential: {} }) }, catalog: { visible: () => [] },
     client: { prepareChatBody: raw => raw, chatStream: async () => ({ ok: true, response: new Response(upstream) }) },
   })
   const abort = new AbortController()
@@ -372,4 +490,20 @@ test('PI composer paints the row marker in the shared colour', () => {
   const rule = css.split('\n').find(line => line.startsWith('.xd-points-dot{'))
   assert.ok(rule, 'the row marker rule must exist')
   assert.match(rule, /background:#4f9f7c/, 'the marker is a fixed colour shared with the DeepSeek Harness build')
+})
+
+/**
+ * The delete button shares the remove button's box.
+ *
+ * Both sit in one flex line at the right end of an account row. The delete
+ * button inherited the default `button` padding while the remove button carried
+ * the row's smaller one, so it stood taller and its top edge sat above the
+ * control it belongs beside.
+ */
+test('the account row ships one box for the remove and delete buttons', () => {
+  const css = fs.readFileSync(path.join(root, 'renderer/panel.css'), 'utf8')
+  const shared = css.match(/\.acct-remove,\s*\n\.acct-delete \{([^}]*)\}/)
+  assert.ok(shared, 'the two buttons must be sized by one rule, not by the default button padding')
+  assert.match(shared[1], /padding:\s*4px 10px/, 'and that rule must set the row padding both of them share')
+  assert.match(shared[1], /font-size:\s*12\.5px/, 'with the row font size, so their heights match')
 })

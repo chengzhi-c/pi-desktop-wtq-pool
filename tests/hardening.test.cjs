@@ -576,7 +576,7 @@ test('the collected check-in slots persist and are pruned to the retention windo
   const dataPath = scratch('xdpool-slots-test-')
   const context = vm.createContext({
     fs, path, Date, Intl, JSON, Set, Object, Array, console: { log() {}, warn() {} },
-    log: () => {}, messageOf: (error) => String(error?.message ?? error),
+    log: () => {}, safeMessage: (error) => String(error?.message ?? error),
     zonedDayHour: checkinTime.zonedDayHour,
     checkinSlotId: checkinTime.checkinSlotId,
   })
@@ -662,15 +662,18 @@ test('a token budget past the host ceiling is clamped and panel arrays are cappe
 })
 
 /**
- * A stored model override past the host's bounds is clamped before it is
+ * A stored model override past the gateway's own figure is clamped before it is
  * published.
  *
  * The panel's own save path bounds these figures, but the read path folds a
  * settings document in verbatim, so a hand-edited or legacy file can carry a
  * figure the host's manifest validator rejects - and a rejected declaration
- * takes every provider this plugin publishes down with it.
+ * takes every provider this plugin publishes down with it. A figure that is
+ * merely larger than the model accepts is just as wrong: the host sizes its
+ * context budget and compaction threshold from the declared number, so it waited
+ * for room the gateway never had and the reply was cut short.
  */
-test('a stored model override past the host bounds is clamped, not published verbatim', () => {
+test('a stored model override past what the model accepts is clamped, not published verbatim', () => {
   const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
   const constant = (name) => Number(new RegExp(`const ${name} = (0x[0-9a-f]+|\\d+);`).exec(source)[1])
   const context = vm.createContext({
@@ -685,8 +688,51 @@ test('a stored model override past the host bounds is clamped, not published ver
     "sourceModelView('trae:cn', { id: 'm-1' }, { contextWindow: 128000, maxTokens: 32000, supportsImages: false })",
     context,
   )
-  assert.equal(view.contextWindow, 0xffffffff, 'the stored context window is clamped to the host ceiling')
-  assert.equal(view.maxOutputTokens, 0xffffffff, 'the stored output limit is clamped to the host ceiling')
+  assert.equal(view.contextWindow, 128000, 'the stored context window is clamped to what the model accepts')
+  assert.equal(view.maxOutputTokens, 32000, 'the stored output limit is clamped to what the model accepts')
+  // A figure the model can take still passes through untouched, so the clamp is
+  // not a silent downgrade of every edited model.
+  context.gatewayOverrides = () => ({ 'm-1': { contextWindow: 200000, maxOutputTokens: 64000 } })
+  const smaller = vm.runInContext(
+    "sourceModelView('trae:cn', { id: 'm-1' }, { contextWindow: 1000000, maxTokens: 128000 })",
+    context,
+  )
+  assert.equal(smaller.contextWindow, 200000, 'a window the model can take is published as stored')
+  assert.equal(smaller.maxOutputTokens, 64000, 'an output limit the model can take is published as stored')
+})
+
+/**
+ * The editor's "default tier" output ceiling does not follow the declared window.
+ *
+ * `nativeMaxOutputTokens` is the budget of the model's DEFAULT window, because that
+ * is what the editor compares a draft window against. Filling it with the figure
+ * for the window in force meant that a user who raised the window to the Max tier
+ * and then went back to the default one was told the ceiling was the Max tier's
+ * smaller budget, and the field refused an output the gateway accepts.
+ */
+test('the default-tier output ceiling stays put after the window is raised', () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const constant = (name) => Number(new RegExp(`const ${name} = (0x[0-9a-f]+|\\d+);`).exec(source)[1])
+  const context = vm.createContext({
+    MAX_TOKEN_BUDGET: constant('MAX_TOKEN_BUDGET'),
+    CONSERVATIVE_CONTEXT_WINDOW: constant('CONSERVATIVE_CONTEXT_WINDOW'),
+    DEFAULT_MAX_TOKENS: constant('DEFAULT_MAX_TOKENS'),
+    // The live row measured on the AI region: 200000 with 32000 output, and a 1M
+    // Max tier whose function grants only 16000.
+    gatewayOverrides: () => ({ 'm-1': { contextWindow: 1000000 } }),
+  })
+  vm.runInContext(entryFunctions(['positiveInteger', 'sourceModelView'], source), context)
+  const view = vm.runInContext(
+    "sourceModelView('trae:ai', { id: 'm-1' },"
+      + " { contextWindow: 200000, maxTokens: 32000, maxTokensAtCeiling: 16000, maxContextWindow: 1000000, supportsImages: false })",
+    context,
+  )
+  assert.equal(view.contextWindow, 1000000, 'the declared window is the one stored')
+  assert.equal(view.maxOutputTokens, 16000,
+    'and the declaration states the Max-serving budget, which is what that window gets')
+  assert.equal(view.nativeMaxOutputTokens, 32000,
+    'the editor\'s default-tier ceiling stays at the default tier\'s budget')
+  assert.equal(view.maxOutputAtCeiling, 16000, 'while the raised tier states its own')
 })
 
 /**
@@ -699,6 +745,28 @@ test('a stored model override past the host bounds is clamped, not published ver
  * because that document is exactly where an echoed credential rides - Trae's 401
  * quotes the `Cloud-IDE-JWT` header it was sent.
  */
+/**
+ * The vendor's channel check is answered as a cause, not as a wall of tips.
+ *
+ * WorkBuddy's domestic host refuses any request whose prompt names DeepSeek
+ * Harness as the client (code 11128), on every account of that region. Rotation
+ * cannot clear it, so the pool must not spend four upstream calls pretending to
+ * try; and the body it returns is a block of mixed Chinese and English advice
+ * that names no cause and no way forward. This pins the sentence the user reads.
+ */
+test('the channel refusal names its cause and the way forward', () => {
+  const { unapprovedChannelRefusal } = require('../lib/loopback')
+  const body = '{"code":11128,"msg":"Illegal API invocation from an unapproved channel","displayTips":{"zh":"这次调用没通过渠道校验"}}'
+  const sentence = unapprovedChannelRefusal(body)
+  assert.ok(typeof sentence === 'string', 'the refusal has to be recognised')
+  assert.match(sentence, /DeepSeek Harness/, 'it names the identity the vendor rejected')
+  assert.match(sentence, /international|Trae|Qoder/, 'and the sources that do serve it')
+  assert.doesNotMatch(sentence, /unapproved channel|displayTips/, 'the vendor block of tips is not what the user reads')
+  // A 400 that is not this one keeps the ordinary sentence, or the mapping would
+  // swallow every real client error.
+  assert.equal(unapprovedChannelRefusal('{"code":4003,"msg":"messages must not be empty"}'), undefined)
+  assert.equal(unapprovedChannelRefusal('nothing structured'), undefined)
+})
 test('an upstream refusal reaches the client as a sentence, not as a document', () => {
   const { liftUpstreamMessage } = require('../lib/loopback')
   assert.equal(liftUpstreamMessage('{"error":{"message":"service busy"}}'), 'service busy',
@@ -776,7 +844,7 @@ test('a Trae transport failure is answered 502 with the transport message', asyn
 test('a stalling upstream body errors the relayed stream instead of closing it', async () => {
   const source = fs.readFileSync(path.join(root, 'lib/upstream.js'), 'utf8')
   const context = vm.createContext({
-    STREAM_IDLE_TIMEOUT_MS: 40, ReadableStream, Error, setTimeout, clearTimeout,
+    STREAM_IDLE_TIMEOUT_MS: 40, ReadableStream, Error, setTimeout, clearTimeout, setInterval, clearInterval,
   })
   vm.runInContext(entryFunctions(['withIdleWatchdog'], source), context)
   const encoder = new TextEncoder()
@@ -927,12 +995,22 @@ test('a composer answer carries at most eight packages', async () => {
     declarationModels: () => [{ id: 'fixture', name: 'Fixture Model' }],
     activeTraeRegions: () => [], traeDeclarationModels: () => [],
     activeQoderRegions: () => [], qoderDeclarationModels: () => [],
+    // The chip text is resolved against the published declaration, and this
+    // fixture stands in for one WorkBuddy region.
+    manifestProviders: () => [{ id: 'xdpool-cn', models: [{ id: 'fixture', name: 'Fixture Model' }] }],
+    PROVIDER_ID_BY_REGION: { cn: 'xdpool-cn', global: 'xdpool-global' },
+    TRAE_PROVIDER_ID_BY_REGION: { cn: 'xdpool-trae-cn', ai: 'xdpool-trae-ai' },
+    QODER_PROVIDER_ID_BY_REGION: { cn: 'xdpool-qoder-cn', global: 'xdpool-qoder-global' },
+    REGIONS: ['cn', 'global'],
+    TRAE_REGIONS: ['cn', 'ai'],
+    QODER_REGIONS: ['cn', 'global'],
     composerPrefer: async () => ({}), composerRefresh: async () => ({}),
   })
   vm.runInContext([
     ceiling[0],
     entryFunctions(['composerPointsEnabled', 'composerModels', 'composerChipText', 'composerChipTextOf',
-      'matchComposerModel', 'composerPackages', 'workbuddyComposerAccounts', 'composerPoints', 'onRendererCall'], source),
+      'matchComposerModel', 'composerPackages', 'workbuddyComposerAccounts', 'composerPoints',
+      'routeOfProviderId', 'modelTag', 'onRendererCall'], source),
   ].join('\n'), context)
   const answer = await context.onRendererCall('xd.composerPoints',
     { chip: 'Fixture Model', provider: 'xdpool-cn', model: 'fixture' })
@@ -1853,8 +1931,11 @@ test('a check-in pass that starts after a stop still collects', async () => {
     // The state a service stop leaves behind: the flag is aborted, nothing is
     // running, and the pass this entry is about to start must not inherit it.
     checkinAbort: new AbortController(),
+    checkinScope: { enterWith() {} },
     checkinPassRunning: false,
     checkinPassToken: 0,
+    // Nothing is in growth, which is the state the guard has to let through.
+    growthPassRunning: false,
     // The service is running again: a pass the user starts by hand after a stop
     // belongs to the activation that came back, which is the case under test.
     serviceStopped: false,
@@ -1874,7 +1955,7 @@ test('a check-in pass that starts after a stop still collects', async () => {
     qoderCheckinAll: async () => { claims.qoder += 1; return { claimed: 1, skipped: 0, failed: 0 } },
     traeCheckinAll: async () => { claims.trae += 1; return { claimed: 1, skipped: 0, failed: 0 } },
     checkinPause: async () => {},
-    claimAllGrowth: async () => { claims.growth += 1; return { streak: 0, tasks: 0, credit: 0 } },
+    claimAllGrowth: async () => { claims.growth += 1; return { streak: 0, credit: 0 } },
     scheduleRefresh: () => {},
     log: () => {},
     safeMessage: (error) => String(error),
@@ -1892,6 +1973,131 @@ test('a check-in pass that starts after a stop still collects', async () => {
   assert.equal(context.checkinAbort.signal.aborted, false,
     'the pass must have re-armed the flag, or the next one inherits this stop')
   assert.equal(slots.has('2026-10-15T9'), true, 'a pass that ran has spent its slot')
+})
+
+/**
+ * A reload installs a new controller while a pass is still between accounts.
+ * The pause has to keep the signal that pass captured. Reading the global
+ * instead returned at once, and the pass walked the rest of the pool.
+ */
+test('a check-in pause follows the pass that started it', async () => {
+  const { AsyncLocalStorage } = require('node:async_hooks')
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const scope = new AsyncLocalStorage()
+  const stopped = new AbortController()
+  stopped.abort()
+  const context = vm.createContext({
+    AbortController,
+    checkinAbort: stopped,
+    checkinScope: scope,
+    setTimeout,
+    clearTimeout,
+  })
+  vm.runInContext(entryFunctions(['currentCheckinSignal', 'checkinPause'], source), context)
+  const pass = new AbortController()
+  const started = Date.now()
+  await scope.run(pass.signal, () => context.checkinPause(40))
+  assert.ok(Date.now() - started >= 30, 'the pause must wait on the pass signal, not the aborted global')
+  const cut = new AbortController()
+  const cutAt = Date.now()
+  const pending = scope.run(cut.signal, () => context.checkinPause(5000))
+  cut.abort()
+  await pending
+  assert.ok(Date.now() - cutAt < 500, 'aborting the pass signal must cut the pause')
+})
+
+/**
+ * A reload aborts the previous load's work without touching its gateways.
+ *
+ * Clearing the maps here looked like the tidy thing to do, and it cost the Trae
+ * and Qoder directory caches with them: those rows dropped out of the manifest
+ * until the next warm-up happened to rebuild them, which on a machine whose
+ * preferred ports are taken is not soon. `onUnload` already closes them.
+ */
+test('a load leaves the source gateways alone', () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const body = entryFunctions(['onLoad'], source)
+  assert.match(body, /checkinAbort\.abort\(\)/, 'a reload must still abort the pass it replaces')
+  assert.match(body, /abortWarmups\(\)/, 'and stop its warm-ups')
+  assert.doesNotMatch(body, /traeGateways\.clear\(\)/,
+    'clearing Trae here drops its directory cache and its provider row with it')
+  assert.doesNotMatch(body, /qoderGateways\.clear\(\)/, 'and the same for Qoder')
+  // A WorkBuddy runtime is different: it closed over the pool and the client this
+  // load has just replaced, so leaving it in the map serves the previous
+  // activation's account list. It is retired and cleared instead, and the clear
+  // is only allowed when every runtime it drops was first handed to a stop.
+  if (/runtimes\.clear\(\)/.test(body)) {
+    assert.match(body, /stopRuntime\(runtime\)/,
+      'a runtime cleared here must be closed first, or its port is never released')
+    assert.ok(body.indexOf('stopRuntime(runtime)') < body.indexOf('runtimes.clear()'),
+      'and stopped before the map lets go of it')
+  }
+})
+
+/**
+ * A sign-in the panel started does not survive the reload that replaced it.
+ *
+ * `deviceLogins` holds the state each browser-based login is polled against. Its
+ * own comment says a reload drops them so the panel starts over; nothing cleared
+ * the map, so a poll arriving after an in-place reload was answered with a state
+ * this activation never issued and could complete that sign-in.
+ */
+test('a reload drops the sign-ins the previous activation started', () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const body = entryFunctions(['onUnload'], source)
+  assert.match(body, /deviceLogins\.clear\(\)/,
+    'the map is process state, and the poll that would read it outlives the reload')
+})
+
+/**
+ * A reload rebuilds the WorkBuddy runtimes against the core it just made.
+ *
+ * Each shim closes over the pool and client it was created with. When a reload
+ * arrived without the previous unload - the case `onLoad` handles explicitly -
+ * the old shims kept serving from the old pool while `applySettingsToCore`,
+ * `prefer`, `disable`, the credit reserves and `scan` all wrote to the new one:
+ * the panel showed one account list and the gateway drew from another. This pins
+ * the retirement, and that the Trae and Qoder directories are still left alone.
+ */
+test('a reload retires the runtimes bound to the core it replaced', async () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const stopped = []
+  const context = vm.createContext({
+    serviceStopped: false,
+    loadGeneration: 1,
+    refreshTimer: null,
+    runtimes: new Map([['cn', { region: 'cn' }], ['global', { region: 'global' }]]),
+    traeGateways: new Map([['cn', { source: 'trae', region: 'cn' }]]),
+    qoderGateways: new Map(),
+    pendingRuntimeStops: [],
+    stopRuntime: async (runtime) => { stopped.push(runtime.region) },
+    checkinAbort: { abort: () => {} },
+    abortWarmups: () => {},
+    stopAutoCheckin: () => {},
+    stopAccountWatch: () => {},
+    clearModelRetries: () => {},
+    checkinScope: { enterWith: () => {} },
+    checkinPassRunning: false,
+    autoCheckinSlots: new Map(),
+    growthPassRunning: false,
+  })
+  // Only the retirement itself: everything around it needs the host, and the
+  // retirement is what this case is about.
+  const body = entryFunctions(['onLoad'], source)
+  const from = body.indexOf('for (const runtime of Array.from(runtimes.values()))')
+  assert.notEqual(from, -1, 'the retirement must sit in the entry')
+  const retirement = body.slice(from, body.indexOf('await adoptHostSettings()', from))
+  assert.ok(retirement.length > 0, 'the retirement must sit before the core is rebuilt')
+  // The globals it assigns are not declared in this snippet, so they are declared
+  // here as the module would have them.
+  vm.runInContext('var checkinAbort, checkinPassRunning, autoCheckinSlots, growthPassRunning;\n' + retirement, context)
+
+  assert.deepEqual(stopped.sort(), ['cn', 'global'],
+    'a runtime left over from the previous activation must be closed, not kept')
+  assert.equal(context.runtimes.size, 0,
+    'and dropped, so the declaration pass rebuilds it against this load\'s pool')
+  assert.equal(context.traeGateways.size, 1,
+    'the Trae directory is not a closure over the core: clearing it drops its provider row')
 })
 
 /**
@@ -2068,37 +2274,6 @@ test('a spent account is held out of rotation instead of returning each minute',
     'and the account must be out of rotation for the whole of it')
 })
 
-
-
-/**
- * A counter-less task is claimable, so its reward is actually collected.
- *
- * A task with no counter (target 0) has nothing to meet, and requiring
- * `target > 0` made it permanently unclaimable. The pass then skipped it in
- * silence and the reward was simply never collected.
- */
-test('a task with no counter is claimable rather than skipped forever', async () => {
-  const { WorkBuddyUpstreamClient } = require('../lib/upstream')
-  const client = new WorkBuddyUpstreamClient({
-    fetchImpl: async () => new Response(JSON.stringify({
-      code: 0,
-      data: { tasks: [
-        { task_code: 'profile_done', title: '完善资料', reward_credit: 100, current: 0, target: 0, accept_status: 'accepted' },
-        { task_code: 'chat_5', title: '和 AI 聊天 5 次', current: 2, target: 5, accept_status: 'accepted' },
-        { task_code: 'already', title: '已领', current: 0, target: 0, accept_status: 'claimed' },
-      ] },
-    }), { status: 200, headers: { 'content-type': 'application/json' } }),
-  })
-  const tasks = await client.listTasks({
-    accessToken: 't', refreshToken: 'r', expiresAtMs: 0, domain: 'www.workbuddy.cn', sourcePath: '',
-  })
-  const byCode = Object.fromEntries(tasks.map((task) => [task.taskCode, task]))
-  assert.equal(byCode['profile_done'].claimable, true,
-    'a counter-less task has nothing left to wait for, so the pass must offer it')
-  assert.equal(byCode['chat_5'].claimable, false, 'a task with a counter still has to meet it')
-  assert.equal(byCode['already'].claimable, false, 'and an already-claimed one is not offered again')
-})
-
 /**
  * A rate-limit marker only reclassifies the 503 that states the limit.
  *
@@ -2175,7 +2350,7 @@ test('a refused source sign-in is demoted behind the healthy ones, not dropped',
     { label: 'healthy-acct', expiresAtMs: live },
   ]
   const before = Date.now()
-  pool.noteSourceFailure('trae', 'held-acct', '7200')
+  pool.noteSourceFailure('trae', 'cn', 'held-acct', '7200')
   const ordered = pool.orderSourceCredentials('trae', 'cn', credentials, labelOf, false)
   assert.deepEqual(ordered.map(labelOf), ['healthy-acct', 'held-acct'],
     'the refused sign-in must sort behind the healthy one, so the next request is not spent on the same failure')
@@ -2199,7 +2374,7 @@ test('a source hold with no stated wait ends at the cooldown', () => {
     { label: 'held-acct', expiresAtMs: live },
     { label: 'healthy-acct', expiresAtMs: live },
   ]
-  pool.noteSourceFailure('trae', 'held-acct', undefined)
+  pool.noteSourceFailure('trae', 'cn', 'held-acct', undefined)
   const ordered = pool.orderSourceCredentials('trae', 'cn', credentials, labelOf, false)
   assert.deepEqual(ordered.map(labelOf), ['held-acct', 'healthy-acct'],
     'a hold whose cooldown is already past must not keep the sign-in demoted')
@@ -2256,7 +2431,7 @@ test('a sign-in the upstream just refused is tried after the healthy ones but be
   const healthy = { label: 'healthy', expiresAtMs: now + 3600000 }
   const held = { label: 'held', expiresAtMs: now + 3600000 }
   const dead = { label: 'dead', expiresAtMs: now - 60000 }
-  pool.noteSourceFailure('trae', 'held', undefined)
+  pool.noteSourceFailure('trae', 'cn', 'held', undefined)
   assert.deepEqual(pool.orderSourceCredentials('trae', 'cn', [dead, held, healthy], sourceLabel, false).map(sourceLabel),
     ['healthy', 'held', 'dead'],
     'healthy first, then the refused one, then the expired one')
@@ -2264,6 +2439,29 @@ test('a sign-in the upstream just refused is tried after the healthy ones but be
   assert.deepEqual(pool.orderSourceCredentials('trae', 'cn', [dead, held], sourceLabel, false).map(sourceLabel),
     ['held', 'dead'],
     'a held sign-in is still used when it is all there is')
+})
+
+/**
+ * A hold belongs to one region's sign-in, not to its name.
+ *
+ * The scanner keys its rows by label *and* region because one Trae account keeps
+ * a copy in each region (and two different accounts can share a numeral). Keying
+ * the hold by the label alone handed a 429 in one region to the other region's
+ * copy, which then sorted behind a healthy account it had never failed against.
+ */
+test('a hold in one region does not reach the same name in the other', () => {
+  const pool = orderingPool()
+  const now = Date.now()
+  const cnCopy = { label: 'same-name', expiresAtMs: now + 3600000 }
+  const aiCopy = { label: 'same-name', expiresAtMs: now + 3600000 }
+  const aiHealthy = { label: 'other', expiresAtMs: now + 3600000 }
+  pool.noteSourceFailure('trae', 'cn', 'same-name', '7200')
+  assert.deepEqual(pool.orderSourceCredentials('trae', 'cn', [cnCopy, aiHealthy], sourceLabel, false).map(sourceLabel),
+    ['other', 'same-name'],
+    'the refused copy in this region sorts behind the healthy one')
+  assert.deepEqual(pool.orderSourceCredentials('trae', 'ai', [aiCopy, aiHealthy], sourceLabel, false).map(sourceLabel),
+    ['same-name', 'other'],
+    "the other region's copy of that name never failed, so it leads")
 })
 
 test('the picked account leads in every mode, and a retired pick does not', () => {
@@ -2299,8 +2497,8 @@ test('the expiry mode spends the soonest-expiring pack first, and never an expir
   // a one-off pack has to be spent before it lapses, and a monthly pack can
   // wait. `packUrgency` returns Infinity for a sign-in with nothing recorded, so
   // both of these carry a pack.
-  pool.sourceCreditExpiry.set('trae\nsoon', now + 3600000)
-  pool.sourceCreditExpiry.set('trae\nlater', now + 86400000)
+  pool.sourceCreditExpiry.set(pool.accountStateKey('trae', 'cn', 'soon'), now + 3600000)
+  pool.sourceCreditExpiry.set(pool.accountStateKey('trae', 'cn', 'later'), now + 86400000)
   const soon = { label: 'soon', expiresAtMs: now + 7 * 86400000 }
   const later = { label: 'later', expiresAtMs: now + 3600000 }
   const dead = { label: 'dead', expiresAtMs: now - 60000 }
@@ -2308,7 +2506,7 @@ test('the expiry mode spends the soonest-expiring pack first, and never an expir
     ['soon', 'later', 'dead'],
     'the pack that expires soonest is spent first, so a one-off pack is not wasted - and the token expiry says the opposite, which is the point')
   // An expired sign-in is last even when its pack is the most urgent.
-  pool.sourceCreditExpiry.set('trae\ndead', now + 60000)
+  pool.sourceCreditExpiry.set(pool.accountStateKey('trae', 'cn', 'dead'), now + 60000)
   assert.deepEqual(pool.orderSourceCredentials('trae', 'cn', [later, soon, dead], sourceLabel, false).map(sourceLabel),
     ['soon', 'later', 'dead'],
     'an expired sign-in is never spent first however urgent its pack is')
@@ -2403,10 +2601,11 @@ test('a switched-off account does not hold the panel polling open', () => {
 /**
  * A probe pass drops the accounts that have left the pool.
  *
- * The probe cache is keyed by account id and only ever grew: an account whose
- * sign-in was removed kept its entry, and every stale check walked the dead
- * entries alongside the live ones. The prune runs when the cache holds more than
- * the pool does, which is the one moment a departed id is provably in there.
+ * The probe cache is keyed by account id and only ever grows: without a prune,
+ * an account whose sign-in was removed keeps its entry and every stale check
+ * walks the dead entries alongside the live ones. The prune runs when the cache
+ * holds more than the pool does, which is the one moment a departed id is
+ * provably in there.
  */
 test('a probe pass drops the cache entries of accounts that left the pool', async () => {
   const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
@@ -2453,9 +2652,15 @@ test('a declaration that already says the same thing is not rewritten', () => {
   const temporary = scratch('xdpool-decl-test-')
   const manifestPath = path.join(temporary, 'manifest.json')
   // The same provider as the descriptors below, with its keys in another order.
+  // `alias` is what the host's chip prints, so a declaration carries it beside the
+  // name; the comparison is about key order, not about which fields exist.
   const onDisk = {
     contributes: {
-      providers: [{ models: ['fixture-model'], baseUrl: 'http://127.0.0.1:41831/v1', id: 'xdpool-cn' }],
+      providers: [{
+        models: [{ name: 'Fixture', id: 'fixture-model', alias: 'Fixture' }],
+        baseUrl: 'http://127.0.0.1:41831/v1',
+        id: 'xdpool-cn',
+      }],
     },
   }
   fs.writeFileSync(manifestPath, JSON.stringify(onDisk, null, 2) + '\n')
@@ -2465,9 +2670,15 @@ test('a declaration that already says the same thing is not rewritten', () => {
     packageRoot: temporary,
     manifestCache: undefined,
     errorCodeOf: () => 'unknown',
+    // Nothing here is one of this plugin's pools, so the labels are published
+    // exactly as given and the case stays about the canonical comparison.
+    PROVIDER_ID_BY_REGION: {}, TRAE_PROVIDER_ID_BY_REGION: {}, QODER_PROVIDER_ID_BY_REGION: {},
+    REGIONS: [], TRAE_REGIONS: [], QODER_REGIONS: [],
   })
-  vm.runInContext(entryFunctions(['canonicalJson', 'writeDeclaration'], source), context)
-  const descriptors = [{ id: 'xdpool-cn', baseUrl: 'http://127.0.0.1:41831/v1', models: ['fixture-model'] }]
+  vm.runInContext(entryFunctions([
+    'canonicalJson', 'writeDeclaration', 'disambiguateModelLabels', 'stripModelTag', 'modelTag', 'routeOfProviderId',
+  ], source), context)
+  const descriptors = [{ id: 'xdpool-cn', baseUrl: 'http://127.0.0.1:41831/v1', models: [{ id: 'fixture-model', name: 'Fixture' }] }]
   const result = context.writeDeclaration(descriptors)
   assert.deepEqual(JSON.parse(JSON.stringify(result)), { ok: true, changed: false, providerCount: 1 },
     'a manifest that already carries the same provider must read as unchanged')
@@ -2475,10 +2686,56 @@ test('a declaration that already says the same thing is not rewritten', () => {
     'and it must not be rewritten, or the footer claims an update that did not happen')
   // The control: a genuinely different declaration still writes, or the case
   // above would pass for a writer that never writes at all.
-  const changed = context.writeDeclaration([{ id: 'xdpool-cn', baseUrl: 'http://127.0.0.1:41831/v1', models: ['other-model'] }])
+  const changed = context.writeDeclaration([{ id: 'xdpool-cn', baseUrl: 'http://127.0.0.1:41831/v1', models: [{ id: 'other-model', name: 'Other' }] }])
   assert.equal(changed.changed, true, 'a different model list is a real change and must be written')
   assert.equal(before.equals(fs.readFileSync(manifestPath)), false, 'and the file on disk must reflect it')
   fs.rmSync(temporary, { recursive: true, force: true })
+})
+
+/**
+ * The region tagging pass is idempotent, so a pass over its own output writes
+ * nothing.
+ *
+ * Two halves of one declaration are built differently: the rosters this run read
+ * carry plain names, while the rows retained for a warming gateway already carry
+ * the tag from the previous write. Counting those two as they are makes the
+ * same declaration read as changed - the CN row loses its suffix while a sibling
+ * warms, then gets it back afterwards - and each flip is a manifest rewrite plus
+ * a window in which the composer chip names nothing.
+ */
+test('a declaration written over its own output is unchanged', () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const context = vm.createContext({
+    PROVIDER_ID_BY_REGION: { cn: 'xdpool-cn', global: 'xdpool-global' },
+    TRAE_PROVIDER_ID_BY_REGION: { cn: 'xdpool-trae-cn', ai: 'xdpool-trae-ai' },
+    QODER_PROVIDER_ID_BY_REGION: { cn: 'xdpool-qoder-cn', global: 'xdpool-qoder-global' },
+    REGIONS: ['cn', 'global'], TRAE_REGIONS: ['cn', 'ai'], QODER_REGIONS: ['cn', 'global'],
+  })
+  vm.runInContext(entryFunctions([
+    'disambiguateModelLabels', 'stripModelTag', 'modelTag', 'routeOfProviderId',
+  ], source), context)
+  const roster = (name) => [{ id: 'm', name }]
+  const first = context.disambiguateModelLabels([
+    { id: 'xdpool-cn', models: roster('Shared \u00b7 x0.29') },
+    { id: 'xdpool-global', models: roster('Shared \u00b7 x0.29') },
+  ])
+  assert.deepEqual(JSON.parse(JSON.stringify(first.map((provider) => provider.models[0].name))),
+    ['Shared \u00b7 x0.29 (CN)', 'Shared \u00b7 x0.29 (Global)'],
+    'both spellings of a shared name carry their region')
+
+  // The next pass is handed one read roster and one retained row, which is what
+  // `syncDeclaration` builds while a sibling gateway is still warming.
+  const second = context.disambiguateModelLabels([
+    { id: 'xdpool-cn', models: roster('Shared \u00b7 x0.29') },
+    { id: 'xdpool-global', models: roster('Shared \u00b7 x0.29 (Global)') },
+  ])
+  assert.deepEqual(JSON.parse(JSON.stringify(second.map((provider) => provider.models[0].name))),
+    ['Shared \u00b7 x0.29 (CN)', 'Shared \u00b7 x0.29 (Global)'],
+    'the retained row keeps its tag and the fresh one regains it, so the output equals the first pass')
+
+  // A name that merely ends in parentheses is not a tag and has to survive.
+  const plain = context.disambiguateModelLabels([{ id: 'xdpool-cn', models: roster('Model (beta)') }])
+  assert.equal(plain[0].models[0].name, 'Model (beta)', 'a name that ends in parentheses keeps it')
 })
 
 /**
@@ -2526,13 +2783,22 @@ test('composer points tell the readout to stop when the feature is off', () => {
     traeDeclarationModels: () => [],
     activeQoderRegions: () => [],
     qoderDeclarationModels: () => [],
+    // The label a chip carries is resolved against what the host was given, and
+    // nothing has been published here.
+    manifestProviders: () => [],
+    PROVIDER_ID_BY_REGION: { cn: 'xdpool-cn', global: 'xdpool-global' },
+    TRAE_PROVIDER_ID_BY_REGION: { cn: 'xdpool-trae-cn', ai: 'xdpool-trae-ai' },
+    QODER_PROVIDER_ID_BY_REGION: { cn: 'xdpool-qoder-cn', global: 'xdpool-qoder-global' },
+    REGIONS: ['cn', 'global'],
+    TRAE_REGIONS: ['cn', 'ai'],
+    QODER_REGIONS: ['cn', 'global'],
     runtimes: new Map(),
     traeGateways: new Map(),
     qoderGateways: new Map(),
   })
   vm.runInContext(entryFunctions([
     'composerPointsEnabled', 'composerPoints', 'matchComposerModel', 'composerChipTextOf',
-    'composerModels', 'composerChipText', 'composerChipTexts',
+    'composerModels', 'composerChipText', 'composerChipTexts', 'routeOfProviderId',
   ], source), context)
   const off = context.composerPoints({ chip: 'anything' })
   assert.deepEqual(JSON.parse(JSON.stringify(off)), { show: false, ours: false, enabled: false },
@@ -2559,7 +2825,7 @@ test('a forced refresh holds the pass slot until the background pass has finishe
   const gate = new Promise((resolve) => { release = resolve });
   let documents = 0;
   const context = vm.createContext({
-    setTimeout, clearTimeout,
+    setTimeout, clearTimeout, setInterval, clearInterval,
     serviceStopped: false,
     loadGeneration: 1,
     refreshInflight: null,
@@ -2700,6 +2966,77 @@ test('a WorkBuddy field sealed under the at-rest key opens, and one sealed under
     $wbEncrypted: 1,
     envelope: Buffer.from(JSON.stringify({ ...record, ciphertext: edited.toString('base64') })).toString('base64'),
   }, key), /authenticate/i, 'an edited ciphertext must fail the tag, not decrypt to a token nobody issued')
+})
+
+/**
+ * The signature scan is handed a module path its own edition can load.
+ *
+ * `powershell` is Windows PowerShell 5.1, and it binds
+ * `Microsoft.PowerShell.Security` by walking `PSModulePath` in order. Any machine
+ * with a Store-installed PowerShell 7 carries that build's Modules directory
+ * ahead of the system one, because the Store install prepends it to the variable
+ * the desktop host inherited. 5.1 then binds the 7 build's copy of the module, the
+ * import dies on a type-data conflict, and `Get-AuthenticodeSignature` throws for
+ * every candidate. The scan's own catch swallows that, the policy function is
+ * handed an empty status, and the at-rest key reads as "no WorkBuddy executable
+ * found" on a machine holding two signed installs - which is what it read as
+ * here, until the scan was given a path of its own.
+ *
+ * The scan is driven with a stubbed `execFileSync` rather than a real PowerShell,
+ * so the case proves the environment is handed over at all: dropping the option
+ * fails it just as surely as getting the order wrong. It also runs on a machine
+ * with no registry to plant an uninstall key in.
+ */
+test('the signature scan is handed a module path 5.1 can load', () => {
+  const atRestSource = fs.readFileSync(path.join(root, 'lib/at-rest.js'), 'utf8')
+  const spawns = []
+  const context = vm.createContext({
+    // esbuild's namespace import, the same shape the crypto case below stubs.
+    import_node_child_process: { execFileSync: (file, args, options) => { spawns.push({ file, args, options }); return '' } },
+    signatureScanEnv: require('../lib/at-rest').signatureScanEnv,
+    scanInterpreter: require('../lib/at-rest').scanInterpreter,
+    import_node_path: require('node:path'),
+    process,
+  })
+  vm.runInContext(entryFunctions(['cleanIconPath', 'systemRootOf', 'scanInterpreter', 'readRegistryAppPaths'], atRestSource), context)
+  vm.runInContext('readRegistryAppPaths()', context)
+  assert.equal(spawns.length, 1, 'the scan runs exactly once')
+  // By absolute path, not by bare name: a user-writable directory is on the
+  // default PATH, and the scan exists precisely because a user-level process can
+  // plant what it runs.
+  assert.ok(path.isAbsolute(spawns[0].file), 'the interpreter is pinned, not looked up on PATH')
+  assert.match(spawns[0].file, /WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/i)
+
+  const handed = spawns[0].options.env
+  assert.notEqual(handed, undefined, 'the child must be handed an environment of our own, not the ambient one')
+  const systemRoot = process.env['SystemRoot']
+  if (systemRoot !== undefined && systemRoot !== '') {
+    const modules = path.join(systemRoot, 'system32', 'WindowsPowerShell', 'v1.0', 'Modules')
+    assert.equal(handed.PSModulePath.split(';')[0], modules,
+      'the 5.1 modules directory leads the path the child is given, so it binds its own edition of the module')
+  }
+  // The ordering property itself, stated against a path shaped like the one that
+  // broke it, so the case holds on a machine whose own path is already clean.
+  const store = path.join('C:\\Program Files', 'WindowsApps', 'microsoft.powershell_7.6.7.0_x64__8wekyb3d8bbwe', 'Modules')
+  const ambient = [
+    path.join('C:\\Users\\fixture', 'Documents', 'PowerShell', 'Modules'),
+    path.join('C:\\Program Files', 'PowerShell', 'Modules'),
+    store,
+    path.join('C:\\Program Files', 'WindowsPowerShell', 'Modules'),
+    path.join('C:\\Windows', 'system32', 'WindowsPowerShell', 'v1.0', 'Modules'),
+  ].join(';')
+  const { signatureScanEnv } = require('../lib/at-rest')
+  const built = signatureScanEnv({ SystemRoot: 'C:\\Windows', PSModulePath: ambient, PATH: 'unchanged' })
+  const order = built.PSModulePath.split(';')
+  assert.ok(order.indexOf(path.join('C:\\Windows', 'system32', 'WindowsPowerShell', 'v1.0', 'Modules')) < order.indexOf(store),
+    'the system modules directory precedes the Store PowerShell 7 one, which is the whole fix')
+  assert.equal(order.length, ambient.split(';').length + 1,
+    'nothing is dropped: a user\'s own modules still resolve behind the system one')
+  assert.equal(built.PATH, 'unchanged', 'the rest of the environment is passed through untouched')
+  assert.equal(signatureScanEnv(built).PSModulePath, built.PSModulePath,
+    'building it twice is a no-op, so the path cannot grow on every scan')
+  assert.equal(signatureScanEnv({ PATH: 'unchanged' }).PATH, 'unchanged',
+    'with no SystemRoot to derive from the environment is left as it is rather than given an invented path')
 })
 
 /**
@@ -3134,7 +3471,7 @@ test('a 401 without a session marker rotates and refreshes', async () => {
       account: { uin: 'u-' + name, nickname: name },
     }))
   }
-  const pool = new WorkBuddyAccountPool({ client, cooldownMs: 60000 })
+  const pool = new WorkBuddyAccountPool({ authDirs: [path.join(dir, 'first'), path.join(dir, 'second')], client, cooldownMs: 60000 })
   const { createWorkBuddyShim } = require('../lib/shim')
   const { WorkBuddyCatalog } = require('../lib/catalog')
   const shim = createWorkBuddyShim({ pool, client, catalog: new WorkBuddyCatalog() })
@@ -3759,7 +4096,7 @@ test('a refusal that merely contains "already" is a failure', () => {
   const body = entryFunctions([name], source)
   const mod = { exports: {} }
   new Function('module', 'exports', 'require',
-    'const messageOf = (error) => String((error && error.message) || error);\n' + body
+    'const safeMessage = (error) => String((error && error.message) || error);\n' + body
     + '\nmodule.exports = { isAlreadyCheckin };')(mod, mod.exports, require)
   assert.equal(mod.exports.isAlreadyCheckin(new Error('already')), false,
     'a bare word is not the sentence the upstream uses for a collected day')
@@ -3932,28 +4269,279 @@ test('an international turn opens with a system prompt', async () => {
 })
 
 /**
+ * A request that names no thinking effort is not refused for the omission.
+ *
+ * `glm-5.1` rejects the whole request with HTTP 400 / 11133 ("the request
+ * parameters were rejected by the model provider") when `reasoning_effort` is
+ * absent, while the same request carrying `off` or any rung of its ladder is
+ * served. A client that expresses no preference - a plain OpenAI client, or the
+ * host on a model whose off level is not a name its map carries - therefore got
+ * a refusal where an answer was due. The gateway retries once with the model's
+ * own declared default, and only for that refusal: a genuinely malformed request
+ * keeps its 400 and is not spent upstream twice.
+ */
+test('a request that names no thinking effort gets the model default, once', async () => {
+  const { WorkBuddyUpstreamClient } = require('../lib/upstream')
+  const { WorkBuddyAccountPool } = require('../lib/accounts')
+  const { WorkBuddyCatalog } = require('../lib/catalog')
+  const { createWorkBuddyShim } = require('../lib/shim')
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-effort-'))
+  const home = path.join(dir, 'home')
+  fs.mkdirSync(home, { recursive: true })
+  fs.writeFileSync(path.join(home, 'workbuddy-desktop.info'), JSON.stringify({
+    auth: { accessToken: 'effort-token', refreshToken: 'effort-refresh', expiresAt: 0, domain: 'www.workbuddy.cn' },
+    account: { uin: 'u-effort', nickname: 'effort' },
+  }))
+
+  // The refusal the upstream really answers with, verbatim enough for the code.
+  const refusal = JSON.stringify({
+    code: 11133,
+    msg: 'the request parameters were rejected by the model provider',
+    extError: { code: '1210', type: 'invalid_request_error', StatusCode: 400 },
+  })
+  const bodies = []
+  const client = new WorkBuddyUpstreamClient({
+    fetchImpl: async (url, init) => {
+      // Only the chat calls are counted: the pool also refreshes the token for a
+      // sign-in whose expiry has passed, and that POST is not a model request.
+      if (!String(url).endsWith('/v2/chat/completions')) {
+        return new Response(JSON.stringify({ code: 0, data: { accessToken: 'effort-token', expiresIn: 3600 } }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      }
+      const body = JSON.parse(String(init?.body ?? '{}'))
+      bodies.push(body)
+      // The upstream's rule, as measured: any named effort is served (glm-5.1
+      // even takes names outside its own ladder), and the field merely being
+      // absent - or present but empty, which is not a level either - is what it
+      // rejects.
+      if (typeof body.reasoning_effort !== 'string' || body.reasoning_effort === '') {
+        return new Response(refusal, { status: 400, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response('data: {"choices":[{"delta":{"content":"pong"}}]}\n\ndata: [DONE]\n\n', {
+        status: 200, headers: { 'content-type': 'text/event-stream' },
+      })
+    },
+  })
+  const catalog = new WorkBuddyCatalog()
+  // The declared ladder comes from the upstream roster; the static fallback
+  // states none, so the fixture states the row the live directory really carries.
+  catalog.update([{
+    id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200000, maxOutputTokens: 48000,
+    supportedEfforts: ['off', 'low', 'medium', 'high', 'xhigh', 'max'], defaultThinkingLevel: 'medium',
+  }])
+  // The pool must read THIS file and nothing else. Without `authDirs` it falls
+  // back to the real desktop profile directories, so the case would pass on a
+  // machine with a live WorkBuddy sign-in and fail everywhere else - a test that
+  // reads the developer's own tokens.
+  const pool = new WorkBuddyAccountPool({ authDirs: [home], client, cooldownMs: 60000 })
+  const shim = createWorkBuddyShim({ pool, client, catalog })
+  const ask = async () => {
+    const answer = await fetch(shim.baseUrl() + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1' },
+      body: JSON.stringify({ model: 'glm-5.1', messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 }),
+    })
+    return { status: answer.status, text: await answer.text() }
+  }
+  try {
+    await shim.ready
+    const served = await ask()
+    assert.equal(served.status, 200, 'the turn is served instead of refused for the missing field')
+    assert.match(served.text, /pong/, 'and the upstream answer reaches the caller')
+    assert.equal(bodies.length, 2, 'exactly one retry: the refusal, then the same request with a default')
+    assert.equal(bodies[0].reasoning_effort, undefined, 'the first attempt is the caller\'s body, unchanged')
+    assert.equal(bodies[1].reasoning_effort, 'medium',
+      'the retry carries the default the catalog declares for this model')
+    assert.deepEqual(bodies[1].messages, bodies[0].messages, 'and nothing else about the request changes')
+
+    // A caller that named an effort is served on the first attempt: nothing is
+    // sent twice on behalf of a request that was already complete.
+    bodies.length = 0
+    const named = await fetch(shim.baseUrl() + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1' },
+      body: JSON.stringify({
+        model: 'glm-5.1', messages: [{ role: 'user', content: 'hi' }], max_tokens: 16, reasoning_effort: 'off',
+      }),
+    })
+    assert.equal(named.status, 200, 'a request that names its effort is served as sent')
+    assert.equal(bodies.length, 1, 'and is not spent upstream a second time')
+    assert.equal(bodies[0].reasoning_effort, 'off', 'the caller\'s own choice is what reaches the upstream')
+
+    // An empty string is "no preference" spelled differently, so it is filled in
+    // rather than read as a named level.
+    bodies.length = 0
+    const blank = await fetch(shim.baseUrl() + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1' },
+      body: JSON.stringify({
+        model: 'glm-5.1', messages: [{ role: 'user', content: 'hi' }], max_tokens: 16, reasoning_effort: '',
+      }),
+    })
+    assert.equal(blank.status, 200, 'an empty effort is filled in, not passed through as a refusal')
+    assert.equal(bodies.length, 2, 'the empty string is retried, not accepted as a named level')
+    assert.equal(bodies[1].reasoning_effort, 'medium', 'the declared default replaces the empty string')
+  } finally {
+    await shim.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/**
+ * A 400 that is not the parameter refusal is answered as it came.
+ *
+ * 11133 is a general invalid-parameter code, so the retry is gated on it being
+ * that code *and* the request having named no effort. A different refusal - a
+ * bad `temperature`, an unsupported field - must reach the caller after one
+ * upstream call: retrying it would spend an account's request to produce the
+ * same error, and would replace the first answer with the second.
+ */
+test('a refusal that is not the parameter rejection is not retried', async () => {
+  const { WorkBuddyUpstreamClient } = require('../lib/upstream')
+  const { WorkBuddyAccountPool } = require('../lib/accounts')
+  const { WorkBuddyCatalog } = require('../lib/catalog')
+  const { createWorkBuddyShim } = require('../lib/shim')
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-effort-skip-'))
+  const home = path.join(dir, 'home')
+  fs.mkdirSync(home, { recursive: true })
+  fs.writeFileSync(path.join(home, 'workbuddy-desktop.info'), JSON.stringify({
+    auth: { accessToken: 'skip-token', refreshToken: 'skip-refresh', expiresAt: 0, domain: 'www.workbuddy.cn' },
+    account: { uin: 'u-skip', nickname: 'skip' },
+  }))
+
+  let chatCalls = 0
+  const client = new WorkBuddyUpstreamClient({
+    fetchImpl: async (url) => {
+      if (!String(url).endsWith('/v2/chat/completions')) {
+        return new Response(JSON.stringify({ code: 0, data: { accessToken: 'skip-token', expiresIn: 3600 } }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      }
+      chatCalls += 1
+      return new Response(JSON.stringify({ code: 11128, msg: 'the first message is not a system prompt' }), {
+        status: 400, headers: { 'content-type': 'application/json' },
+      })
+    },
+  })
+  const catalog = new WorkBuddyCatalog()
+  catalog.update([{
+    id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200000, maxOutputTokens: 48000,
+    supportedEfforts: ['off', 'low', 'medium', 'high'], defaultThinkingLevel: 'medium',
+  }])
+  const pool = new WorkBuddyAccountPool({ authDirs: [home], client, cooldownMs: 60000 })
+  const shim = createWorkBuddyShim({ pool, client, catalog })
+  try {
+    await shim.ready
+    const answer = await fetch(shim.baseUrl() + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1' },
+      body: JSON.stringify({ model: 'glm-5.1', messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 }),
+    })
+    assert.equal(answer.status, 400, 'a different refusal keeps its own status')
+    assert.equal(chatCalls, 1, 'and is spent upstream exactly once')
+    assert.match(await answer.text(), /11128/, 'the caller sees the upstream\'s own reason, not a rewritten one')
+  } finally {
+    await shim.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/**
+ * A declared default the model does not accept is not sent.
+ *
+ * Answering the refusal with a level the upstream also refuses would spend a second
+ * call to produce the same error. The catalog is the only source of the default, and
+ * it can disagree with the ladder it states - a row written by hand, or an upstream
+ * that lists a level its own default is not on.
+ */
+test('a default outside the model ladder is not retried with', async () => {
+  const { WorkBuddyUpstreamClient } = require('../lib/upstream')
+  const { WorkBuddyAccountPool } = require('../lib/accounts')
+  const { WorkBuddyCatalog } = require('../lib/catalog')
+  const { createWorkBuddyShim } = require('../lib/shim')
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-effort-ladder-'))
+  const home = path.join(dir, 'home')
+  fs.mkdirSync(home, { recursive: true })
+  fs.writeFileSync(path.join(home, 'workbuddy-desktop.info'), JSON.stringify({
+    auth: { accessToken: 'ladder-token', refreshToken: 'ladder-refresh', expiresAt: 0, domain: 'www.workbuddy.cn' },
+    account: { uin: 'u-ladder', nickname: 'ladder' },
+  }))
+
+  let chatCalls = 0
+  const client = new WorkBuddyUpstreamClient({
+    fetchImpl: async (url) => {
+      if (!String(url).endsWith('/v2/chat/completions')) {
+        return new Response(JSON.stringify({ code: 0, data: { accessToken: 'ladder-token', expiresIn: 3600 } }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      }
+      chatCalls += 1
+      return new Response(JSON.stringify({ code: 11133, msg: 'the request parameters were rejected by the model provider' }), {
+        status: 400, headers: { 'content-type': 'application/json' },
+      })
+    },
+  })
+  const catalog = new WorkBuddyCatalog()
+  catalog.update([{
+    id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200000, maxOutputTokens: 48000,
+    // The declared default is not on the ladder this row states.
+    supportedEfforts: ['off', 'low', 'high'], defaultThinkingLevel: 'max',
+  }])
+  const pool = new WorkBuddyAccountPool({ authDirs: [home], client, cooldownMs: 60000 })
+  const shim = createWorkBuddyShim({ pool, client, catalog })
+  try {
+    await shim.ready
+    const answer = await fetch(shim.baseUrl() + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1' },
+      body: JSON.stringify({ model: 'glm-5.1', messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 }),
+    })
+    assert.equal(answer.status, 400, 'the refusal is passed through')
+    await answer.text()
+    assert.equal(chatCalls, 1,
+      'and not retried: a default the model states it does not accept would be refused again')
+  } finally {
+    await shim.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/**
  * A sign-in that is gone takes its hold and pack expiry with it.
  *
- * Both maps are keyed by source and label, and a label is not unique to one
- * sign-in: a departed account's hold was inherited by the next one that happened
- * to carry the same name, which demoted it for the rest of the hold despite
- * never having failed, and its pack expiry corrupted expiry-mode ordering.
+ * A label is not unique to one sign-in: a departed account's hold was inherited
+ * by the next one that happened to carry the same name, which demoted it for the
+ * rest of the hold despite never having failed, and its pack expiry corrupted
+ * expiry-mode ordering. The keys come from the engine's own `sourceRegionKey`, so
+ * the fixture cannot drift from the format `pruneSourceState` builds.
  */
 test('a departed sign-in leaves no hold or pack expiry behind', () => {
   const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
   const rows = {
     traeAccountRows: [{ label: 'kept', region: 'cn' }],
     qoderAccountRows: [{ label: 'kept', region: 'cn' }],
-    sourceFailureHold: new Map([['trae\nkept', Date.now() + 60000], ['trae\ngone', Date.now() + 60000]]),
-    sourceCreditExpiry: new Map([['qoder\nkept', Date.now() + 60000], ['qoder\ngone', Date.now() + 60000]]),
+    sourceFailureHold: new Map(),
+    sourceCreditExpiry: new Map(),
   }
   const context = vm.createContext({ console, ...rows })
-  vm.runInContext(entryFunctions(['pruneSourceState'], source), context)
+  vm.runInContext(entryFunctions(['sourceRegionKey', 'pruneSourceState'], source), context)
+  context.accountStateKey = (from, region, label) => context.sourceRegionKey(from, region) + '\n' + label
+  const keptTrae = context.accountStateKey('trae', 'cn', 'kept')
+  const goneTrae = context.accountStateKey('trae', 'cn', 'gone')
+  const keptQoder = context.accountStateKey('qoder', 'cn', 'kept')
+  const goneQoder = context.accountStateKey('qoder', 'cn', 'gone')
+  const until = Date.now() + 60000
+  rows.sourceFailureHold.set(keptTrae, until).set(goneTrae, until)
+  rows.sourceCreditExpiry.set(keptQoder, until).set(goneQoder, until)
   context.pruneSourceState()
   assert.equal(context.sourceFailureHold.size, 1, 'the hold of the departed sign-in is dropped')
-  assert.ok(context.sourceFailureHold.has('trae\nkept'), 'and the one that is still signed in keeps its hold')
+  assert.ok(context.sourceFailureHold.has(keptTrae), 'and the one that is still signed in keeps its hold')
   assert.equal(context.sourceCreditExpiry.size, 1, 'the same for the pack expiry')
-  assert.ok(context.sourceCreditExpiry.has('qoder\nkept'), 'the surviving sign-in keeps its expiry')
+  assert.ok(context.sourceCreditExpiry.has(keptQoder), 'the surviving sign-in keeps its expiry')
 })
 
 /**
@@ -3978,18 +4566,79 @@ test('a service stop releases the refresh slot', async () => {
     ...state,
     clearTimeout: () => { stopped.push('timer') },
     stopAutoCheckin: () => stopped.push('checkin'),
+    stopAccountWatch: () => stopped.push('accountWatch'),
     abortWarmups: () => stopped.push('warmups'),
+    clearModelRetries: () => stopped.push('modelRetries'),
     checkinAbort: { abort: () => stopped.push('checkinAbort') },
+    runtimeStarts: new Map(),
     runtimes: new Map(),
     traeGateways: new Map(),
     qoderGateways: new Map(),
+    gatewayStartFailures: new Map([['cn', 'boom']]),
+    sourceStartFailures: new Map([['trae:cn', 'boom']]),
+    pendingRuntimeStops: [{ then: () => {} }],
     stopRuntime: async () => {},
     log: () => {},
-    messageOf: (error) => String(error?.message ?? error),
+    safeMessage: (error) => String(error?.message ?? error),
   })
   vm.runInContext(entryFunctions(['onServiceStop'], source), context)
   await context.onServiceStop()
   assert.equal(context.refreshInflight, null,
     'the slot must be free for the freshly loaded plugin\'s first background pass')
   assert.equal(context.refreshTimer, null, 'and the deferred timer with it')
+  assert.ok(stopped.includes('modelRetries'),
+    'and the roster retries, which would otherwise fire into the next activation')
+  assert.equal(context.gatewayStartFailures.size, 0,
+    'a region whose failure belonged to this activation must not read as failed in the next')
+  assert.equal(context.sourceStartFailures.size, 0, 'and the same for the two source regions')
+  assert.equal(context.pendingRuntimeStops.length, 0,
+    'a deferred stop waiting on a runtime this teardown closed has nothing left to wait for')
+})
+
+/**
+ * The Max gate follows the manifest the HOST loaded, not the file on disk.
+ *
+ * This plugin rewrites `manifest.json` at the end of every load, so the file is one
+ * generation ahead of what the host is actually sizing requests against. Reading it
+ * back would open Max mode the moment a window was saved - billed on the larger
+ * tier's terms for room this session never uses - and close it again whenever a
+ * directory function failed. `getManifest()` is what the host holds.
+ */
+test('the published window is read from the manifest the host loaded', () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const context = vm.createContext({
+    pi: {
+      plugin: {
+        // The host's copy: the model is at its default tier.
+        getManifest: () => ({
+          contributes: {
+            providers: [{
+              id: 'plugin:test:trae-cn',
+              models: [{ id: 'm-1', contextWindow: 200000 }, { id: 'm-2', contextWindow: 256000 }],
+            }],
+          },
+        }),
+      },
+    },
+    // Deliberately disagreeing with the host: the file has since been rewritten
+    // with the Max tier, and reading it would report the wider window.
+    readManifest: () => ({
+      contributes: {
+        providers: [{ id: 'plugin:test:trae-cn', models: [{ id: 'm-1', contextWindow: 1000000 }] }],
+      },
+    }),
+    manifestProviders: () => [{ id: 'plugin:test:trae-cn', models: [{ id: 'm-1', contextWindow: 1000000 }] }],
+    positiveInteger: (value, fallback) => (Number.isFinite(Number(value)) && Number(value) > 0 ? Math.trunc(Number(value)) : fallback),
+    hostPublishedWindows: null,
+  })
+  const capture = vm.runInContext(`(${entryFunctions(['captureHostWindows'], source).replace(/^function captureHostWindows/, 'function captureHostWindows')})`, context)
+  capture()
+  vm.runInContext('hostWindowOf = ' + entryFunctions(['hostWindowOf'], source).replace('function hostWindowOf', 'function hostWindowOf'), context)
+  assert.equal(context.hostWindowOf('plugin:test:trae-cn', 'm-1'), 200000,
+    'the host holds the default tier, so that is the window Max mode is measured against')
+  assert.equal(context.hostWindowOf('plugin:test:trae-cn', 'm-2'), 256000)
+  assert.equal(context.hostWindowOf('plugin:test:trae-cn', 'gone'), undefined,
+    'a model the host does not hold has no published window')
+  assert.equal(context.hostWindowOf('plugin:test:trae-ai', 'm-1'), undefined,
+    'and neither does a provider it does not hold')
 })

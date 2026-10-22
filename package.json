@@ -1,8 +1,8 @@
 {
   "name": "pi-desktop-wtq-pool",
-  "version": "1.0.41",
+  "version": "1.0.5",
   "private": true,
-  "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接进 PI-Desktop。WorkBuddy 被限流时自动换号，三家各有开关。",
+  "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接入 PI-Desktop。限流或额度用尽时自动换号，三家各有开关。",
   "author": "chengzhi-c",
   "homepage": "https://github.com/chengzhi-c/pi-desktop-wtq-pool",
   "repository": {

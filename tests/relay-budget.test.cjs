@@ -61,7 +61,7 @@ test('the composer refresh answers inside the host relay budget', async (t) => {
   const context = vm.createContext({
     require: createRequire(path.join(root, 'main.js')),
     module: { exports: {} }, __dirname: temporary,
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
     pi: {
       plugin: {
         getSettings: async () => ({ ...settings }),

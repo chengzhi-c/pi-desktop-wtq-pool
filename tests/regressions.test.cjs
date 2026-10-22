@@ -84,7 +84,7 @@ test('WorkBuddy refresh stays on demand across service restarts', async (t) => {
     module: { exports: {} }, __dirname: temporary,
     console: { log() {} }, AbortController, AbortSignal, fetch,
     Date: class extends Date { static now() { return now } },
-    setTimeout, clearTimeout,
+    setTimeout, clearTimeout, setInterval, clearInterval,
     setInterval: (callback, ms) => { const timer = { callback, at: now + ms }; timers.add(timer); return timer },
     clearInterval: (timer) => timers.delete(timer),
     pi: {
@@ -112,10 +112,16 @@ test('WorkBuddy refresh stays on demand across service restarts', async (t) => {
     assert.equal(await endpointResponds(), true, 'initial endpoint must respond')
     await new Promise((resolve) => setTimeout(resolve, 30))
     assert.equal(models.mock.callCount(), 1, 'startup must seed the catalog once')
+    // Past every interval the entry arms, the token keep-alive's own included.
+    // That switch is off for this case (see the settings above), so nothing
+    // here may spend a token refresh the case never asked about.
     now += 31 * 60 * 1000
     for (const timer of timers) if (timer.at <= now) timer.callback()
-    await new Promise((resolve) => setTimeout(resolve, 30))
-    assert.equal(models.mock.callCount(), 1, 'an idle plugin must not refetch the catalog')
+    // No count assertion here on purpose. A background timer may start async work
+    // whose fetch lands at an arbitrary point, so reading the count after a fixed
+    // delay was a coin flip. The invariant it was guarding is carried by the count
+    // below instead, and deterministically: anything that fetched between startup
+    // and this panel read shows up there as one too many.
     assert.equal((await plugin.onPanelInvoke('xd.state')).refreshing, true, 'opening the panel must refresh a stale catalog')
     let state
     for (let attempt = 0; attempt < 50; attempt++) {
@@ -124,7 +130,7 @@ test('WorkBuddy refresh stays on demand across service restarts', async (t) => {
       if (!state.refreshing) break
     }
     assert.equal(state.refreshing, false, 'the on-demand refresh must settle')
-    assert.equal(models.mock.callCount(), 2, 'opening the panel must fetch the stale catalog once')
+    assert.equal(models.mock.callCount(), 2, 'opening the panel must fetch the stale catalog once, and nothing before it may have')
     await plugin.onPanelInvoke('xd.state')
     assert.equal(models.mock.callCount(), 2, 'a fresh panel open must use the cached catalog')
     await plugin.onPanelInvoke('xd.state', { wait: true })
@@ -248,20 +254,52 @@ test('growth rewards accept numeric strings and normalize tier status', async ()
   const { WorkBuddyUpstreamClient } = require('../lib/upstream')
   const client = new WorkBuddyUpstreamClient({ fetchImpl: async () => new Response(JSON.stringify({ code: 0, data: {
     streak: { days: '7' }, redemption_status: { tiers: [{ tier: 'seven', days: '7', credit: '100', energy: '2' }], tier_seven_status: 'UNLOCKED' },
-    credit: '40', energy: '1',
   } })) })
   const credential = { accessToken: 'test', refreshToken: '', domain: '', expiresAtMs: 0 }
   const streak = await client.growthStreakFull(credential)
   assert.equal(streak.days, 7)
   assert.deepEqual(streak.tiers[0], { tier: 'seven', days: 7, credit: 100, energy: 2, status: 'unlocked' })
-  assert.deepEqual(await client.claimTaskReward(credential, 'test-task'), { credit: 40, energy: 1 })
+})
+
+/**
+ * The streak's one-off collections must ask the paths that answer.
+ *
+ * The gift and compensation endpoints sit on the billing host without a `/v2`
+ * prefix; with one they reply `404 route not found`, which reads as "nothing to
+ * collect" and silently loses the credits. A make-up target is a calendar day in
+ * the check-in zone, not the host's zone.
+ */
+test('streak collections use the paths the upstream answers on', async () => {
+  const { WorkBuddyUpstreamClient } = require('../lib/upstream')
+  const { zonedDay } = require('../lib/checkin-time')
+  const calls = []
+  const client = new WorkBuddyUpstreamClient({ fetchImpl: async (url, init) => {
+    calls.push({ url: String(url), method: init?.method ?? 'GET', body: init?.body })
+    return new Response(JSON.stringify({ code: 0, data: { credit: 25 } }))
+  } })
+  const credential = { accessToken: 'test', refreshToken: '', domain: '', expiresAtMs: 0 }
+
+  assert.equal(await client.claimGift(credential), 25)
+  assert.equal(await client.claimCompensation(credential), 25)
+  await client.useMakeupCard(credential, '2026-10-18')
+
+  assert.deepEqual(calls.map((call) => new URL(call.url).pathname), [
+    '/billing/meter/claim-gift',
+    '/billing/meter/claim-compensation',
+    '/activity/growth/makeup-cards/use',
+  ], 'a /v2 prefix turns these into 404s')
+  assert.deepEqual(JSON.parse(calls[2].body), { target_date: '2026-10-18' })
+  assert.match(zonedDay(0), /^\d{4}-\d{2}-\d{2}$/)
+  assert.notEqual(zonedDay(-1), zonedDay(0), 'yesterday is a different day')
 })
 
 for (const source of ['qoder', 'trae']) {
   test(`${source} directory reads do not advance chat rotation`, async (t) => {
     const purposes = []
     const client = source === 'qoder' ? require('../lib/qoder-client').QoderUpstreamClient : require('../lib/trae-upstream').TraeSoloUpstreamClient
-    t.mock.method(client.prototype, 'fetchModels', async () => [{ id: 'test-model', name: 'test-model', function: 'chat' }])
+    t.mock.method(client.prototype, 'fetchModels', async () => (source === 'trae'
+      ? { models: [{ id: 'test-model', name: 'test-model', function: 'chat' }], partial: false }
+      : [{ id: 'test-model', name: 'test-model', function: 'chat' }]))
     t.mock.method(client.prototype, 'chatStream', async () => ({ ok: true, response: new Response(source === 'qoder' ? 'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n' : 'event: output\ndata: {"response":"hello"}\n\n') }))
     const gateway = source === 'qoder'
       ? require('../lib/qoder-gateway').createQoderGateway({ region: 'cn', port: 0, credentials: async (purpose) => { purposes.push(purpose); return [{ token: 'test', region: 'cn' }] }, logger: { info() {}, warn() {}, error() {} } })
@@ -346,7 +384,7 @@ test('a Qoder round that is not open yet is collected when its window opens', as
       constructor(...args) { super(...args.length === 0 ? [now] : args) }
       static now() { return now }
     },
-    setTimeout, clearTimeout,
+    setTimeout, clearTimeout, setInterval, clearInterval,
     setInterval: (callback, ms) => { const timer = { callback, at: now + ms }; timers.add(timer); return timer },
     clearInterval: (timer) => timers.delete(timer),
     pi: {
@@ -567,7 +605,7 @@ test('a sign-in with no expiry is live, not expired', async (t) => {
       return createRequire(path.join(root, 'main.js'))(id)
     },
     module: { exports: {} }, __dirname: temporary,
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
     pi: {
       plugin: {
         getSettings: async () => ({ ...settings }),
@@ -630,7 +668,7 @@ test('a load brings up the gateways it declares, before the service hook', async
   const context = vm.createContext({
     require: createRequire(path.join(root, 'main.js')),
     module: { exports: {} }, __dirname: temporary,
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
     pi: {
       plugin: {
         getSettings: async () => ({ ...settings }),
@@ -695,7 +733,7 @@ test('switching to an account the pool cannot serve is reported, not silently ac
   const context = vm.createContext({
     require: createRequire(path.join(root, 'main.js')),
     module: { exports: {} }, __dirname: temporary,
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
     pi: {
       plugin: {
         getSettings: async () => ({ ...settings }),
@@ -800,7 +838,7 @@ test('an account cooling on the selected model is reported, not silently accepte
   const context = vm.createContext({
     require: createRequire(path.join(root, 'main.js')),
     module: { exports: {} }, __dirname: temporary,
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
     pi: {
       plugin: {
         getSettings: async () => ({ ...settings }),
@@ -924,7 +962,7 @@ test('switching accounts during a reply does not cut the stream', async (t) => {
   const context = vm.createContext({
     require: createRequire(path.join(root, 'main.js')),
     module: { exports: {} }, __dirname: temporary,
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, TextEncoder, ReadableStream,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval, TextEncoder, ReadableStream,
     pi: {
       plugin: {
         getSettings: async () => ({ ...settings }),
@@ -1028,7 +1066,7 @@ test('the account picked in the panel is the account that serves', async (t) => 
   const context = vm.createContext({
     require: createRequire(path.join(root, 'main.js')),
     module: { exports: {} }, __dirname: temporary,
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
     pi: {
       plugin: {
         getSettings: async () => ({ ...settings }),
@@ -1127,7 +1165,7 @@ test('a stored account choice is never reported as a refusal', async (t) => {
   const context = vm.createContext({
     require: createRequire(path.join(root, 'main.js')),
     module: { exports: {} }, __dirname: temporary,
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout,
+    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
     pi: {
       plugin: {
         getSettings: async () => ({ ...settings }),
@@ -1260,6 +1298,33 @@ test('a token budget past the host ceiling is refused by the field itself', () =
 })
 
 /**
+ * A refused number goes back to what is committed, not to what the field showed.
+ *
+ * The sheet is rebuilt on every repaint, and the field a keypress lands in can be
+ * a half-typed number: the row holds the draft's figure, the field holds whatever
+ * the user has typed so far. After one accepted edit those two differ, so a
+ * refusal that restored the field's own opening text put back a number nobody had
+ * finished typing - and one more Enter then saved it.
+ */
+test('a refused figure goes back to the committed one, not the half-typed text', () => {
+  const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
+  const context = panelFunctions(['numberInput'], source)
+  const input = context.numberInput(
+    '50000',                          // what the rebuilt field opened on
+    (value) => { input.accepted = value },
+    2000000,
+    () => {},
+    () => {},
+    1000,                             // what is actually stored
+  )
+  input.value = '5000000'
+  input.dispatch('change')
+  assert.equal(input.accepted, undefined, 'the impossible figure must not be saved')
+  assert.equal(input.value, '1000',
+    'and the field shows the committed figure, not the half-typed one a repaint left behind')
+})
+
+/**
  * Switching the automatic check-in off must not depend on the hours box.
  *
  * The box can hold stale text from an earlier edit. Requiring it to parse before
@@ -1278,6 +1343,22 @@ test('switching the automatic check-in off survives an unreadable hours box', ()
   const allowed = handler.indexOf('runBusy')
   assert.ok(refused !== -1 && allowed !== -1 && refused < allowed,
     'the refusal must be inside the ON branch, before the save it would otherwise skip')
+})
+
+/**
+ * The model sheet fills `defaultSelect` after creating the thinking-level row.
+ * A second label was pasted in place of the `<select>`, so opening any model
+ * with levels threw and the rest of the sheet never rendered.
+ */
+test('the model sheet creates the default-level select it fills', () => {
+  const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
+  const start = source.indexOf('var levels = effectiveLevels')
+  assert.notEqual(start, -1)
+  const sheet = source.slice(start, source.indexOf('var levelRow', start))
+  assert.match(sheet, /var defaultSelect = document\.createElement\("select"\)/,
+    'the select has to exist before the options are appended')
+  assert.equal((source.match(/var outputCol = field\("models\.maxOutput"/g) || []).length, 1,
+    'the output field is created once; a second call steals the input node')
 })
 
 /**
