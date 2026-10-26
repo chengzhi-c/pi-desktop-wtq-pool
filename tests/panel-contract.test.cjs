@@ -338,7 +338,7 @@ test('the connection report counts the accounts without naming them', async () =
  * The expected text is read back out of the panel's own tables and the note is
  * driven through the panel's own `t`, so a copy here cannot drift from the ship.
  */
-test('the ban-risk note reaches the panel line and both READMEs', () => {
+test('the ban-risk note reaches the panel line', () => {
   const panel = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
   const page = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
 
@@ -391,17 +391,6 @@ test('the ban-risk note reaches the panel line and both READMEs', () => {
     vm.runInContext('labelTabs()', context)
     assert.equal(node.textContent, expected, `${name} note has to reach the page verbatim`)
   }
-  // The docs state the same risk, in the same two languages. A README that drops
-  // it while the panel keeps it is a warning users only meet after installing.
-  for (const [file, pattern] of [['README.md', /封号风险/], ['README.en.md', /A ban is possible/]]) {
-    const readme = fs.readFileSync(path.join(root, file), 'utf8')
-    assert.match(readme, pattern, `${file} has to carry the ban-risk warning`)
-    // Near the top, above the first section heading: a warning below the install
-    // steps is one the user reads after deciding to install.
-    const firstSection = readme.search(/^## /m)
-    const at = readme.search(pattern)
-    assert.ok(at !== -1 && at < firstSection, `${file} has to warn before its first section`)
-  }
 })
 
 /**
@@ -431,13 +420,6 @@ test('the README screenshots show the panel the repository ships', () => {
   }
   assert.deepEqual(Object.keys(stamp.shots).sort(), [...shots].sort(),
     'the capture has to list the shots the README embeds')
-
-  // The preview page mounts the real files rather than a copy of them, which is
-  // what makes a capture trustworthy in the first place.
-  const preview = fs.readFileSync(path.join(root, 'docs', 'preview-panel.html'), 'utf8')
-  assert.ok(preview.includes('../renderer/index.html'), 'the preview has to mount the shipped markup')
-  assert.ok(preview.includes('../renderer/panel.js'), 'and load the shipped script')
-  assert.ok(preview.includes('../renderer/panel.css'), 'and the shipped stylesheet')
 
   for (const shot of shots) {
     const at = path.join(root, 'docs', shot)

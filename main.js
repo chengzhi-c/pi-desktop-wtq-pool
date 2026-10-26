@@ -60,9 +60,6 @@ const { createSourcePool } = require("./lib/source-pool");
 
 /** The ids this plugin used before it was renamed, newest first; only the migration reads them. */
 const PREVIOUS_PLUGIN_IDS = ["io.github.chengzhi-c.pi-desktop-xdpool", "local.pi-desktop-xdpool", "local.pi-desktop-workbuddy", "local.pi-workbuddy-xdpool"];
-// Read from the package rather than written here, so the fallback below can
-// never drift a few versions behind the manifest it stands in for.
-
 /** The one background service the manifest declares. */
 const SERVICE_ID = "provider-host";
 
@@ -537,7 +534,7 @@ const travelAdoptTried = new Map();
 
 function log(level, message) {
   try {
-    console.log("[xdpool] " + level + ": " + message);
+    console.log("[wtq-pool] " + level + ": " + message);
   } catch {
     /* logging must never break a request */
   }
@@ -2475,7 +2472,14 @@ async function connect(runtime, force) {
   if (runtime.stopped) return false;
   runtime.lastError = "";
   runtime.lastWarning = "";
-  const account = core.pool.list(runtime.region)[0];
+  const regionAccounts = core.pool.list(runtime.region);
+  // The first account whose sign-in the upstream still accepts, not simply the
+  // first on file: a refused sign-in reads the roster with a token the gateway
+  // turns away, and the static fallback then stands in for a roster a healthy
+  // account on the same gateway would have read. With every account refused the
+  // first one still reads, so the failure names the sign-in rather than
+  // reporting the region as unsigned.
+  const account = regionAccounts.find((item) => core.pool.activeHold(item.id)?.reason !== "session") ?? regionAccounts[0];
   if (account === undefined) {
     runtime.signedIn = false;
     runtime.lastError = "no " + runtime.region + " WorkBuddy sign-in found";
@@ -2500,10 +2504,11 @@ async function connect(runtime, force) {
   // Cached opens reuse the roster; a manual refresh still bypasses its TTL.
   if (force === true || !catalogFresh(runtime)) {
     try {
-      const models = await core.client.fetchModels(
-        account.credential,
-        AbortSignal.timeout(MODELS_TIMEOUT_MS),
-      );
+      const models = await core.pool.readAfterRefresh(account.id, (credential) =>
+        core.client.fetchModels(
+          credential,
+          AbortSignal.timeout(MODELS_TIMEOUT_MS),
+        ));
       // Stopped while the fetch was in flight: the runtime is held by no map
       // any more, so nothing here may claim a roster for it.
       if (runtime.stopped) return false;
@@ -3122,12 +3127,13 @@ function resetDiscoveryCaches() {
 /**
  * Directories the WorkBuddy pool reads, in order.
  *
- * The desktop app's own directories come first, so its live sign-in wins over
- * anything the plugin wrote. The plugin's own directory is appended rather than
+ * The desktop app's own directories come first, and that is only the walk
+ * order: which copy of an account serves is decided by issue time, with the
+ * source breaking a tie. The plugin's own directory is appended rather than
  * substituted: an account added from the panel is read on exactly the same
  * terms as a desktop sign-in, and removing it is a file deletion the user can
- * see. A repointed `authFile` narrows the walk to that one directory, as
- * before — the user asked for a specific file.
+ * see. A repointed `authFile` narrows the walk to that one directory plus the
+ * plugin's own, the way the pool reads whatever it writes.
  */
 function poolAuthDirs(authFile) {
   if (authFile !== "") return [path.dirname(authFile)];
@@ -3246,6 +3252,15 @@ async function accountProbe(account, allowNetwork, checkinOnly = false) {
     return cached === undefined ? { pending: true } : cached.value;
   }
   if (cached !== undefined && Date.now() - cached.atMs < PROBE_TTL_MS) return cached.value;
+  // A sign-in the upstream refused is held, and the row carries the hold: no
+  // read is spent on it, so the panel stops paying two upstream calls every
+  // couple of minutes for an answer the account cannot give. The first refusal
+  // itself is what placed the hold, through `readAfterRefresh` below.
+  //
+  // The answer is deliberately not cached. A hold is released by a new sign-in
+  // or a refresh that works, and a cached empty row would keep showing a
+  // recovered account as blank for as long as the probe entry lives.
+  if (signInRefused(account)) return {};
   const value = {};
   // A cooling account may not spend a turn, but its check-in state is exactly
   // what the user opens the panel to see, and the daily reward is claimable
@@ -3253,7 +3268,8 @@ async function accountProbe(account, allowNetwork, checkinOnly = false) {
   // upstream call and the account cannot serve a request anyway.
   if (!checkinOnly) {
     try {
-      const credits = await core.client.fetchCredits(account.credential);
+      const credits = await core.pool.readAfterRefresh(account.id, (credential) =>
+        core.client.fetchCredits(credential));
       value.credits = {
         ...credits.total === undefined ? {} : { total: credits.total },
         packages: (credits.packages || []).map((pack) => ({
@@ -3277,7 +3293,8 @@ async function accountProbe(account, allowNetwork, checkinOnly = false) {
     }
   }
   try {
-    const checkin = await core.client.fetchCheckinStatus(account.credential);
+    const checkin = await core.pool.readAfterRefresh(account.id, (credential) =>
+      core.client.fetchCheckinStatus(credential));
     value.checkin = {
       active: checkin.active,
       todayCheckedIn: checkin.todayCheckedIn,
@@ -3321,6 +3338,33 @@ function catalogWarnings() {
     if (typeof message === "string" && message !== "") warnings[region] = message;
   }
   return Object.keys(warnings).length === 0 ? {} : { warnings };
+}
+
+/**
+ * Whether this account's sign-in is one the upstream has refused.
+ *
+ * The hold is the pool's own record that a refresh could not save the sign-in,
+ * so every pass that walks the pool asks before it spends a call: a held
+ * account cannot answer, and the panel row already says why.
+ */
+function signInRefused(account) {
+  return core.pool.activeHold(account.id)?.reason === "session";
+}
+
+/**
+ * The row fields that describe a hold the pool itself decided, if one is in
+ * force for this account right now.
+ *
+ * Empty spread when the account is simply cooling on an upstream window: that
+ * state already reads as one on the row, and its remedy is to wait. The reason
+ * travels with it because a refused sign-in, a spent balance and a vendor
+ * restriction need three different remedies, and the row prints the reason
+ * rather than "rate-limited" for all three.
+ */
+function activeHoldOf(accountId, now) {
+  const hold = core.pool.activeHold(accountId);
+  if (hold === null || hold.untilMs <= now) return {};
+  return { hold: hold.reason };
 }
 
 async function statusDocument(options) {
@@ -3388,6 +3432,12 @@ async function statusDocument(options) {
         ...cooling ? { cooldownUntil: new Date(account.cooldownUntilMs).toISOString() } : {},
         ...modelCooldowns.length === 0 ? {} : { modelCooldowns },
         rateLimitHits: account.rateLimitHits,
+        // The pool's own hold, when one is in force. A `session` hold is the one
+        // the user has to act on - the sign-in was refused and only a new one
+        // releases it - so the row says so instead of showing the raw upstream
+        // sentence on every poll. `spent` needs no field of its own: the row
+        // already reads as cooling, and a balance read releases it.
+        ...activeHoldOf(account.id, now),
         active: runtimeNextUpId.get(region) === account.id,
         preferred: preferredAccountIds[region] === account.id,
         disabled: core.pool.isDisabled(account.id),
@@ -4228,6 +4278,12 @@ async function onPanelInvoke(channel, payload) {
     case "xd.state": {
       if (payload?.wait === true) {
         const refreshed = await refreshAll("panel", true);
+        // A pass retired by a reload answers with `stale`: the click would
+        // otherwise clear the busy state and the banner while showing the
+        // document from before the reload.
+        if (refreshed.stale === true) {
+          return { ...await statusDocument({ allowNetwork: false }), refreshing: false, stale: true };
+        }
         return { ...refreshed, refreshing: false };
       }
       const document = await statusDocument({ allowNetwork: false });
@@ -4251,7 +4307,7 @@ async function onPanelInvoke(channel, payload) {
     case "xd.fetchModels": {
       await settleWithin(Promise.all(Array.from(runtimes.values()).map(async (runtime) => {
         try {
-          await connect(runtime, true);
+          await refreshRuntime(runtime, "fetch-models", true);
         } catch (error) {
           runtime.lastError = safeMessage(error);
         }
@@ -4321,11 +4377,23 @@ async function onPanelInvoke(channel, payload) {
       // other's record of what today collected. A growth run walks the same
       // accounts, so it counts as a pass too.
       if (checkinPassRunning || growthPassRunning) throw panelError("a check-in or growth pass is already running; wait for it to finish", "BUSY");
+      // Taking the flag, not only reading it. Reading it alone guarded a claim that
+      // arrives after a pass has started and left the other order open: a scheduled
+      // tick or "run now" landing between this claim's status read and its write
+      // walked the same account at the same time. Nothing is paid twice, because
+      // every claim re-reads today's state first, but the second round then reports
+      // a failure for an account that was already collected.
+      const token = ++checkinPassToken;
+      checkinPassRunning = true;
       // The two reads inside carry their own 30 s bound each, which is a whole
       // panel budget apiece; the step is capped as a whole instead and says so
       // when it runs out rather than leaving the button spinning.
-      const work = async () => {
-        const before = await core.client.fetchCheckinStatus(account.credential);
+       const work = async () => {
+         // Wrapped like the batch pass: a refused sign-in gets its one forced
+         // refresh here too, because the claim below is the mutation that would
+         // otherwise be lost for the day.
+         const before = await core.pool.readAfterRefresh(account.id, (credential) =>
+           core.client.fetchCheckinStatus(credential));
         if (before.todayCheckedIn) {
           probeCache.delete(accountId);
           return {
@@ -4339,7 +4407,10 @@ async function onPanelInvoke(channel, payload) {
         probeCache.delete(accountId);
         return { state: await statusDocument({ allowNetwork: true, budgetMs: DOCUMENT_BUDGET_MS }), result: claim };
       };
-      const answered = await settleWithin(work(), PANEL_STEP_BUDGET_MS);
+      const answered = await settleWithin(work(), PANEL_STEP_BUDGET_MS).finally(() => {
+        // The same ownership rule the passes use: a newer run keeps the guard.
+        if (token === checkinPassToken) checkinPassRunning = false;
+      });
       if (answered === undefined) throw panelError("the check-in did not finish in time; try again", "TIMEOUT");
       return answered;
     }
@@ -4550,6 +4621,12 @@ async function onPanelInvoke(channel, payload) {
      *  check-in pool in the panel, so one button must not sweep the others. */
     case "xd.checkinAll": {
       const source = typeof payload?.source === "string" ? payload.source : "";
+      // A name no worker answers would otherwise run a pass that collected
+      // nothing and then record it as the last run: the panel would show an
+      // all-zero log row for a button nobody pressed.
+      if (!["", "workbuddy", "trae", "qoder"].includes(source)) {
+        throw panelError("source must be workbuddy, trae or qoder", "INVALID");
+      }
       // One pass, one implementation: this channel only narrows it to one source
       // and reshapes the answer. A second copy of the fan-out here had already
       // drifted - it skipped the pause before the growth burst and never recorded
@@ -4585,12 +4662,17 @@ async function onPanelInvoke(channel, payload) {
       // an account that pass is about to reach, and both write today's record.
       // The growth run is a pass over the same accounts.
       if (checkinPassRunning || growthPassRunning) throw panelError("a check-in or growth pass is already running; wait for it to finish", "BUSY");
+      // Taken, not only read, for the reason the pool's single claim states.
+      const token = ++checkinPassToken;
+      checkinPassRunning = true;
       // Capped as a whole, like the pool's own check-in: the claim re-reads the
       // status first and each read carries a 30 s bound of its own.
       const answered = await settleWithin((async () => {
         const outcome = source === "trae" ? await traeClaimOne(label, region) : await qoderClaimOne(label, region);
         return { state: await statusDocument({ allowNetwork: true, budgetMs: DOCUMENT_BUDGET_MS }), result: outcome };
-      })(), PANEL_STEP_BUDGET_MS);
+      })(), PANEL_STEP_BUDGET_MS).finally(() => {
+        if (token === checkinPassToken) checkinPassRunning = false;
+      });
       if (answered === undefined) throw panelError("the check-in did not finish in time; try again", "TIMEOUT");
       return answered;
     }
@@ -4888,21 +4970,22 @@ async function onPanelInvoke(channel, payload) {
       const generation = loadGeneration;
       const finished = (async () => {
         try {
-          return await claimAllGrowth();
+          const counts = await claimAllGrowth();
+          // Recorded here, not by the caller: a pass that outran the panel's
+          // budget is still running, and its result has to appear in the next
+          // document instead of being dropped with the timed-out wait.
+          if (stillLoaded(generation)) {
+            growthLast = { at: new Date().toISOString(), ...counts };
+            scheduleRefresh("growth");
+          }
+          return counts;
         } finally {
           if (token === growthPassToken) growthPassRunning = false;
         }
       })();
       const counts = await settleWithin(finished, GROWTH_BUDGET_MS);
-      // A pass that outran the budget keeps going and records itself, exactly
-      // like the check-in pass: the card picks the result up from the next
-      // document instead of the panel waiting on it.
       if (counts === undefined) {
         return { state: await statusDocument({ allowNetwork: false }), running: true };
-      }
-      if (stillLoaded(generation)) {
-        growthLast = { at: new Date().toISOString(), ...counts };
-        scheduleRefresh("growth");
       }
       return { state: await statusDocument({ allowNetwork: false }), growth: counts };
     }
@@ -5268,6 +5351,9 @@ async function claimAllGrowth() {
     // upstream call each, because nothing will read the result.
     if (currentCheckinSignal().aborted) break;
     if (core.pool.isDisabled(account.id) || !regionEnabled("workbuddy", regionOf(account.credential.domain))) continue;
+    // A sign-in the upstream refused answers every step below with the same
+    // 401, and the hold that says so is only released by a new sign-in.
+    if (signInRefused(account)) continue;
     // Both regions: the growth centre exists on the international host too, and
     // its streak only advances on a reported activity, so leaving those accounts
     // out kept their tiers locked for good.
@@ -5328,7 +5414,8 @@ async function readGrowthState() {
   const rows = [];
   let failed = 0;
   const wanted = core.pool.list().filter((account) =>
-    !core.pool.isDisabled(account.id) && regionEnabled("workbuddy", regionOf(account.credential.domain)));
+    !core.pool.isDisabled(account.id) && regionEnabled("workbuddy", regionOf(account.credential.domain))
+    && !signInRefused(account));
   const reads = await Promise.all(wanted.map(async (account) => {
     try {
       const [streak, chances] = await Promise.all([
@@ -5396,11 +5483,19 @@ async function claimAllCheckins() {
   for (const account of core.pool.list()) {
     if (currentCheckinSignal().aborted) break;
     if (core.pool.isDisabled(account.id) || !regionEnabled("workbuddy", regionOf(account.credential.domain))) continue;
+    // The check-in is the pass that meets a refused sign-in first: the read
+    // below is wrapped, so the account is held here and the growth and travel
+    // passes that follow skip it without spending a call.
+    if (signInRefused(account)) continue;
     if (seen > 0) await checkinPause(CHECKIN_ACCOUNT_DELAY_MS);
     seen += 1;
     try {
-      const before = await core.client.fetchCheckinStatus(account.credential);
-      if (!before.active) continue;
+      const before = await core.pool.readAfterRefresh(account.id, (credential) =>
+        core.client.fetchCheckinStatus(credential));
+      if (!before.active) {
+        counts.skipped += 1;
+        continue;
+      }
       if (before.todayCheckedIn) {
         counts.skipped += 1;
         continue;
@@ -5540,6 +5635,9 @@ async function travelAllAccounts() {
     if (core.pool.isDisabled(account.id) || !regionEnabled("workbuddy", regionOf(account.credential.domain))) continue;
     if (regionOf(account.credential.domain) !== "cn") continue;
     if (!account.credential.refreshToken) continue;
+    // Every step of the travel chain reads and mutates on the same credential:
+    // a refused sign-in fails the first one and would fail the rest.
+    if (signInRefused(account)) continue;
     if (seen > 0) await checkinPause(TRAVEL_ACCOUNT_DELAY_MS);
     seen += 1;
     try {
@@ -5951,8 +6049,15 @@ async function keepAliveTokens() {
     if (serviceStopped) break;
     if (core.pool.isDisabled(account.id)) continue;
     if (!regionEnabled("workbuddy", regionOf(account.credential.domain))) continue;
+    // A sign-in the upstream refused cannot be refreshed: the hold says so, and
+    // spending the sweep's one call per account on it would report a failure for
+    // a condition the panel already explains.
+    if (signInRefused(account)) continue;
     const outcome = await core.pool.ensureFresh(account);
-    counts[outcome] = (counts[outcome] ?? 0) + 1;
+    // The panel has no separate bucket for a refusal: it is a failed refresh
+    // just like a timeout, and the sign-in hold explains the difference.
+    const bucket = outcome === "refused" ? "failed" : outcome;
+    counts[bucket] = (counts[bucket] ?? 0) + 1;
   }
   return counts;
 }

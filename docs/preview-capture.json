@@ -1,14 +1,14 @@
 {
   "rendered": {
-    "renderer/index.html": "7a169b36d2721bf8eb3ab847934d6346a49f8461dd66edcb588e897d3ea77010",
-    "renderer/panel.js": "5c81f51eebd46d1e9a9307b7eac28722c0506c359ef0a93ecc83a32c20ec92b1",
-    "renderer/panel.css": "7eed721593f2bfd2fb23089e20f740e76697f2e6d79b9b4acd9a0fdb89319f5e"
+    "renderer/index.html": "80f552f6f4495567e6ff88300a7bb65bf744d5a1e43ce2b3c42539d8e07dce92",
+    "renderer/panel.js": "74c6041034f9a3e2dc31beade6cf9508e87b980831b70d180f0cbc9330c49857",
+    "renderer/panel.css": "e1be2a93ed0e8571525b6433b6d18262198d23be2cdc7e05bb95b17a4e096b0e"
   },
   "shots": {
-    "preview-pool.png": "e3f44b4401b15ece356d6848edba62d1aba7d15adcf59535d304fe19742b180a",
-    "preview-dark.png": "954554ee75950c800155df9b7867c3e8987029258415937d0cd0322a8154c665",
-    "preview-models.png": "daa1088a1f83cc5a7348dbf307e85d92c337e2f9757a76f85663e226071f781d",
-    "preview-growth.png": "3b564ff61fbcd95b24d39778c2e8bd0f4eb5f546f1ae0c91be71caaf1d8f95b5",
-    "preview-page.png": "c612b851dce3fb258f870c45c52e8d44d50da54dd0abd4d964727c5451adcbc9"
+    "preview-pool.png": "97353ffc53a19e2fd4028ba4da4b6ef7d890cd6e46ff15625badae37e6ca4920",
+    "preview-dark.png": "cb11a6fa21929fb95cec21ecc0aed89fb310879cf58e4c8fb137ada7fb011974",
+    "preview-models.png": "fd0710358f976b3f1d89eee4a10273b330f5a02429de4933e7e2eec0d4e672c4",
+    "preview-growth.png": "88210d1b25062b97e04a072eece79dea2c4b522263356cd68c216e05e1eb5bb0",
+    "preview-page.png": "232fd4f0d904135b2a9bb06464f276ef042028f6703fcb5690c624accc6e6579"
   }
 }

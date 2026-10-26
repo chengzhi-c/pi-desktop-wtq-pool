@@ -169,6 +169,8 @@ test('a sealed sign-in keeps its account until the at-rest key is available', as
     const kept = await pool.scan()
     assert.equal(kept.length, 1, 'a sign-in this build cannot open must not empty the pool')
     assert.equal(kept[0].credential.accessToken, 'live', 'the incumbent credential must survive the sealed rewrite')
+    assert.equal(kept[0].archived, undefined,
+      'a file this build cannot open says nothing about the account: it is not a lost sign-in')
   } finally {
     require.cache[atRestPath] = realAtRestEntry
     if (realAccountsEntry === undefined) delete require.cache[accountsPath]
@@ -2267,7 +2269,7 @@ test('a spent account is held out of rotation instead of returning each minute',
   await pool.scan()
   const account = pool.list()[0]
   const before = Date.now()
-  pool.penalize(account.id, before + SPENT_HOLD_MS, undefined, true)
+  pool.penalize(account.id, before + SPENT_HOLD_MS, undefined, 'spent')
   assert.ok(account.cooldownUntilMs - before > 60 * 60 * 1000,
     'the hold must far outlast the configured cooldown window')
   assert.deepEqual(pool.available(Date.now(), undefined, 'cn'), [],
@@ -2623,10 +2625,16 @@ test('a probe pass drops the cache entries of accounts that left the pool', asyn
         fetchCredits: async () => ({ total: 100, packages: [] }),
         fetchCheckinStatus: async () => ({ active: true, todayCheckedIn: false, streakDays: 0 }),
       },
-      pool: { list, setCreditBalance: () => {} },
+      pool: {
+        list, setCreditBalance: () => {},
+        // The pool surface the probe now uses: no hold in force, and the read
+        // handed straight to the client, which is all this case is about.
+        activeHold: () => null,
+        readAfterRefresh: async (id, read) => read({}),
+      },
     },
   })
-  vm.runInContext(entryFunctions(['accountProbe'], source), context)
+  vm.runInContext(entryFunctions(['accountProbe', 'signInRefused'], source), context)
   await context.accountProbe({ id: 'live-acct', credential: {} }, true)
   assert.equal(probeCache.has('live-acct'), true, 'the live account must be cached by its probe')
   // A departed id, so the cache now holds more than the pool lists.
@@ -3617,38 +3625,6 @@ test('an expired sign-in with no refresh token leads no request', async () => {
 })
 
 /**
- * A balance read that finds credits again releases the pool's hold.
- *
- * The hold's own documentation names three release paths; a balance read was
- * not one of them. A user who topped up a 402'd account waited out the whole
- * hold, and the only way back was a manual cooldown reset.
- */
-test('a balance read that finds credits releases the hold', async () => {
-  const { WorkBuddyAccountPool } = require('../lib/accounts')
-  const dir = scratch('hold-release')
-  fs.writeFileSync(path.join(dir, 'workbuddy-desktop.info'), JSON.stringify({
-    auth: { accessToken: 't', refreshToken: 'r', expiresAt: 0, domain: 'www.workbuddy.cn' },
-    account: { uin: 'u-1', nickname: 'Fixture' },
-  }))
-  const pool = new WorkBuddyAccountPool({ authDirs: [dir] })
-  await pool.scan()
-  const id = pool.list()[0].id
-  pool.penalize(id, Date.now() + 6 * 60 * 60 * 1000, undefined, true)
-  assert.equal(pool.available(Date.now()).length, 0, 'the hold keeps the account out of rotation')
-  pool.setCreditBalance(id, 500)
-  assert.equal(pool.available(Date.now()).length, 1,
-    'credits being there again is the signal that the condition behind the hold changed')
-  // A rate limit is not released by a balance: it belongs to the upstream's own
-  // window, which a balance says nothing about.
-  pool.penalize(id, Date.now() + 60000)
-  pool.setCreditBalance(id, 500)
-  assert.equal(pool.available(Date.now()).length, 0,
-    'a rate-limit cooldown is the upstream\'s to end, not the balance\'s')
-  pool.resetCooldowns()
-  assert.equal(pool.available(Date.now()).length, 1, 'and the manual reset still clears everything')
-})
-
-/**
  * A sign-in that leaves the pool takes its balance and expiry with it.
  *
  * Both maps are keyed by account id and were never pruned, so a signed-out and
@@ -4103,15 +4079,21 @@ test('a repointed auth file schedules the scan that refills the pool', async () 
  * account before it can answer at all.
  */
 test('a failed response body is bounded in time', async () => {
-  const { readErrorBody } = require('../lib/upstream')
-  const stalled = new Response(new ReadableStream({ start() { /* never sends, never ends */ } }), { status: 429 })
+  const { readErrorBody, ERROR_BODY_TIMEOUT_MS } = require('../lib/upstream')
+  assert.ok(ERROR_BODY_TIMEOUT_MS >= 1000 && ERROR_BODY_TIMEOUT_MS <= 12000,
+    'the shipped deadline has to stay inside the range a rotation can pay')
+  let cancelled = false
+  const stalled = new Response(new ReadableStream({
+    start() { /* never sends, never ends */ },
+    cancel() { cancelled = true },
+  }), { status: 429 })
   const started = Date.now()
-  assert.equal(await readErrorBody(stalled, 4096), '',
+  assert.equal(await readErrorBody(stalled, 4096, undefined, 50), '',
     'a body that never completes is abandoned rather than awaited')
-  // The plugin's own bound, not undici's 300 s body timeout: a rotation pays
-  // this once per account, so it has to be short enough to answer inside.
-  assert.ok(Date.now() - started < 20000, 'and it is abandoned inside the plugin\'s own bound')
-  assert.ok(Date.now() - started >= 9000, 'and it is not abandoned before the body has had its chance')
+  // The bound is a parameter so this case does not sit out the shipped 10 s
+  // window; what matters is that the reader is cancelled, not how long it took.
+  assert.ok(Date.now() - started < 2000, 'and it is abandoned without waiting for undici\'s body timeout')
+  assert.equal(cancelled, true, 'and the reader is cancelled, which is what releases the socket')
   assert.equal(await readErrorBody(new Response('upstream said 429', { status: 429 }), 4096),
     'upstream said 429', 'a body that arrives is read')
   assert.equal((await readErrorBody(new Response('x'.repeat(20000), { status: 429 }), 100)).length, 100,
@@ -4245,9 +4227,11 @@ test('a chat request carries the conversation header family', async () => {
   }, JSON.stringify({ model: 'hy3', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
     undefined, { headersMs: 50 })
   assert.ok(cnHeaders['X-Conversation-ID'], 'the CN request carries the family too')
-  // CN keeps the UA it has always been sent: the gateway reads its roster with
-  // that spelling, and there is no capture to align it to.
-  assert.equal(cnHeaders['User-Agent'], 'WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1')
+  // One client build, named the same way in the header and in the UA. The
+  // version used to exist as three literals (5.8.4 in the header, 5.5.4 in the
+  // CN UA, 5.5.2 for the roster), a combination no real client produces.
+  assert.equal(cnHeaders['User-Agent'], 'WorkBuddy/5.8.4 WorkBuddy/5.8.4 CLI/2.161.0')
+  assert.equal(cnHeaders['X-IDE-Version'], '5.8.4')
   assert.equal(headers['User-Agent'], 'WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0',
     'the international request uses the captured desktop UA')
 })

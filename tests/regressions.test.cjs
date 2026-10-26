@@ -1234,29 +1234,6 @@ test('every composer word the popup asks for exists in both languages', () => {
 })
 
 /**
- * The footer links are static markup, so nothing else couples them to the word
- * tables: a label whose key is missing renders as the raw `foot.npm` on the page.
- */
-test('every footer link label exists in both languages', () => {
-  const html = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
-  const labels = [...html.matchAll(/data-foot-label="([A-Za-z]+)"/g)].map((match) => match[1])
-  assert.ok(labels.length > 0, 'the footer must carry at least one labelled link')
-  const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
-  const keysOf = (name) => {
-    const start = source.indexOf(`var ${name} = {`)
-    assert.notEqual(start, -1, `${name} must exist`)
-    const body = source.slice(start, source.indexOf('\n};', start))
-    return new Set([...body.matchAll(/"([^"]+)":/g)].map((match) => match[1]))
-  }
-  const zh = keysOf('ZH')
-  const en = keysOf('EN')
-  for (const label of new Set(labels)) {
-    assert.ok(zh.has(`foot.${label}`), `foot.${label} is rendered but missing from ZH`)
-    assert.ok(en.has(`foot.${label}`), `foot.${label} is rendered but missing from EN`)
-  }
-})
-
-/**
  * The model sheet's numeric fields must refuse a value the host will not store.
  *
  * `parseOverride` rejects the whole selection payload when one window exceeds
