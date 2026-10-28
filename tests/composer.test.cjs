@@ -50,9 +50,9 @@ function loadComposer(providers) {
   })
   const context = vm.createContext({
     manifestProviders: () => providers,
-    PROVIDER_ID_BY_REGION: { cn: 'xdpool-cn', global: 'xdpool-global' },
-    TRAE_PROVIDER_ID_BY_REGION: { cn: 'xdpool-trae-cn', ai: 'xdpool-trae-ai' },
-    QODER_PROVIDER_ID_BY_REGION: { cn: 'xdpool-qoder-cn', global: 'xdpool-qoder-global' },
+    PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn', global: 'wtqpool-global' },
+    TRAE_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-trae-cn', ai: 'wtqpool-trae-ai' },
+    QODER_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-qoder-cn', global: 'wtqpool-qoder-global' },
     REGIONS: ['cn', 'global'], TRAE_REGIONS: ['cn', 'ai'], QODER_REGIONS: ['cn', 'global'],
     settings: { showComposerPoints: true },
     workbuddyComposerAccounts: () => [],
@@ -90,10 +90,10 @@ function loadMatcher(providers) {
  */
 test('a label two pools both publish resolves to neither of them', () => {
   const shared = {
-    id: 'xdpool-cn', models: [{ id: 'step-5-preview', name: 'Step-5-Preview \u00b7 x0.00' }],
+    id: 'wtqpool-cn', models: [{ id: 'step-5-preview', name: 'Step-5-Preview \u00b7 x0.00' }],
   }
   const same = {
-    id: 'xdpool-global', models: [{ id: 'step-5-preview', name: 'Step-5-Preview \u00b7 x0.00' }],
+    id: 'wtqpool-global', models: [{ id: 'step-5-preview', name: 'Step-5-Preview \u00b7 x0.00' }],
   }
   const context = loadComposer([shared, same])
   assert.equal(context.matchComposerModel('Step-5-Preview \u00b7 x0.00'), undefined,
@@ -279,8 +279,8 @@ test('a chip showing the model id still answers, unless two pools share that id'
     // shared. A unique one is the real world's common case and is covered directly
     // against the matcher, where a declaration can be built by hand.
     const resolver = loadMatcher([
-      { id: 'xdpool-cn', models: [{ id: 'cn-only-model', name: 'CN only' }, { id: 'both-model', name: 'Both' }] },
-      { id: 'xdpool-global', models: [{ id: 'global-only-model', name: 'Global only' }, { id: 'both-model', name: 'Both' }] },
+      { id: 'wtqpool-cn', models: [{ id: 'cn-only-model', name: 'CN only' }, { id: 'both-model', name: 'Both' }] },
+      { id: 'wtqpool-global', models: [{ id: 'global-only-model', name: 'Global only' }, { id: 'both-model', name: 'Both' }] },
     ])
     assert.equal(resolver.match('cn-only-model')?.region, 'cn',
       'the host prints the id until it has imported the alias, so a unique id has to answer')

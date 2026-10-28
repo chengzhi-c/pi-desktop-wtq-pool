@@ -347,16 +347,20 @@ test('a Qoder round that is not open yet is collected when its window opens', as
     autoCheckin: { enabled: true, hours: [9] },
   }
   const lines = []
+  let opened = false
   // The modules underneath `main.js` run in the real realm, so the fake clock
   // only governs the host: the opening time handed to Qoder has to be a real
-  // timestamp for the client's own window check to read it as "not yet".
+  // timestamp for the client's own window check to read it as "not yet". The
+  // deferred call flips it to an open round so the claim path is exercised too.
   const qoder = require('../lib/qoder-credentials')
   const client = require('../lib/qoder-client')
   class FakeQoderClient extends client.QoderUpstreamClient {
     async fetchCampaigns() {
       // A round that exists but has not opened: exactly what an 09:00 pass sees.
-      return { campaigns: [{ actionType: 'CLAIM_BENEFIT', campaignId: 'today', startAt: opensAt }] }
+      return { campaigns: [{ actionType: 'CLAIM_BENEFIT', campaignId: 'today',
+        startAt: opened ? Date.now() - 1000 : opensAt }] }
     }
+    async claimCampaign() { return { success: true, grantId: 'claim-1' } }
     async fetchUsage() { return { userQuota: { remaining: 5, total: 10 }, dedicatedPackages: [] } }
     async fetchModels() { return [{ id: 'qoder-model' }] }
   }
@@ -407,14 +411,22 @@ test('a Qoder round that is not open yet is collected when its window opens', as
       lines.filter((line) => line.includes('deferred Qoder check-in')), [],
       'a round that has not opened must not be reported as a deferred collection yet',
     )
+    // A source-only click must not cancel the deferral the full pass just set.
+    // The old unconditional write replaced it with the placeholder's zero.
+    await plugin.onPanelInvoke('xd.checkinAll', { source: 'trae' })
+    const slots = JSON.parse(fs.readFileSync(path.join(temporary, 'data', 'checkin-slots.json'), 'utf8'))
+    assert.equal(slots._qoderRetryAt, opensAt,
+      'the deferred Qoder time must survive another source and be written for a reload')
     // Now the window opens: the tick that was already scheduled must collect Qoder.
+    opened = true
     now = opensAt + 1000
     for (const timer of timers) if (timer.at <= now) timer.callback()
     await new Promise((resolve) => setTimeout(resolve, 200))
-    assert.equal(
-      lines.filter((line) => line.includes('deferred Qoder check-in')).length, 1,
-      'the tick must come back for Qoder at the opening time it was told about',
-    )
+    const deferred = lines.filter((line) => line.includes('deferred Qoder check-in'))
+    assert.equal(deferred.length, 1,
+      'the tick must come back for Qoder at the opening time it was told about')
+    assert.match(deferred[0], /"claimed":1/,
+      'the deferred round must actually claim, not merely report another wait')
   } finally {
     await plugin.onUnload()
     if (service) await service.stop()

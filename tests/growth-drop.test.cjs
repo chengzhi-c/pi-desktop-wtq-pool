@@ -110,7 +110,9 @@ test('the host settings card, a rescan and a new login all drop the read', () =>
   }
   // Each window stops before the next call site, so deleting the call this case
   // is about cannot be covered by a neighbouring one.
-  assert.match(bodyOf('async function onHostSettingsChanged(next)', 2600), /if \(toggled\)[\s\S]{0,120}?dropGrowthRead\(\)/,
+  assert.match(bodyOf('async function onHostSettingsChanged(next)', 2000), /await applySettingsEverywhere\(toggled\)/,
+    'a host settings change must reach the shared reconciliation')
+  assert.match(bodyOf('async function applySettingsEverywhere(toggled)', 2600), /if \(toggled\)[\s\S]{0,120}?dropGrowthRead\(\)/,
     'a source or region switched in the host settings must drop the read')
   assert.match(bodyOf('case "xd.rescan": {', 1400), /dropGrowthRead\(\)/,
     'a rescan can add or retire accounts, so it must drop the read')

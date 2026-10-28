@@ -288,6 +288,86 @@ test('a status the upstream chose is not reclassified by the body it quotes', ()
 })
 
 /**
+ * A check-in read for a cooling account must not erase the balance a full read
+ * already cached.
+ */
+test('a check-in-only probe keeps the cached balance and cannot satisfy a full read', async () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const start = source.indexOf('async function accountProbe(')
+  assert.ok(start > 0, 'accountProbe is where it is expected')
+  const mod = { exports: {} }
+  const account = { id: 'a' }
+  const probeCache = new Map()
+  let creditReads = 0
+  const core = {
+    pool: {
+      list: () => [account],
+      readAfterRefresh: async (_id, read) => read({}),
+      setCreditBalance: () => {},
+    },
+    client: {
+      fetchCredits: async () => {
+        creditReads += 1
+        return { total: 7, packages: [] }
+      },
+      fetchCheckinStatus: async () => ({ active: true, todayCheckedIn: false }),
+    },
+  }
+  new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'signInRefused', 'safeMessage',
+    entryFunctions(['accountProbe'], source) + '\nmodule.exports = { accountProbe }',
+  )(mod, mod.exports, core, probeCache, 60000, () => false, (error) => String(error?.message ?? error))
+
+  const full = await mod.exports.accountProbe(account, true, false)
+  assert.equal(full.credits.total, 7, 'the full read stores the balance')
+  assert.equal(creditReads, 1)
+
+  probeCache.get(account.id).atMs = 0
+  const only = await mod.exports.accountProbe(account, true, true)
+  assert.equal(only.credits.total, 7, 'the check-in-only pass must keep the previous balance')
+  assert.equal(only.checkin.active, true, 'and must still refresh the check-in state')
+  assert.equal(creditReads, 1, 'it must not spend a balance read')
+
+  probeCache.set(account.id, { atMs: Date.now(), value: { checkin: { active: true } } })
+  creditReads = 0
+  const again = await mod.exports.accountProbe(account, true, false)
+  assert.equal(again.credits.total, 7, 'a full read refills a balance the cache never had')
+  assert.equal(creditReads, 1, 'and does not serve the check-in-only entry as a balance')
+})
+
+/**
+ * A JSON endpoint can answer a refused sign-in as HTTP 200 with a business
+ * code, and some spell that code as a string. Reading the status as success
+ * served the dead sign-in again on every request; reading only the numeric
+ * code left the string form unclassified.
+ */
+test('a JSON endpoint business code is classified on HTTP 200', async () => {
+  const upstream = require('../lib/upstream')
+  const credential = {
+    accessToken: 't', refreshToken: 'r', expiresAtMs: 0, uid: 'u',
+    domain: 'www.workbuddy.cn', sourcePath: '',
+  }
+  const answer = (body) => new upstream.WorkBuddyUpstreamClient({
+    fetchImpl: async () => new Response(JSON.stringify(body), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    }),
+  })
+  await assert.rejects(
+    () => answer({ code: '12153', msg: 'Offline user session not found' }).fetchCheckinStatus(credential),
+    (error) => upstream.upstreamErrorKind(error) === 'session_dead',
+    'a string session code must hold the sign-in instead of reading as success',
+  )
+  await assert.rejects(
+    () => answer({ code: 6004, msg: '频率限制' }).fetchCredits(credential),
+    (error) => upstream.upstreamErrorKind(error) === 'soft_rate',
+    'a rate limit in a 200 envelope must stay a rate limit',
+  )
+  assert.equal(upstream.classifyUpstreamError(200, '{"code":"11140"}'), 'account_restricted')
+  assert.equal(upstream.classifyUpstreamError(200, '{"code":"11158"}'), 'model_tier')
+  assert.equal(upstream.classifyUpstreamError(200, '{"code":6004,"msg":"quota exceeded"}'), 'soft_rate',
+    'the rate-limit business code outranks quota prose')
+})
+
+/**
  * An oversized body is refused without cutting the socket that carries the 413.
  *
  * The refusal used to destroy the request as soon as the limit passed, and with
@@ -586,6 +666,7 @@ test('the collected check-in slots persist and are pruned to the retention windo
     entryDeclaration(/^const CHECKIN_SLOTS_FILE = "[^"]+";$/m, source),
     entryDeclaration(/^const CHECKIN_SLOTS_KEEP_DAYS = \d+;$/m, source),
     entryDeclaration(/^const autoCheckinSlots = new Set\(\);$/m, source),
+    entryDeclaration(/^let qoderRetryAt = 0;$/m, source),
     entryDeclaration(/^let dataPath = "";$/m, source),
     entryFunctions(['recentCheckinDays', 'loadCheckinSlots', 'saveCheckinSlots'], source),
   ].join('\n'), context)
@@ -604,6 +685,18 @@ test('the collected check-in slots persist and are pruned to the retention windo
     assert.deepEqual(Object.keys(stored), [today.day],
       'only the days inside the retention window may be written')
     assert.deepEqual(stored[today.day], [todaySlot], 'the slot the pass recorded must be the one stored')
+
+    // A deferred Qoder round is bookkeeping beside the slots, and a reload has
+    // to find it again; without this the day's Qoder credits were lost across a
+    // restart between the morning pass and the 10:00 opening.
+    const retryAt = read('Date.now() + 60000')
+    read(`qoderRetryAt = ${retryAt}`)
+    read('saveCheckinSlots()')
+    const withRetry = JSON.parse(fs.readFileSync(path.join(dataPath, slotsFile), 'utf8'))
+    assert.equal(withRetry._qoderRetryAt, retryAt, 'the deferred time must be written beside the slots')
+    read('qoderRetryAt = 0')
+    read('loadCheckinSlots()')
+    assert.equal(read('qoderRetryAt'), retryAt, 'and restored on the next load')
 
     // The read side takes the same view: a day outside the window on disk is not
     // read back as a day already spent, or a restart would skip today's pass.
@@ -761,8 +854,8 @@ test('the channel refusal names its cause and the way forward', () => {
   const body = '{"code":11128,"msg":"Illegal API invocation from an unapproved channel","displayTips":{"zh":"这次调用没通过渠道校验"}}'
   const sentence = unapprovedChannelRefusal(body)
   assert.ok(typeof sentence === 'string', 'the refusal has to be recognised')
-  assert.match(sentence, /DeepSeek Harness/, 'it names the identity the vendor rejected')
-  assert.match(sentence, /international|Trae|Qoder/, 'and the sources that do serve it')
+  assert.match(sentence, /11128/, 'it names the check that refused')
+  assert.match(sentence, /Trae|Qoder|international/, 'and the sources that do serve it')
   assert.doesNotMatch(sentence, /unapproved channel|displayTips/, 'the vendor block of tips is not what the user reads')
   // A 400 that is not this one keeps the ordinary sentence, or the mapping would
   // swallow every real client error.
@@ -999,10 +1092,10 @@ test('a composer answer carries at most eight packages', async () => {
     activeQoderRegions: () => [], qoderDeclarationModels: () => [],
     // The chip text is resolved against the published declaration, and this
     // fixture stands in for one WorkBuddy region.
-    manifestProviders: () => [{ id: 'xdpool-cn', models: [{ id: 'fixture', name: 'Fixture Model' }] }],
-    PROVIDER_ID_BY_REGION: { cn: 'xdpool-cn', global: 'xdpool-global' },
-    TRAE_PROVIDER_ID_BY_REGION: { cn: 'xdpool-trae-cn', ai: 'xdpool-trae-ai' },
-    QODER_PROVIDER_ID_BY_REGION: { cn: 'xdpool-qoder-cn', global: 'xdpool-qoder-global' },
+    manifestProviders: () => [{ id: 'wtqpool-cn', models: [{ id: 'fixture', name: 'Fixture Model' }] }],
+    PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn', global: 'wtqpool-global' },
+    TRAE_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-trae-cn', ai: 'wtqpool-trae-ai' },
+    QODER_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-qoder-cn', global: 'wtqpool-qoder-global' },
     REGIONS: ['cn', 'global'],
     TRAE_REGIONS: ['cn', 'ai'],
     QODER_REGIONS: ['cn', 'global'],
@@ -1015,7 +1108,7 @@ test('a composer answer carries at most eight packages', async () => {
       'routeOfProviderId', 'modelTag', 'onRendererCall'], source),
   ].join('\n'), context)
   const answer = await context.onRendererCall('xd.composerPoints',
-    { chip: 'Fixture Model', provider: 'xdpool-cn', model: 'fixture' })
+    { chip: 'Fixture Model', provider: 'wtqpool-cn', model: 'fixture' })
   assert.equal(answer.show, true, 'the probe cache must be seen to answer, or the cap is untested')
   assert.equal(answer.accounts.length, 1)
   assert.equal(answer.accounts[0].packages.length, 8,
@@ -2069,6 +2162,8 @@ test('a reload retires the runtimes bound to the core it replaced', async () => 
     loadGeneration: 1,
     refreshTimer: null,
     runtimes: new Map([['cn', { region: 'cn' }], ['global', { region: 'global' }]]),
+    runtimeStarts: new Map(),
+    sourceGatewayStarts: new Map(),
     traeGateways: new Map([['cn', { source: 'trae', region: 'cn' }]]),
     qoderGateways: new Map(),
     pendingRuntimeStops: [],
@@ -2540,6 +2635,16 @@ test('round-robin rotates only among the sign-ins that can still answer', () => 
   const single = orderingPool({ sourceDistribution: () => 'round-robin' })
   assert.deepEqual(single.orderSourceCredentials('trae', 'cn', [dead, a], sourceLabel, true).map(sourceLabel), ['a', 'dead'],
     'a single live account leads and rotation is a no-op')
+  // The composer chip names the account the next chat will use, so it has to see
+  // the current cursor step - but reading it must not consume that step.
+  const preview = orderingPool({ sourceDistribution: () => 'round-robin' })
+  assert.equal(preview.orderSourceCredentials('trae', 'cn', [a, b], sourceLabel, 'peek')[0].label, 'a')
+  assert.equal(preview.orderSourceCredentials('trae', 'cn', [a, b], sourceLabel, 'peek')[0].label, 'a',
+    'a preview never advances the cursor')
+  assert.equal(preview.orderSourceCredentials('trae', 'cn', [a, b], sourceLabel, true)[0].label, 'a',
+    'and the next chat still starts where the cursor was')
+  assert.equal(preview.orderSourceCredentials('trae', 'cn', [a, b], sourceLabel, 'peek')[0].label, 'b',
+    'after the chat, the preview names the account the following one would use')
 })
 
 /**
@@ -2667,7 +2772,7 @@ test('a declaration that already says the same thing is not rewritten', () => {
       providers: [{
         models: [{ name: 'Fixture', id: 'fixture-model', alias: 'Fixture' }],
         baseUrl: 'http://127.0.0.1:41831/v1',
-        id: 'xdpool-cn',
+        id: 'wtqpool-cn',
       }],
     },
   }
@@ -2686,7 +2791,7 @@ test('a declaration that already says the same thing is not rewritten', () => {
   vm.runInContext(entryFunctions([
     'canonicalJson', 'writeDeclaration', 'disambiguateModelLabels', 'stripModelTag', 'modelTag', 'routeOfProviderId',
   ], source), context)
-  const descriptors = [{ id: 'xdpool-cn', baseUrl: 'http://127.0.0.1:41831/v1', models: [{ id: 'fixture-model', name: 'Fixture' }] }]
+  const descriptors = [{ id: 'wtqpool-cn', baseUrl: 'http://127.0.0.1:41831/v1', models: [{ id: 'fixture-model', name: 'Fixture' }] }]
   const result = context.writeDeclaration(descriptors)
   assert.deepEqual(JSON.parse(JSON.stringify(result)), { ok: true, changed: false, providerCount: 1 },
     'a manifest that already carries the same provider must read as unchanged')
@@ -2694,7 +2799,7 @@ test('a declaration that already says the same thing is not rewritten', () => {
     'and it must not be rewritten, or the footer claims an update that did not happen')
   // The control: a genuinely different declaration still writes, or the case
   // above would pass for a writer that never writes at all.
-  const changed = context.writeDeclaration([{ id: 'xdpool-cn', baseUrl: 'http://127.0.0.1:41831/v1', models: [{ id: 'other-model', name: 'Other' }] }])
+  const changed = context.writeDeclaration([{ id: 'wtqpool-cn', baseUrl: 'http://127.0.0.1:41831/v1', models: [{ id: 'other-model', name: 'Other' }] }])
   assert.equal(changed.changed, true, 'a different model list is a real change and must be written')
   assert.equal(before.equals(fs.readFileSync(manifestPath)), false, 'and the file on disk must reflect it')
   fs.rmSync(temporary, { recursive: true, force: true })
@@ -2714,9 +2819,9 @@ test('a declaration that already says the same thing is not rewritten', () => {
 test('a declaration written over its own output is unchanged', () => {
   const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
   const context = vm.createContext({
-    PROVIDER_ID_BY_REGION: { cn: 'xdpool-cn', global: 'xdpool-global' },
-    TRAE_PROVIDER_ID_BY_REGION: { cn: 'xdpool-trae-cn', ai: 'xdpool-trae-ai' },
-    QODER_PROVIDER_ID_BY_REGION: { cn: 'xdpool-qoder-cn', global: 'xdpool-qoder-global' },
+    PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn', global: 'wtqpool-global' },
+    TRAE_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-trae-cn', ai: 'wtqpool-trae-ai' },
+    QODER_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-qoder-cn', global: 'wtqpool-qoder-global' },
     REGIONS: ['cn', 'global'], TRAE_REGIONS: ['cn', 'ai'], QODER_REGIONS: ['cn', 'global'],
   })
   vm.runInContext(entryFunctions([
@@ -2724,8 +2829,8 @@ test('a declaration written over its own output is unchanged', () => {
   ], source), context)
   const roster = (name) => [{ id: 'm', name }]
   const first = context.disambiguateModelLabels([
-    { id: 'xdpool-cn', models: roster('Shared \u00b7 x0.29') },
-    { id: 'xdpool-global', models: roster('Shared \u00b7 x0.29') },
+    { id: 'wtqpool-cn', models: roster('Shared \u00b7 x0.29') },
+    { id: 'wtqpool-global', models: roster('Shared \u00b7 x0.29') },
   ])
   assert.deepEqual(JSON.parse(JSON.stringify(first.map((provider) => provider.models[0].name))),
     ['Shared \u00b7 x0.29 (CN)', 'Shared \u00b7 x0.29 (Global)'],
@@ -2734,15 +2839,15 @@ test('a declaration written over its own output is unchanged', () => {
   // The next pass is handed one read roster and one retained row, which is what
   // `syncDeclaration` builds while a sibling gateway is still warming.
   const second = context.disambiguateModelLabels([
-    { id: 'xdpool-cn', models: roster('Shared \u00b7 x0.29') },
-    { id: 'xdpool-global', models: roster('Shared \u00b7 x0.29 (Global)') },
+    { id: 'wtqpool-cn', models: roster('Shared \u00b7 x0.29') },
+    { id: 'wtqpool-global', models: roster('Shared \u00b7 x0.29 (Global)') },
   ])
   assert.deepEqual(JSON.parse(JSON.stringify(second.map((provider) => provider.models[0].name))),
     ['Shared \u00b7 x0.29 (CN)', 'Shared \u00b7 x0.29 (Global)'],
     'the retained row keeps its tag and the fresh one regains it, so the output equals the first pass')
 
   // A name that merely ends in parentheses is not a tag and has to survive.
-  const plain = context.disambiguateModelLabels([{ id: 'xdpool-cn', models: roster('Model (beta)') }])
+  const plain = context.disambiguateModelLabels([{ id: 'wtqpool-cn', models: roster('Model (beta)') }])
   assert.equal(plain[0].models[0].name, 'Model (beta)', 'a name that ends in parentheses keeps it')
 })
 
@@ -2760,7 +2865,7 @@ test('the manifest is read once and reused across lookups', () => {
   const context = vm.createContext({
     path,
     packageRoot: '/fixture/package',
-    fs: { readFileSync: () => { reads += 1; return JSON.stringify({ contributes: { providers: [{ id: 'xdpool-cn' }] } }) } },
+    fs: { readFileSync: () => { reads += 1; return JSON.stringify({ contributes: { providers: [{ id: 'wtqpool-cn' }] } }) } },
   })
   vm.runInContext([
     entryDeclaration(/^let manifestCache;$/m, source),
@@ -2769,7 +2874,7 @@ test('the manifest is read once and reused across lookups', () => {
   const first = context.manifestProviders()
   const second = context.manifestProviders()
   assert.equal(reads, 1, 'the manifest must be read off the disk once, not once per lookup')
-  assert.deepEqual(JSON.parse(JSON.stringify(second)), [{ id: 'xdpool-cn' }],
+  assert.deepEqual(JSON.parse(JSON.stringify(second)), [{ id: 'wtqpool-cn' }],
     'and every lookup must be answered from the same parsed copy')
 })
 
@@ -2794,9 +2899,9 @@ test('composer points tell the readout to stop when the feature is off', () => {
     // The label a chip carries is resolved against what the host was given, and
     // nothing has been published here.
     manifestProviders: () => [],
-    PROVIDER_ID_BY_REGION: { cn: 'xdpool-cn', global: 'xdpool-global' },
-    TRAE_PROVIDER_ID_BY_REGION: { cn: 'xdpool-trae-cn', ai: 'xdpool-trae-ai' },
-    QODER_PROVIDER_ID_BY_REGION: { cn: 'xdpool-qoder-cn', global: 'xdpool-qoder-global' },
+    PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn', global: 'wtqpool-global' },
+    TRAE_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-trae-cn', ai: 'wtqpool-trae-ai' },
+    QODER_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-qoder-cn', global: 'wtqpool-qoder-global' },
     REGIONS: ['cn', 'global'],
     TRAE_REGIONS: ['cn', 'ai'],
     QODER_REGIONS: ['cn', 'global'],
@@ -4152,6 +4257,100 @@ test('the panel keeps polling while every account is cooling', () => {
 })
 
 /**
+ * A probe that started before a claim must not restore the pre-claim answer.
+ *
+ * The claim handlers delete the cache entry and read again. Without a check at
+ * write time the older probe can finish afterwards and put "not checked in"
+ * back for a whole TTL, bringing the claim button back just after a success.
+ */
+test('a probe invalidated by a claim does not write its pre-claim answer back', async () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const start = source.indexOf('async function accountProbe(')
+  assert.ok(start > 0, 'accountProbe is where it is expected')
+  const mod = { exports: {} }
+  const account = { id: 'a' }
+  const probeCache = new Map()
+  let releaseCheckin
+  let checkinStarted
+  const started = new Promise((resolve) => { checkinStarted = resolve })
+  const core = {
+    pool: {
+      list: () => [account],
+      readAfterRefresh: async (_id, read) => read({}),
+      setCreditBalance: () => {},
+    },
+    client: {
+      fetchCredits: async () => ({ total: 7, packages: [] }),
+      fetchCheckinStatus: async () => {
+        checkinStarted()
+        return new Promise((resolve) => { releaseCheckin = resolve })
+      },
+    },
+  }
+  new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'signInRefused', 'safeMessage',
+    entryFunctions(['accountProbe'], source) + '\nmodule.exports = { accountProbe }',
+  )(mod, mod.exports, core, probeCache, 60000, () => false, (error) => String(error?.message ?? error))
+
+  const old = mod.exports.accountProbe(account, true, false)
+  await started
+  // The claim invalidates the entry and writes the post-claim state.
+  probeCache.delete(account.id)
+  const postClaim = { atMs: Date.now(), value: { checkin: { active: true, todayCheckedIn: true } } }
+  probeCache.set(account.id, postClaim)
+  releaseCheckin({ active: true, todayCheckedIn: false })
+
+  const result = await old
+  assert.equal(result.checkin.todayCheckedIn, true, 'the older probe must return the newer claim state')
+  assert.equal(probeCache.get(account.id).value.checkin.todayCheckedIn, true,
+    'and must not overwrite the fresh entry')
+  assert.equal(probeCache.get(account.id), postClaim)
+
+  // A check-in-only entry must not satisfy a full read even when it kept the
+  // previous balance; only a full read can refresh credits.
+  let creditReads = 0
+  core.client.fetchCredits = async () => {
+    creditReads += 1
+    return { total: 9, packages: [] }
+  }
+  core.client.fetchCheckinStatus = async () => ({ active: true, todayCheckedIn: true })
+  probeCache.set(account.id, {
+    atMs: Date.now(),
+    checkinOnly: true,
+    value: { checkin: { active: true, todayCheckedIn: true }, credits: { total: 1, packages: [] } },
+  })
+  const refreshed = await mod.exports.accountProbe(account, true, false)
+  assert.equal(creditReads, 1, 'a full read must refresh credits from a check-in-only entry')
+  assert.equal(refreshed.credits.total, 9)
+  assert.equal(probeCache.get(account.id).checkinOnly, false)
+
+  // A check-in-only failure that lands while a full read is fetching credits
+  // must not outlive the full read's successful check-in.
+  probeCache.clear()
+  let releaseCredits
+  let creditsStarted
+  const creditsGate = new Promise((resolve) => { releaseCredits = resolve })
+  const creditsBegan = new Promise((resolve) => { creditsStarted = resolve })
+  core.client.fetchCredits = async () => {
+    creditsStarted()
+    await creditsGate
+    return { total: 11, packages: [] }
+  }
+  core.client.fetchCheckinStatus = async () => ({ active: true, todayCheckedIn: true })
+  const full = mod.exports.accountProbe(account, true, false)
+  await creditsBegan
+  probeCache.set(account.id, {
+    atMs: Date.now(),
+    checkinOnly: true,
+    value: { checkinError: 'old check-in failure' },
+  })
+  releaseCredits()
+  const merged = await full
+  assert.equal(merged.checkin.todayCheckedIn, true, 'the full read check-in is the newer answer')
+  assert.equal(merged.checkinError, undefined)
+  assert.equal(probeCache.get(account.id).checkinOnly, false)
+})
+
+/**
  * A chat request carries the conversation header family.
  *
  * The international gateway runs a channel check that refuses a request
@@ -4227,11 +4426,9 @@ test('a chat request carries the conversation header family', async () => {
   }, JSON.stringify({ model: 'hy3', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
     undefined, { headersMs: 50 })
   assert.ok(cnHeaders['X-Conversation-ID'], 'the CN request carries the family too')
-  // One client build, named the same way in the header and in the UA. The
-  // version used to exist as three literals (5.8.4 in the header, 5.5.4 in the
-  // CN UA, 5.5.2 for the roster), a combination no real client produces.
-  assert.equal(cnHeaders['User-Agent'], 'WorkBuddy/5.8.4 WorkBuddy/5.8.4 CLI/2.161.0')
-  assert.equal(cnHeaders['X-IDE-Version'], '5.8.4')
+  // CN 5.9 names its agent runtime; the international build does not.
+  assert.equal(cnHeaders['User-Agent'], 'WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0')
+  assert.equal(cnHeaders['X-IDE-Version'], '5.9.3')
   assert.equal(headers['User-Agent'], 'WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0',
     'the international request uses the captured desktop UA')
 })
@@ -4590,6 +4787,7 @@ test('a service stop releases the refresh slot', async () => {
     clearModelRetries: () => stopped.push('modelRetries'),
     checkinAbort: { abort: () => stopped.push('checkinAbort') },
     runtimeStarts: new Map(),
+    sourceGatewayStarts: new Map(),
     runtimes: new Map(),
     traeGateways: new Map(),
     qoderGateways: new Map(),

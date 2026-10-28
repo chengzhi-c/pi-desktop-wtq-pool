@@ -955,6 +955,10 @@ function renderSourceTabs() {
   for (var j = 0; j < groups.length; j += 1) {
     groups[j].hidden = groups[j].getAttribute("data-source") !== activeSource;
   }
+  // The keep-alive renews WorkBuddy sign-ins only; leaving the card on Trae or
+  // Qoder made it look as if "Refresh now" would touch that source's tokens.
+  var keepAliveCard = $("keepAliveCard");
+  if (keepAliveCard) keepAliveCard.hidden = activeSource !== "workbuddy";
   // The source tab owns the models view too, and a source tab click does not
   // run the whole render, so the model page and the footer - which names the
   // endpoint of the source on screen - are repainted from here.
@@ -1871,7 +1875,10 @@ function autoNoteRows(auto) {
       tone: claimed > 0 || adopted > 0 ? "ok" : "",
     });
   };
-  push(t("auto.rowWorkbuddy"), { claimed: last.claimed, skipped: last.skipped, failed: last.failed });
+  if (last.workbuddy !== false
+    && (last.claimed !== undefined || last.skipped !== undefined || last.failed !== undefined)) {
+    push(t("auto.rowWorkbuddy"), { claimed: last.claimed, skipped: last.skipped, failed: last.failed });
+  }
   pushTravel(last.travel);
   if (last.growth) {
     var growth = last.growth;
@@ -4026,7 +4033,15 @@ function runBusy(id, work) {
   render();
   return work().then(function (result) {
     busy = null;
-    if (result && result.accounts) adopt(result);
+    // A host answer may still be detecting behind the click. Adopt it through
+    // the same polling path the initial open uses, but only when it actually
+    // reports that state: most settings/reset answers omit `refreshing`, and
+    // adopting those here must not cancel a poll already running.
+    if (result && result.accounts && typeof result.refreshing === "boolean") {
+      adoptAndMaybePoll(result, 0);
+    } else if (result && result.accounts) {
+      adopt(result);
+    }
     if (result && result.stale === true) note(t("err.stale"), "warn");
     else note(null);
     render();
@@ -4474,6 +4489,12 @@ function saveModels() {
   invoke("xd.saveModels", {
     gateway: page.key,
     selection: { enabledModelIds: enabledModelIds, overrides: overrides },
+    // The models this page actually showed. A roster read can be partial (the
+    // static fallback while the live list is still unread, or a directory that
+    // answered with fewer rows), and the host keeps the stored entries for the
+    // ids this page could not display instead of reading their absence as a
+    // deliberate removal.
+    knownModelIds: page.list.map(function (model) { return model.id; }),
   }).then(function (next) {
     busy = null;
     adopt(next);

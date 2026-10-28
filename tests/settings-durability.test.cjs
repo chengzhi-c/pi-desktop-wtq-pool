@@ -47,6 +47,7 @@ function loadEntry(options = {}) {
   let settingsDocument = options.settings ?? {}
   let readFails = false
   let gate = null
+  let writeGate = null
   const baseRequire = createRequire(path.join(root, 'main.js'))
   const context = vm.createContext({
     require: (id) => {
@@ -69,7 +70,10 @@ function loadEntry(options = {}) {
           if (readFails) throw new Error('settings host unavailable')
           return snapshot
         },
-        setSettings: async (patch) => { settingsDocument = { ...settingsDocument, ...patch } },
+        setSettings: async (patch) => {
+          if (writeGate !== null) await writeGate
+          settingsDocument = { ...settingsDocument, ...patch }
+        },
         getDataPath: async () => path.join(temporary, 'data'),
         getManifest: () => ({ version: '0.0.0-test' }),
       },
@@ -87,6 +91,12 @@ function loadEntry(options = {}) {
     holdRead() {
       let release
       gate = new Promise((resolve) => { release = resolve })
+      return release
+    },
+    /** Keep every later write pending until the returned release is called. */
+    holdWrite() {
+      let release
+      writeGate = new Promise((resolve) => { release = resolve })
       return release
     },
     read: (expression) => vm.runInContext(expression, context),
@@ -140,6 +150,85 @@ test('a failed settings read keeps the last known document instead of wiping it'
       'the picked account must not be dropped because a read failed')
     assert.deepEqual(stored.modelSelection, { cn: { enabledModelIds: ['model-a'] } },
       'the saved model selection must not be dropped because a read failed')
+  } finally {
+    entry.cleanup()
+  }
+})
+
+/**
+ * A host edit that raced a local save is re-read, not dropped with the stale
+ * event payload.
+ *
+ * PI announces the host's stored document, and an announcement already in
+ * flight when this process saves carries the pre-save copy. Dropping it left
+ * the host's own edit - a cooldown changed while the save was open - unapplied
+ * until something else re-read the file. The host's copy after the save is the
+ * merge of both, so re-reading is the answer that keeps each side's change.
+ */
+test('a host edit that raced a local save is re-read, not dropped', async () => {
+  const entry = loadEntry({ settings: { sourceTrae: false, cooldownSeconds: 60 } })
+  try {
+    await entry.read('adoptHostSettings()')
+    // The real pool is built during `onLoad`; this case only exercises the
+    // document merge, so a no-op pool keeps reconciliation out of the way.
+    entry.read(`core.pool = {
+      applyConfig: () => false, applyRemoved: () => {}, prefer: () => {},
+      list: () => [], isDisabled: () => false,
+    }`)
+    const release = entry.holdWrite()
+    const saving = entry.read('saveSettings({ sourceTrae: true })')
+    // The host stored its own edit while the save was in flight. The event it
+    // already sent carries the document from before the save.
+    entry.setDocument({ sourceTrae: true, cooldownSeconds: 120 })
+    const changed = entry.read('onHostSettingsChanged({ sourceTrae: false, cooldownSeconds: 120 })')
+    release()
+    await saving
+    await changed
+    const current = json(entry.read('settings'))
+    assert.equal(current.sourceTrae, true, 'the local save must survive the host event')
+    assert.equal(current.cooldownSeconds, 120, 'the host edit that raced the save must land too')
+  } finally {
+    entry.cleanup()
+  }
+})
+
+/**
+ * A save from a partial roster keeps what the page could not show.
+ *
+ * The panel cannot display a model the current roster read did not list, so it
+ * cannot offer to keep or drop it. Treating its absence from the payload as a
+ * deliberate removal wiped that model's tick and edits whenever the static
+ * fallback stood in for a live list, or a source directory answered with fewer
+ * rows than it would carry later.
+ */
+test('a save from a partial roster keeps the models the page did not show', async () => {
+  const entry = loadEntry({
+    settings: {
+      modelSelection: {
+        cn: {
+          enabledModelIds: ['shown', 'hidden'],
+          overrides: { shown: { contextWindow: 8000 }, hidden: { alias: 'Hidden' } },
+        },
+      },
+    },
+  })
+  try {
+    await entry.read('adoptHostSettings()')
+    const merged = json(entry.read(`mergeSelectionForPartialRoster(
+      parseSelection({ enabledModelIds: ['shown'], overrides: {} }),
+      gatewaySelectionFor('cn'),
+      parseKnownModelIds(['shown']))`))
+
+    assert.deepEqual(merged.enabledModelIds, ['shown', 'hidden'], 'the unseen model stays enabled')
+    assert.equal(merged.overrides.hidden.alias, 'Hidden', 'and keeps its per-model edits')
+    assert.equal(merged.overrides.shown, undefined, 'an edit cleared on the page is still removed')
+    // An older panel sends no id list: its payload is the whole selection, so
+    // nothing is carried over.
+    const legacy = json(entry.read(`mergeSelectionForPartialRoster(
+      parseSelection({ enabledModelIds: ['shown'], overrides: {} }),
+      gatewaySelectionFor('cn'),
+      undefined)`))
+    assert.deepEqual(legacy, { enabledModelIds: ['shown'], overrides: {} })
   } finally {
     entry.cleanup()
   }

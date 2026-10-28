@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.chengzhi-c.pi-desktop-wtq-pool",
   "name": "WTQ Pool",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接入 PI-Desktop。限流或额度用尽时自动换号，三家各有开关。",
   "author": "chengzhi-c (PI-Desktop port of XDTrees/dsh-workbuddy-xdpool)",
   "license": "MIT",
@@ -142,5 +142,5 @@
     ],
     "providers": []
   },
-  "changelog": "1.1.0：同一账号在多处留有登录时按签发时间取最新的一份，续期结果写回插件自己的登录文件（修复令牌未过期却显示需重新登录）；删除的账号不再被桌面快照或留档副本带回。"
+  "changelog": "1.2.0：模型提供商 ID 由 xdpool-* 改为 wtqpool-*，升级后模型选择需要重新选一次。"
 }

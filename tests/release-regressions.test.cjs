@@ -63,21 +63,21 @@ for (const source of ['trae', 'qoder']) {
 test('a partial startup preserves enabled providers whose directories are still warming', () => {
   const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
   const fn = source.match(/^function syncDeclaration\(\) \{[^]*?^\}/m)[0]
-  const old = { id: 'xdpool-qoder-cn', models: [{ id: 'saved-qoder' }] }
+  const old = { id: 'wtqpool-qoder-cn', models: [{ id: 'saved-qoder' }] }
   const writes = []
   const context = vm.createContext({
     runtimes: new Map([['cn', { signedIn: true }]]),
     activeRegions: () => ['cn'], activeTraeRegions: () => [], activeQoderRegions: () => ['cn'],
     declarationModels: () => [{ id: 'workbuddy' }], traeDeclarationModels: () => [], qoderDeclarationModels: () => [],
-    PROVIDER_ID_BY_REGION: { cn: 'xdpool-cn' }, TRAE_PROVIDER_ID_BY_REGION: {}, QODER_PROVIDER_ID_BY_REGION: { cn: old.id },
-    descriptorFor: () => ({ id: 'xdpool-cn', models: [{ id: 'workbuddy' }] }), descriptorForTrae() {}, descriptorForQoder() {},
+    PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn' }, TRAE_PROVIDER_ID_BY_REGION: {}, QODER_PROVIDER_ID_BY_REGION: { cn: old.id },
+    descriptorFor: () => ({ id: 'wtqpool-cn', models: [{ id: 'workbuddy' }] }), descriptorForTrae() {}, descriptorForQoder() {},
     manifestProviders: () => [old], writeDeclaration: rows => { writes.push(rows); return { ok: true } }, runtimeState: {},
     // A Qoder gateway whose directory has not answered yet is the one case a row
     // is republished for; everything else that cannot publish drops its row.
     warmingGatewayIds: () => new Set([old.id]),
   })
   vm.runInContext(fn + '\nsyncDeclaration()', context)
-  assert.deepEqual(Array.from(writes[0], row => row.id), ['xdpool-cn', 'xdpool-qoder-cn'])
+  assert.deepEqual(Array.from(writes[0], row => row.id), ['wtqpool-cn', 'wtqpool-qoder-cn'])
 })
 
 /**
@@ -92,21 +92,21 @@ test('a partial startup preserves enabled providers whose directories are still 
 test('a partial startup drops the row of a Qoder gateway that has answered', () => {
   const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
   const fn = source.match(/^function syncDeclaration\(\) \{[^]*?^\}/m)[0]
-  const old = { id: 'xdpool-qoder-cn', models: [{ id: 'saved-qoder' }] }
+  const old = { id: 'wtqpool-qoder-cn', models: [{ id: 'saved-qoder' }] }
   const writes = []
   const context = vm.createContext({
     runtimes: new Map([['cn', { signedIn: true }]]),
     activeRegions: () => ['cn'], activeTraeRegions: () => [], activeQoderRegions: () => ['cn'],
     declarationModels: () => [{ id: 'workbuddy' }], traeDeclarationModels: () => [], qoderDeclarationModels: () => [],
-    PROVIDER_ID_BY_REGION: { cn: 'xdpool-cn' }, TRAE_PROVIDER_ID_BY_REGION: {}, QODER_PROVIDER_ID_BY_REGION: { cn: old.id },
-    descriptorFor: () => ({ id: 'xdpool-cn', models: [{ id: 'workbuddy' }] }), descriptorForTrae() {}, descriptorForQoder() {},
+    PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn' }, TRAE_PROVIDER_ID_BY_REGION: {}, QODER_PROVIDER_ID_BY_REGION: { cn: old.id },
+    descriptorFor: () => ({ id: 'wtqpool-cn', models: [{ id: 'workbuddy' }] }), descriptorForTrae() {}, descriptorForQoder() {},
     manifestProviders: () => [old], writeDeclaration: rows => { writes.push(rows); return { ok: true } }, runtimeState: {},
     // Nothing is warming: the Qoder directory has answered, and the row it saved
     // is all that is left of a sign-in that is gone.
     warmingGatewayIds: () => new Set(),
   })
   vm.runInContext(fn + '\nsyncDeclaration()', context)
-  assert.deepEqual(Array.from(writes[0], row => row.id), ['xdpool-cn'])
+  assert.deepEqual(Array.from(writes[0], row => row.id), ['wtqpool-cn'])
 })
 
 /**
@@ -126,7 +126,7 @@ test('a runtime still connecting is warming and a settled signed-out one is not'
     runtimes: new Map(),
     gatewayStartFailures: new Map(),
     activeRegions: () => ['cn'],
-    PROVIDER_ID_BY_REGION: { cn: 'xdpool-cn' },
+    PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn' },
     traeGateways: new Map(), activeTraeRegions: () => [], TRAE_PROVIDER_ID_BY_REGION: {},
     qoderGateways: new Map(), activeQoderRegions: () => [], QODER_PROVIDER_ID_BY_REGION: {},
   })
@@ -136,7 +136,7 @@ test('a runtime still connecting is warming and a settled signed-out one is not'
   // Mid-connect: the roster is still on its way, so dropping the row would cost
   // a roster the gateway already had.
   context.runtimes = new Map([['cn', { signedIn: false, connecting: Promise.resolve() }]])
-  assert.deepEqual(warming(), ['xdpool-cn'],
+  assert.deepEqual(warming(), ['wtqpool-cn'],
     'a runtime that has not finished connecting must read as warming')
   // Settled: the connect answered and the sign-in is gone, which is a verdict
   // rather than a wait.
@@ -144,7 +144,7 @@ test('a runtime still connecting is warming and a settled signed-out one is not'
   assert.deepEqual(warming(), [], 'a runtime that has settled signed out must not read as warming')
   // No runtime at all is still a roster on its way - the same row is at stake.
   context.runtimes = new Map()
-  assert.deepEqual(warming(), ['xdpool-cn'],
+  assert.deepEqual(warming(), ['wtqpool-cn'],
     'a region with no runtime yet is still waiting for its first roster')
   // A region whose start failed is not waiting for anything: its shim could not
   // bind, and nothing will bring the row it saved back to life.
@@ -162,10 +162,10 @@ test('a Qoder gateway with no error and no roster is warming', () => {
     sourceStartFailures: new Map(), sourceKey: (s, r) => s + ':' + r,
     traeGateways: new Map(), activeTraeRegions: () => [], TRAE_PROVIDER_ID_BY_REGION: {},
     qoderGateways: new Map([['cn', { region: 'cn', source: 'qoder', gateway: { models: () => [] }, lastError: '' }]]),
-    activeQoderRegions: () => ['cn'], QODER_PROVIDER_ID_BY_REGION: { cn: 'xdpool-qoder-cn' },
+    activeQoderRegions: () => ['cn'], QODER_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-qoder-cn' },
   })
   vm.runInContext(fn + '\nwarmingGatewayIds()', context)
-  assert.deepEqual([...vm.runInContext('warmingGatewayIds()', context)], ['xdpool-qoder-cn'],
+  assert.deepEqual([...vm.runInContext('warmingGatewayIds()', context)], ['wtqpool-qoder-cn'],
     'a gateway whose directory read has neither answered nor failed still has a roster in flight')
 })
 
@@ -184,7 +184,7 @@ test('a Qoder gateway whose directory read failed is not warming', () => {
     sourceStartFailures: new Map(), sourceKey: (s, r) => s + ':' + r,
     traeGateways: new Map(), activeTraeRegions: () => [], TRAE_PROVIDER_ID_BY_REGION: {},
     qoderGateways: new Map([['cn', { region: 'cn', source: 'qoder', gateway: { models: () => [] }, lastError: 'boom' }]]),
-    activeQoderRegions: () => ['cn'], QODER_PROVIDER_ID_BY_REGION: { cn: 'xdpool-qoder-cn' },
+    activeQoderRegions: () => ['cn'], QODER_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-qoder-cn' },
   })
   vm.runInContext(fn + '\nwarmingGatewayIds()', context)
   assert.deepEqual([...vm.runInContext('warmingGatewayIds()', context)], [],
@@ -207,7 +207,7 @@ test('a gateway that could not bind is reported as address drift', () => {
     runtimes: new Map(),
     gatewayStartFailures: new Map(),
     activeRegions: () => ['cn'], activeTraeRegions: () => [], activeQoderRegions: () => [],
-    PROVIDER_ID_BY_REGION: { cn: 'xdpool-cn' },
+    PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn' },
     TRAE_PROVIDER_ID_BY_REGION: {}, QODER_PROVIDER_ID_BY_REGION: {},
     sourceStartFailures: new Map(), sourceKey: (s, r) => s + ':' + r,
     SOURCE_SPECS: { trae: { activeRegions: () => [] }, qoder: { activeRegions: () => [] } },
@@ -248,12 +248,13 @@ test('a Trae or Qoder gateway that could not start is drift, not health', () => 
   const fn = source.match(/^function addressDrift\(\) \{[^]*?^\}/m)[0]
   const context = vm.createContext({
     runtimes: new Map(), gatewayStartFailures: new Map(), activeRegions: () => [], PROVIDER_ID_BY_REGION: {},
-    TRAE_PROVIDER_ID_BY_REGION: { cn: 'xdpool-trae-cn' }, QODER_PROVIDER_ID_BY_REGION: {},
+    TRAE_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-trae-cn' }, QODER_PROVIDER_ID_BY_REGION: {},
     activeTraeRegions: () => ['cn'], activeQoderRegions: () => [],
     sourceStartFailures: new Map(), sourceKey: (s, r) => s + ':' + r,
     SOURCE_SPECS: { trae: { activeRegions: () => ['cn'] }, qoder: { activeRegions: () => [] } },
     traeGateways: new Map(), qoderGateways: new Map(),
     declaredBaseUrl: () => undefined, hostDeclaredBaseUrl: () => undefined,
+    hostDeclaredSourceBaseUrl: () => undefined,
     // Publishing is what makes a failed start observable: with no row there is
     // nothing for the host to send requests to.
     declaredSourceBaseUrl: (region, idByRegion) => idByRegion[region] === undefined
@@ -293,6 +294,7 @@ test('a Trae start that throws is recorded before the pass returns', async () =>
     loadGeneration: 1,
     stillLoaded: () => true,
     sourceStartFailures: new Map(), sourceKey: (s, r) => s + ':' + r,
+    sourceGatewayStarts: new Map(),
     serviceStopped: false,
     regionEnabled: () => true,
     createSourceRuntime: async () => { throw new Error('listen EADDRINUSE 127.0.0.1:41851') },
@@ -309,6 +311,52 @@ test('a Trae start that throws is recorded before the pass returns', async () =>
   assert.equal(logged.length, 1, 'and the log still says so')
   assert.equal(vm.runInContext('SOURCE_SPECS.trae.gateways.size', context), 0,
     'a failed start installs nothing')
+})
+
+/**
+ * Two passes asking for the same source region must share one bind.
+ *
+ * A rescan can run beside the background refresh. Without the in-flight map
+ * both call `createSourceRuntime`, the second bind loses the preferred port,
+ * and its EADDRINUSE overwrites the healthy gateway's row in
+ * `sourceStartFailures` - the panel then reports a working source as failed.
+ */
+test('overlapping source reconciles share one gateway start', async () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const fn = source.match(/^async function reconcileSourceGateways\(source\) \{[^]*?^\}/m)[0]
+  let starts = 0
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  const context = vm.createContext({
+    SOURCE_SPECS: { trae: { activeRegions: () => ['cn'], gateways: new Map() } },
+    loadGeneration: 1,
+    stillLoaded: () => true,
+    sourceStartFailures: new Map(), sourceKey: (s, r) => s + ':' + r,
+    sourceGatewayStarts: new Map(),
+    serviceStopped: false,
+    regionEnabled: () => true,
+    createSourceRuntime: async (sourceName, region) => {
+      starts += 1
+      await gate
+      return { source: sourceName, region, gateway: { close: async () => {} } }
+    },
+    safeMessage: (error) => String(error?.message ?? error),
+    log: () => {},
+  })
+  vm.runInContext(fn + '\nreconcileSourceGateways', context)
+  const first = vm.runInContext("reconcileSourceGateways('trae')", context)
+  const second = vm.runInContext("reconcileSourceGateways('trae')", context)
+  let secondDone = false
+  second.then(() => { secondDone = true })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(secondDone, false, 'the second pass must wait for the start it joined')
+  release()
+  await Promise.all([first, second])
+
+  assert.equal(starts, 1, 'the second pass must join the start already in flight')
+  assert.equal(vm.runInContext('SOURCE_SPECS.trae.gateways.size', context), 1)
+  assert.equal(vm.runInContext('sourceStartFailures.size', context), 0,
+    'the loser must not record an EADDRINUSE against the healthy gateway')
 })
 
 /**
@@ -330,7 +378,7 @@ test('the connection check names a Trae or Qoder start that failed', () => {  co
     traeGateways: new Map(),
     qoderGateways: new Map(),
     TRAE_PROVIDER_ID_BY_REGION: {}, TRAE_PROVIDER_NAME_BY_REGION: {},
-    QODER_PROVIDER_ID_BY_REGION: { cn: 'xdpool-qoder-cn' },
+    QODER_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-qoder-cn' },
     QODER_PROVIDER_NAME_BY_REGION: { cn: 'WTQ Pool Qoder (CN)' },
     TRAE_PORTS: {}, QODER_PORTS: { cn: 42871 },
     push: (label, ok, detail) => findings.push({ label, ok, detail }),
@@ -424,10 +472,10 @@ test('WorkBuddy composer starts a background probe for cold credits without a pa
     scheduleRefresh: () => { scheduled++; setImmediate(() => { total = 500 }) },
   })
   vm.runInContext(fn, context)
-  assert.equal(context.composerPoints({ chip: 'fixture', provider: 'xdpool-cn', model: 'fixture' }).total, null)
+  assert.equal(context.composerPoints({ chip: 'fixture', provider: 'wtqpool-cn', model: 'fixture' }).total, null)
   assert.equal(scheduled, 1, 'cache-only composer reads must start the existing background refresh when cold')
   await new Promise(resolve => setImmediate(resolve))
-  assert.equal(context.composerPoints({ chip: 'fixture', provider: 'xdpool-cn', model: 'fixture' }).total, 500)
+  assert.equal(context.composerPoints({ chip: 'fixture', provider: 'wtqpool-cn', model: 'fixture' }).total, 500)
   assert.equal(scheduled, 1, 'fresh credits must not start another probe')
 })
 
