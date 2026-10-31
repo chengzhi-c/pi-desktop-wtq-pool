@@ -95,7 +95,7 @@ function loadEntry(settings) {
     },
   })
   vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), context)
-  return { plugin: context.module.exports, service: () => service, temporary }
+  return { plugin: context.module.exports, service: () => service, temporary, context }
 }
 
 /** Channels the host answers itself, so the entry's switch never sees them. */
@@ -146,6 +146,48 @@ test('the panel\'s check-in goes through the one pass, not a second copy of it',
     assert.equal(typeof answer.state.autoCheckin.last.at, 'string', 'and it has to carry the time it ran')
     const after = await host.plugin.onPanelInvoke('xd.state', {})
     assert.equal(after.autoCheckin.last.manual, true, 'the record has to survive the next document read too')
+  } finally {
+    await host.plugin.onUnload()
+  }
+})
+
+test('a single claim records today on the cached source row', async () => {
+  const host = loadEntry({
+    enabled: true, sourceWorkbuddy: false, sourceTrae: false, sourceQoder: false,
+    distribution: 'priority', cooldownSeconds: 60, authFile: '', showComposerPoints: false,
+  })
+  await host.plugin.onLoad()
+  try {
+    vm.runInContext("qoderAccountRows = [{ label: 'A', region: 'cn', checkin: { active: true, todayCheckedIn: false } }]", host.context)
+    vm.runInContext("markSourceCheckinRow('qoder', 'A', 'cn', { outcome: 'claimed' })", host.context)
+    assert.equal(vm.runInContext("qoderAccountRows[0].checkin.todayCheckedIn", host.context), true,
+      'the document the panel reads back has to say the claim happened')
+    vm.runInContext("traeAccountRows = [{ label: 'B', region: 'cn', checkin: { active: true, todayCheckedIn: false } }]", host.context)
+    vm.runInContext("markSourceCheckinRow('trae', 'B', 'cn', { outcome: 'skipped', deviceCheckedIn: true })", host.context)
+    assert.equal(vm.runInContext("traeAccountRows[0].checkin.deviceCheckedIn", host.context), true,
+      'a device-level refusal has to reach the card too')
+    vm.runInContext("qoderAccountRows = [{ label: 'C', region: 'cn', checkin: { active: true, todayCheckedIn: false } }]", host.context)
+    vm.runInContext("markSourceCheckinRow('qoder', 'C', 'cn', { outcome: 'skipped', todayCheckedIn: true })", host.context)
+    assert.equal(vm.runInContext("qoderAccountRows[0].checkin.todayCheckedIn", host.context), true,
+      'a round already collected in the app has to reach the card as collected')
+  } finally {
+    await host.plugin.onUnload()
+  }
+})
+
+test('the single claim answer carries the claimed row', async () => {
+  const host = loadEntry({
+    enabled: true, sourceWorkbuddy: false, sourceTrae: false, sourceQoder: true,
+    distribution: 'priority', cooldownSeconds: 60, authFile: '', showComposerPoints: false,
+  })
+  await host.plugin.onLoad()
+  try {
+    vm.runInContext("qoderAccountRows = [{ label: 'A', region: 'cn', checkin: { active: true, todayCheckedIn: false } }]", host.context)
+    vm.runInContext("qoderClaimOne = async () => ({ outcome: 'claimed' })", host.context)
+    const answer = await host.plugin.onPanelInvoke('xd.sourceCheckin', { source: 'qoder', label: 'A', region: 'cn' })
+    assert.equal(answer.result.outcome, 'claimed')
+    assert.equal(answer.state.qoder.accounts.find((row) => row.label === 'A').checkin.todayCheckedIn, true,
+      'the document answering the click must not still say the account is claimable')
   } finally {
     await host.plugin.onUnload()
   }
@@ -394,6 +436,21 @@ test('the ban-risk note reaches the panel line', () => {
 })
 
 /**
+ * The panel starts in the host's locale, not a fixed one.
+ *
+ * `panel.js` reads `document.documentElement.lang` before the asynchronous
+ * appearance answer arrives, so a hardcoded `zh-CN` painted Chinese first on an
+ * English host and stayed Chinese if that answer never came. Leaving the
+ * attribute off falls through to `navigator.language`, which the host starts
+ * with; the appearance answer then replaces it with the authoritative locale.
+ */
+test('the panel page does not pin a locale', () => {
+  const page = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
+  assert.doesNotMatch(page, /<html[^>]*\blang\s*=/i,
+    'the panel document must not declare a language before the host appearance is known')
+})
+
+/**
  * The README screenshots show the panel the repository ships now.
  *
  * `docs/preview-panel.html` mounts `renderer/index.html`, `panel.js` and
@@ -404,17 +461,21 @@ test('the ban-risk note reaches the panel line', () => {
  * "Newer than" is a content question, not a file-system one: git does not carry
  * modification times, so a stamp compared against them passes on the machine that
  * took the picture and fails on a fresh clone, in either direction. The capture
- * writes the hashes of the three files it mounted into `docs/preview-capture.json`,
+ * writes the hashes of the files it mounted into `docs/preview-capture.json`,
  * and this compares against those.
  */
 test('the README screenshots show the panel the repository ships', () => {
   const shots = ['preview-pool.png', 'preview-dark.png', 'preview-models.png', 'preview-growth.png', 'preview-page.png']
+  const rendered = ['renderer/index.html', 'renderer/panel.js', 'renderer/panel.css',
+    'docs/preview-panel.html', 'docs/preview-data.js']
   const stampAt = path.join(root, 'docs', 'preview-capture.json')
   assert.ok(fs.existsSync(stampAt), 'docs/preview-capture.json has to exist: the capture writes it')
   const stamp = JSON.parse(fs.readFileSync(stampAt, 'utf8'))
   const digest = (file) => crypto.createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex')
 
-  for (const file of ['renderer/index.html', 'renderer/panel.js', 'renderer/panel.css']) {
+  assert.deepEqual(Object.keys(stamp.rendered).sort(), [...rendered].sort(),
+    'the capture has to name every source that decides what the screenshots show')
+  for (const file of rendered) {
     assert.equal(stamp.rendered[file], digest(file),
       `${file} changed since the screenshots were taken: re-capture, then run node docs/stamp.cjs`)
   }

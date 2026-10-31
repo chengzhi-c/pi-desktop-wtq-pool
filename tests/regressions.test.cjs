@@ -602,6 +602,7 @@ test('a sign-in with no expiry is live, not expired', async (t) => {
   const traeUpstream = require('../lib/trae-upstream')
   // `0` is what the discovery layer produces when the stored document has no
   // usable expiry - the value every sign-in of that shape arrives with.
+  t.mock.method(traeUpstream.TraeSoloUpstreamClient.prototype, 'fetchModels', async () => ({ models: [], partial: false, failedFunctions: [] }))
   t.mock.method(traeUpstream.TraeSoloUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ code: 0, enable: true, checkedIn: false, credits: 3 }))
   t.mock.method(traeUpstream.TraeSoloUpstreamClient.prototype, 'fetchUsageSummary', async () => ({ credits: [], packs: [] }))
   const traeDiscovery = Object.create(trae, {
@@ -634,8 +635,10 @@ test('a sign-in with no expiry is live, not expired', async (t) => {
     await plugin.onLoad()
     await service.start()
     // Filled by the refresh pass behind the load, so poll the way the panel does.
+    // The pass may wait out a probe timeout before it publishes, so the window
+    // here is wider than the probe's own budget.
     let state
-    for (let attempt = 0; attempt < 50; attempt += 1) {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
       state = await plugin.onPanelInvoke('xd.state')
       if (state.trae.accounts.length > 0) break
       await new Promise((resolve) => setTimeout(resolve, 50))
@@ -1471,4 +1474,6 @@ test('a credential echoed by an upstream never survives into the client body', (
   // The business code is the actionable half of an error and must survive.
   assert.equal(redactSecrets('{"code":6004}').includes('6004'), true)
   assert.equal(redactSecrets('{"code":"soft_rate"}').includes('soft_rate'), true)
+  // An address is account-identifying too, and error bodies reach the user.
+  assert.equal(redactSecrets('mail lin.cn@example.com').includes('lin.cn'), false)
 })

@@ -285,6 +285,10 @@ test('a status the upstream chose is not reclassified by the body it quotes', ()
     'a session marker on a 500 is an upstream outage, not a dead sign-in')
   assert.equal(classifyUpstreamError(401, '{"code":12153}'), 'session_dead',
     'a 401 carrying the session marker is the one place it may fire')
+  assert.equal(classifyUpstreamError(403, '<html>request blocked</html>'), 'waf_block',
+    'an HTML 403 is the gateway page, which clears on its own')
+  assert.equal(classifyUpstreamError(403, '{ "code" : 0, "msg" : "forbidden" }'), 'client',
+    'a JSON verdict with spaces around the key is not a WAF page')
 })
 
 /**
@@ -512,6 +516,180 @@ test('a Qoder chat rotates past a sign-in that answers 401', async () => {
     assert.deepEqual(served, ['dead-user', 'live-user'],
       'the dead sign-in must be tried first and then rotated past, in order')
   } finally { await gateway.close() }
+})
+
+test('a Qoder refusal after the first frame still reaches the host with its wait', async () => {
+  // The relay can only end the stream in-band once output has started, but the
+  // account still has to be held for the right reason. Every mid-flight refusal
+  // used to arrive as `server` with no wait, so a spent daily allowance was
+  // retried after the default cooldown.
+  const { createQoderGateway } = require('../lib/qoder-gateway')
+  const credential = { userID: 'quota-user', token: 'quota-token', name: '', email: '' }
+  const failures = []
+  const fetchImpl = async (url) => {
+    if (String(url).includes('/model/list')) {
+      return new Response(JSON.stringify({ chat: [{ key: 'qoder-model', display_name: 'Qoder', enable: true }] }))
+    }
+    return new Response([
+      'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+      'data: {"code":110,"message":"daily quota spent","retryAfterSeconds":7200}\n\n',
+    ].join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  }
+  const gateway = createQoderGateway({
+    region: 'cn', port: 0, credentials: async () => [credential], fetchImpl,
+    onAttemptFailure: (_credential, outcome) => failures.push(outcome),
+  })
+  try {
+    await gateway.ready
+    const answer = await fetch(gateway.baseUrl() + '/v1/chat/completions', {
+      method: 'POST', headers: { 'content-type': 'application/json', connection: 'close' },
+      body: JSON.stringify({ model: 'qoder-model', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    await answer.text()
+    assert.equal(failures.length, 1, 'the mid-flight refusal has to reach the host once')
+    assert.equal(failures[0].retryAfter, '7200', 'and its own wait has to survive the stream')
+  } finally { await gateway.close() }
+})
+
+test('a Trae refusal after the first frame still reaches the host', async () => {
+  const { createTraeGateway } = require('../lib/trae-gateway')
+  const credential = { accessToken: 'quota-token', userId: 'quota-user', host: 'https://api.trae.cn', edition: 'cn', source: 'desktop', expiresAtMs: Date.now() + 3600000 }
+  const failures = []
+  const fetchImpl = async (url) => {
+    const target = String(url)
+    if (target.includes('get_detail_param')) {
+      return new Response(JSON.stringify({ config_info_list: [{ config_name: 'trae-model', display_config: { display_name: 'Trae' } }] }))
+    }
+    if (target.includes('/models')) return new Response(JSON.stringify({ data: { list: [] } }))
+    return new Response(
+      'event: output\ndata: {"response":"partial"}\n\nevent: error\ndata: {"code":1005,"message":"quota spent"}\n\n',
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    )
+  }
+  const gateway = createTraeGateway({
+    port: 0, credentials: async () => [credential], fetchImpl,
+    identity: async () => ({ machineId: 'fixture-machine', deviceId: 'fixture-device', platform: 'win32' }),
+    onAttemptFailure: (_credential, outcome) => failures.push(outcome),
+  })
+  try {
+    await gateway.ready
+    const answer = await fetch(gateway.baseUrl() + '/v1/chat/completions', {
+      method: 'POST', headers: { 'content-type': 'application/json', connection: 'close' },
+      body: JSON.stringify({ model: 'trae-model', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    await answer.text()
+    assert.equal(failures.length, 1, 'the mid-flight refusal has to reach the host once')
+  } finally { await gateway.close() }
+})
+
+test('the Trae batch skips only the edition whose device is spent', async () => {
+  // CN and SOLO are separate installs and can carry different x-device-ids.
+  // Marking every remaining CN account after one edition's device claim took
+  // a claimable account off the board.
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const claims = []
+  const marked = []
+  const context = vm.createContext({
+    activeTraeRegions: () => ['cn'],
+    traeStorageCandidates: () => [],
+    discoverTraeCredentials: async () => ({
+      credentials: [
+        { label: 'cn-1', edition: 'cn' },
+        { label: 'cn-2', edition: 'cn' },
+        { label: 'solo-1', edition: 'solo' },
+      ],
+    }),
+    traeRegionOfCredential: () => 'cn',
+    checkinPause: async () => {},
+    currentCheckinSignal: () => ({ aborted: false }),
+    traeClaimFor: async (credential) => {
+      claims.push(credential.label)
+      return credential.edition === 'cn'
+        ? { outcome: 'claimed', deviceCheckedIn: true }
+        : { outcome: 'claimed' }
+    },
+    traeRowLabel: (credential) => credential.label,
+    markSourceCheckinRow: (...args) => marked.push(args),
+    TRAE_ACCOUNT_DELAY_MS: 0,
+    TRAE_ACCOUNT_JITTER_MS: 0,
+    log: () => {},
+  })
+  vm.runInContext(entryFunctions(['traeCheckinAll'], source), context)
+  const counts = await vm.runInContext('traeCheckinAll()', context)
+  assert.deepEqual(claims, ['cn-1', 'solo-1'],
+    'the second CN account is skipped, the other edition is still claimable')
+  assert.equal(counts.claimed, 2)
+  assert.equal(counts.skipped, 1)
+  const skipped = marked.find((args) => args[1] === 'cn-2')
+  assert.equal(skipped[3].outcome, 'skipped')
+  assert.equal(skipped[3].deviceCheckedIn, true)
+})
+
+/**
+ * Qoder's claim answer carries `replayed: true` on the call that collects the
+ * round. The campaign read before the POST already proved it CLAIMABLE, so the
+ * receipt is a claim; treating the flag as "skipped" made the first successful
+ * click read as already collected until the panel was refreshed.
+ */
+test('a Qoder claim receipt is a claim even when marked replayed', async () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  class QoderClient {
+    async fetchCampaigns() { return {} }
+    async claimCampaign() { return {} }
+  }
+  const context = vm.createContext({
+    QoderUpstreamClient: QoderClient,
+    sourceCredentialExpired: () => false,
+    qoderClientCredential: (credential) => credential,
+    qoderClaimableCampaignIdOf: () => 'daily',
+    qoderNormalizeClaimResult: () => ({ claimed: true, replayed: true }),
+    qoderRowLabel: () => 'fixture',
+    accountLogTag: () => 'acct-fixture',
+    qoderFailureRetryable: () => false,
+    safeMessage: String,
+    log: () => {},
+    Object, Number, String,
+  })
+  vm.runInContext(entryFunctions(['qoderClaimFor'], source), context)
+  const result = await vm.runInContext('qoderClaimFor({ region: "cn" })', context)
+  assert.equal(result.outcome, 'claimed')
+  assert.equal(result.todayCheckedIn, undefined,
+    'the card is already marked collected by the claimed outcome')
+})
+
+/**
+ * A Qoder sign-in whose token has expired is skipped before the network.
+ *
+ * The panel already disables its button for an expired row, but the batch pass
+ * still read the campaign list with the dead token and counted the 401 as a
+ * failed account: a retry the account could not satisfy, and a failure the user
+ * could not act on. Trae's pass has always parked the same case.
+ */
+test('an expired Qoder sign-in is skipped before any upstream read', async () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  let reads = 0
+  class QoderClient {
+    async fetchCampaigns() { reads += 1; return {} }
+    async claimCampaign() { reads += 1; return {} }
+  }
+  const context = vm.createContext({
+    QoderUpstreamClient: QoderClient,
+    sourceCredentialExpired: (credential, now) => credential.expiresAtMs <= now,
+    qoderClientCredential: (credential) => credential,
+    qoderClaimableCampaignIdOf: () => 'daily',
+    qoderNormalizeClaimResult: () => ({ claimed: true }),
+    qoderRowLabel: () => 'fixture',
+    accountLogTag: () => 'acct-fixture',
+    qoderFailureRetryable: () => false,
+    safeMessage: String,
+    log: () => {},
+    Object, Number, String,
+  })
+  vm.runInContext(entryFunctions(['qoderClaimFor'], source), context)
+  const result = await vm.runInContext('qoderClaimFor({ region: "cn", expiresAtMs: 1 })', context)
+  assert.equal(result.outcome, 'skipped', 'an expired sign-in is not a failed account')
+  assert.match(result.reason, /expired/i)
+  assert.equal(reads, 0, 'and it costs no upstream read at all')
 })
 
 /**
@@ -1017,8 +1195,22 @@ test('an at-rest key that is loaded is not reported as missing', async (t) => {
   // walk that only runs when the standard roots hold nothing. Both are stubbed
   // so the case is a property of the fixture and not of this machine.
   const childProcess = require('node:child_process')
-  t.mock.method(childProcess, 'execFileSync', () => '')
+  // The signature pass is a separate call from the registry scan. The fixture
+  // stub is not a signed binary, so the pass is answered with the policy's own
+  // shape: only this candidate, reported as validly signed.
+  t.mock.method(childProcess, 'execFileSync', (file, args) => {
+    const script = Array.isArray(args) ? args[args.length - 1] : ''
+    if (typeof script === 'string' && script.includes('ConvertTo-Json')) {
+      return JSON.stringify([{ path: stub, status: 'Valid', signer: 'CN=Fixture' }])
+    }
+    return ''
+  })
   t.mock.method(childProcess, 'execFile', (file, args, options, callback) => {
+    const script = Array.isArray(args) ? args[args.length - 1] : ''
+    if (typeof script === 'string' && script.includes('ConvertTo-Json')) {
+      callback(null, JSON.stringify([{ path: stub, status: 'Valid', signer: 'CN=Fixture' }]), '')
+      return
+    }
     if (file !== stub) {
       callback(new Error('fixture: the desktop app did not answer'), '', 'fixture stderr')
       return
@@ -3152,6 +3344,143 @@ test('the signature scan is handed a module path 5.1 can load', () => {
     'with no SystemRoot to derive from the environment is left as it is rather than given an invented path')
 })
 
+test('a standard install path is spawned only when its signature is valid', async (t) => {
+  if (process.platform !== 'win32') return t.skip('Authenticode only exists on Windows')
+  // The standard roots and the environment override were trusted by path alone
+  // while only the registry fallback checked a signature. A user-writable
+  // `%LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe` would then be spawned with
+  // the plugin's whole environment, inside a process holding every token.
+  const atRestSource = fs.readFileSync(path.join(root, 'lib/at-rest.js'), 'utf8')
+  const candidates = ['C:\\Users\\fixture\\AppData\\Local\\Programs\\WorkBuddy\\WorkBuddy.exe',
+    'C:\\Program Files\\WorkBuddy\\WorkBuddy.exe']
+  const spawns = []
+  const context = vm.createContext({
+    import_node_child_process: {
+      execFile: (file, args, options, callback) => {
+        spawns.push({ file, args, options })
+        callback(null, JSON.stringify([
+          { path: candidates[0], status: 'NotSigned', signer: '' },
+          { path: candidates[1], status: 'Valid', signer: 'CN=Tencent Technology(Shenzhen) Company Limited' },
+        ]), '')
+      },
+    },
+    import_node_path: require('node:path'),
+    process, Buffer, JSON,
+  })
+  vm.runInContext(entryFunctions([
+    'signatureAccepts', 'scanInterpreter', 'systemRootOf', 'signatureScanEnv', 'signedExecutables',
+  ], atRestSource), context)
+  vm.runInContext('let signatureScanFailure = ""', context)
+  const accepted = await vm.runInContext(`signedExecutables(${JSON.stringify(candidates)})`, context)
+  assert.deepEqual([...accepted], [candidates[1]],
+    'the unsigned per-user copy must not be executable, and the signed install must still be found')
+  assert.equal(spawns.length, 1, 'one signature pass covers every candidate')
+})
+
+test('a registry path is signed again before it is executed', async (t) => {
+  if (process.platform !== 'win32') return t.skip('Authenticode only exists on Windows')
+  // A planted uninstall key can name any executable. Enumeration must not be
+  // trusted: every path it lists is stat'ed and signed again before a spawn.
+  const atRestSource = fs.readFileSync(path.join(root, 'lib/at-rest.js'), 'utf8')
+  const real = 'C:\\Program Files\\WorkBuddy\\WorkBuddy.exe'
+  const injected = 'C:\\Users\\fixture\\planted.exe'
+  const scans = []
+  const context = vm.createContext({
+    import_node_child_process: {
+      execFileSync: () => JSON.stringify([real, injected]),
+      execFile: (file, args, options, callback) => {
+        scans.push({ file, args, options })
+        callback(null, JSON.stringify([{ path: real, status: 'Valid', signer: 'CN=Real' }]), '')
+      },
+    },
+    import_node_path: require('node:path'),
+    import_node_os: { homedir: () => 'C:\\Users\\fixture' },
+    import_node_fs: { statSync: (file) => ({ isFile: () => file === real || file === injected }) },
+    statSync: (file) => ({ isFile: () => file === real || file === injected }),
+    homedir: () => 'C:\\Users\\fixture',
+    scanInterpreter: () => 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+    signatureScanEnv: () => ({}),
+    signatureAccepts: require('../lib/at-rest').signatureAccepts,
+    APP_EXECUTABLE_NAMES: ['WorkBuddy.exe', 'WorkBuddyAI.exe'],
+    WORKBUDDY_APP_EXECUTABLE_ENV: 'WORKBUDDY_APP_EXECUTABLE',
+    process, Buffer, JSON,
+  })
+  vm.runInContext(entryFunctions([
+    'cleanIconPath', 'localWindowsPath', 'readRegistryAppPaths', 'signatureAccepts', 'statExecutables',
+    'signedExecutables', 'windowsRegistryAppPaths', 'executableCandidates',
+  ], atRestSource), context)
+  vm.runInContext('let registryAppPaths; let registryScannedAtMs = 0; let signatureScanFailure = ""', context)
+  const accepted = await vm.runInContext('executableCandidates({})', context)
+  assert.deepEqual([...accepted], [real],
+    'the planted registry path cannot survive the signature check')
+  assert.equal(scans.length, 1, 'the registry result is verified in one signature pass')
+})
+
+/**
+ * A registry key naming a share must never be touched.
+ *
+ * The scan reads values a user process can write. `Test-Path` on a UNC path
+ * opens an SMB connection and hands the named host an NTLM response before any
+ * signature is checked, so the scan only enumerates and Node drops everything
+ * that is not an absolute local drive path before it stats or signs it.
+ */
+test('a registry path that names a share is never touched', (t) => {
+  if (process.platform !== 'win32') return t.skip('the local-drive filter is Windows-specific')
+  const atRestSource = fs.readFileSync(path.join(root, 'lib/at-rest.js'), 'utf8')
+  const unc = '\\\\attacker.example\\share\\WorkBuddy.exe'
+  const local = 'C:\\Program Files\\WorkBuddy\\WorkBuddy.exe'
+  const relative = 'WorkBuddy\\WorkBuddy.exe'
+  const device = '\\\\?\\C:\\Program Files\\WorkBuddy\\WorkBuddy.exe'
+  const statted = []
+  const context = vm.createContext({
+    import_node_child_process: { execFileSync: () => JSON.stringify([unc, local, relative, device]) },
+    import_node_fs: { statSync: (file) => { statted.push(file); return { isFile: () => true } } },
+    import_node_path: require('node:path'),
+    scanInterpreter: require('../lib/at-rest').scanInterpreter,
+    signatureScanEnv: require('../lib/at-rest').signatureScanEnv,
+    process, Buffer, JSON,
+  })
+  vm.runInContext(entryFunctions([
+    'cleanIconPath', 'localWindowsPath', 'readRegistryAppPaths', 'statExecutables',
+  ], atRestSource), context)
+  const listed = vm.runInContext('readRegistryAppPaths()', context)
+  assert.deepEqual([...listed], [local], 'only the local drive path survives enumeration')
+  const files = vm.runInContext(`statExecutables(${JSON.stringify([unc, local, relative, device])})`, context)
+  assert.deepEqual([...files], [local], 'and only the local drive path is stat\'ed')
+  assert.deepEqual(statted, [local], 'the share, relative and device paths never reach statSync')
+})
+
+test('a signature scan that cannot run does not call the install unsigned', async (t) => {
+  if (process.platform !== 'win32') return t.skip('Authenticode only exists on Windows')
+  const atRestSource = fs.readFileSync(path.join(root, 'lib/at-rest.js'), 'utf8')
+  const context = vm.createContext({
+    import_node_child_process: {
+      execFileSync: () => '',
+      execFile: () => { throw new Error('a missing interpreter must not be spawned') },
+    },
+    import_node_path: require('node:path'),
+    import_node_os: { homedir: () => 'C:\\Users\\fixture' },
+    import_node_fs: { statSync: () => ({ isFile: () => true }) },
+    statSync: () => ({ isFile: () => true }),
+    homedir: () => 'C:\\Users\\fixture',
+    scanInterpreter: () => undefined,
+    signatureScanEnv: () => ({}),
+    signatureAccepts: require('../lib/at-rest').signatureAccepts,
+    APP_EXECUTABLE_NAMES: ['WorkBuddy.exe', 'WorkBuddyAI.exe'],
+    WORKBUDDY_APP_EXECUTABLE_ENV: 'WORKBUDDY_APP_EXECUTABLE',
+    process, Buffer, JSON,
+  })
+  vm.runInContext(entryFunctions([
+    'cleanIconPath', 'localWindowsPath', 'readRegistryAppPaths', 'signatureAccepts', 'statExecutables',
+    'signedExecutables', 'windowsRegistryAppPaths', 'executableCandidates',
+  ], atRestSource), context)
+  vm.runInContext('let registryAppPaths; let registryScannedAtMs = 0; let signatureScanFailure = ""', context)
+  const accepted = await vm.runInContext('executableCandidates({})', context)
+  assert.deepEqual([...accepted], [], 'an unverifiable executable is not run')
+  assert.match(vm.runInContext('signatureScanFailure', context), /signature check could not run/,
+    'the reason names the failed check rather than blaming the install')
+})
+
 /**
  * A credential whose refresh token has expired still reaches the pool.
  *
@@ -3660,9 +3989,17 @@ test('a WorkBuddy stream that fails mid-flight ends with a terminator', async ()
     account: { uin: 'u-1', nickname: 'Fixture' },
   }))
   const pool = new WorkBuddyAccountPool({ authDirs: [dir] })
+  let sent = false
   const failing = new ReadableStream({
-    start(controller) {
-      controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'))
+    pull(controller) {
+      // First read serves the content; the next one is the mid-flight failure.
+      // Erroring in the same task as the enqueue discards the queued chunk,
+      // which is the pre-first-byte case that now rotates instead.
+      if (!sent) {
+        sent = true
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'))
+        return
+      }
       controller.error(new Error('Bearer eyJhbGciOi.real.token.value rejected'))
     },
   })
@@ -4243,17 +4580,99 @@ test('the panel keeps polling while every account is cooling', () => {
     return entryFunctions([name], source)
   }
   const mod = { exports: {} }
-  const core = { pool: { list: () => accounts, isDisabled: () => false } }
+  const disabled = new Set()
+  const regionsOff = new Set()
+  const core = { pool: { list: () => accounts, isDisabled: (id) => disabled.has(id) } }
   new Function('module', 'exports', 'require', 'core', 'regionEnabled', 'regionOf', 'probeCache', 'PROBE_TTL_MS',
     grab('cooldownPending') + '\n' + grab('probesStale') + '\nmodule.exports = { cooldownPending, probesStale };',
-  )(mod, mod.exports, require, core, () => true, () => 'cn', new Map(), 60000)
-  const accounts = [{ id: 'a', cooldownUntilMs: Date.now() + 60000 }]
+  )(mod, mod.exports, require, core, (source, region) => !regionsOff.has(source + ':' + region),
+    () => 'cn', new Map(), 60000)
+  const accounts = [{ id: 'a', credential: { domain: 'www.codebuddy.cn' }, cooldownUntilMs: Date.now() + 60000 }]
   assert.equal(mod.exports.probesStale(accounts), false, 'a cooling account is never probed')
   assert.equal(mod.exports.cooldownPending(accounts), true,
     'but the cooldown is still something the panel is waiting for')
+  disabled.add('a')
+  assert.equal(mod.exports.cooldownPending(accounts), false,
+    'a switched-off account never probes, so its cooldown is not a deadline')
+  disabled.delete('a')
+  regionsOff.add('workbuddy:cn')
+  assert.equal(mod.exports.cooldownPending(accounts), false,
+    'nor is a cooling account in a switched-off region')
+  regionsOff.delete('workbuddy:cn')
   accounts[0].cooldownUntilMs = 0
   assert.equal(mod.exports.cooldownPending(accounts), false,
     'and nothing at all when nothing is cooling')
+})
+
+/**
+ * A log line is not a place for an account label or a credential.
+ *
+ * Logs are copied into bug reports; an email address or nickname there is
+ * personal data. The tag keeps lines about one account correlatable without
+ * carrying the label, and the logger strips the same credential and path shapes
+ * the gateway answers use.
+ */
+test('a log line carries no account label or credential', () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const lines = []
+  const context = vm.createContext({
+    console: { log: (line) => lines.push(String(line)) },
+    redactSecrets: require('../lib/loopback').redactSecrets,
+    accountLogTag: require('../lib/log').accountLogTag,
+    String,
+  })
+  vm.runInContext(entryFunctions(['log'], source), context)
+  const tag = vm.runInContext('accountLogTag("lin.cn@example.com")', context)
+  assert.equal(tag, vm.runInContext('accountLogTag("lin.cn@example.com")', context), 'the tag is stable')
+  assert.notEqual(tag, vm.runInContext('accountLogTag("other@example.com")', context), 'different labels differ')
+  assert.doesNotMatch(tag, /lin\.cn|@/, 'the tag carries neither the local part nor the domain')
+  vm.runInContext(
+    'log("warn", "Bearer abcdefghij failed for lin.cn@example.com at C:\\\\Users\\\\fixture\\\\signins\\\\a.info")',
+    context,
+  )
+  const line = lines.join('\n')
+  assert.doesNotMatch(line, /lin\.cn@example\.com/, 'the address is redacted')
+  assert.doesNotMatch(line, /C:\\\\Users/, 'the path is redacted')
+  assert.doesNotMatch(line, /abcdefghij/, 'the credential is redacted')
+})
+
+/**
+ * A gateway refusal is client-facing text, so it must not name the accounts.
+ *
+ * The panel can show an account label because the user is looking at their own
+ * list; an error body also reaches other local clients and gets pasted into
+ * reports. The count is enough there, and the label never leaves the pool.
+ */
+test('a gateway refusal names no account label', async () => {
+  const { createWorkBuddyShim } = require('../lib/shim')
+  const { WorkBuddyCatalog } = require('../lib/catalog')
+  const catalog = new WorkBuddyCatalog()
+  catalog.update([{ id: 'm', name: 'M', contextWindow: 1000, maxOutputTokens: 100 }])
+  const shim = createWorkBuddyShim({
+    pool: {
+      list: () => [{ id: 'a', label: 'Secret Nickname' }],
+      isDisabled: () => true,
+      acquire: async () => undefined,
+      penalize() {},
+      refreshAccount: async () => false,
+    },
+    client: { prepareChatBody: (raw) => raw, chatStream: async () => ({ ok: false, kind: 'transport', status: 503, message: 'not reached' }) },
+    catalog,
+  })
+  try {
+    await shim.ready
+    const answer = await fetch(shim.baseUrl() + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1' },
+      body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const body = await answer.text()
+    assert.equal(answer.status, 403)
+    assert.match(body, /switched off/)
+    assert.doesNotMatch(body, /Secret Nickname/, 'the client-facing refusal carries no account label')
+  } finally {
+    await shim.close()
+  }
 })
 
 /**

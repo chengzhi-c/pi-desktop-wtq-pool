@@ -35,7 +35,7 @@
 
 Use local WorkBuddy, Trae and Qoder desktop sign-ins in PI-Desktop. WorkBuddy fails over when an account is rate-limited or out of quota. Trae and Qoder select an account per request and move on to the next sign-in on an authentication failure, a rate limit or exhausted quota, while a problem with the request itself, such as an unknown model or a malformed body, is answered as the upstream answered it. Each source has its own switch, with domestic and international accounts grouped separately. When the domestic host's channel check (11128) refuses a prompt, the plugin folds the system messages into the first user message and retries once, and removes the client name from assistant history; an accepted prompt is remembered per region.
 
-A rate limit cools for the wait the upstream stated, or the configured window when it stated none. Exhausted quota and a dead sign-in do not recover on their own: that account leaves rotation. A balance read releases an exhausted-quota hold; a successful token refresh, a fresh sign-in or a manual cooldown reset releases a refused-sign-in hold, and both lapse after six hours (WorkBuddy). The non-stream reads of credits, check-in state, the model catalogue and check-ins force one token refresh and one retry when a sign-in is refused: an account whose refresh token still works recovers on the spot and never leaves rotation, and only one whose refresh token is spent too is held. Trae and Qoder holds are accounted separately, demoting the sign-in only by the cooldown window (60 seconds by default, configurable up to 24 hours) or by the wait the upstream stated, and it is still used when it is the only one left. When the upstream host cannot be reached at all, the turn ends with a network error. When the upstream says an account's plan does not include a model (11158), that model is disabled on that account for 24 hours while its other models keep serving; if no account includes it, the turn is answered with 400.
+A rate limit cools for the wait the upstream stated, or the configured window when it stated none. Exhausted quota and a dead sign-in do not recover on their own: that account leaves rotation. A balance read releases an exhausted-quota hold; a successful token refresh, a fresh sign-in or a manual cooldown reset releases a refused-sign-in hold, and both lapse after six hours (WorkBuddy). The non-stream reads of credits, check-in state, the model catalogue and check-ins force one token refresh and one retry when a sign-in is refused: an account whose refresh token still works recovers on the spot and never leaves rotation, and only one whose refresh token is spent too is held. Trae and Qoder holds are accounted separately, demoting the sign-in only by the cooldown window (60 seconds by default, configurable up to 24 hours) or by the wait the upstream stated, and it is still used when it is the only one left. When the upstream host cannot be reached, that account is skipped for the request and the next one is tried; after two accounts fail that way, the turn ends with a network error. When the upstream says an account's plan does not include a model (11158), that model is disabled on that account for 24 hours while its other models keep serving; if no account includes it, the turn is answered with 400.
 
 ## Preview
 
@@ -47,7 +47,7 @@ The panel subscribes to the host's `appearance:changed`, so its palette and loca
 
 ![Dark theme](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-dark.png)
 
-The model page edits each model's display and publishing settings. A Trae directory row states only its plan default, which differs per model (116k to 400k). A model that states no larger tier is published with the measured 1M ceiling. A Trae model whose directory states a rate carries a cost tag such as `x0.79`; models whose directory states none, and every Qoder model, stay unlabelled:
+The model page edits each model's display and publishing settings. A Trae directory row states only its plan default, which differs per model (116k to 400k). A model that states no larger tier is published with a 1M ceiling. A Trae model whose directory states a rate carries a cost tag such as `x0.79`; models whose directory states none, and every Qoder model, stay unlabelled:
 
 ![Model settings](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-models.png)
 
@@ -61,10 +61,6 @@ Live preview: <https://chengzhi-c.github.io/pi-desktop-wtq-pool/>.
 
 ![Preview page](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-page.png)
 
-With `showComposerPoints` enabled, the composer toolbar shows the credits of the account behind the current model; click it to inspect that group and switch accounts. The image below is an off-screen render of the actual composer extension:
-
-![Composer credits](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-composer.png)
-
 To run the preview locally, clone the repository, run `node docs/serve.cjs`, and open the address it prints. The page cannot be opened over `file://`, because a browser will not let it read the panel files beside it.
 
 ## Features
@@ -75,21 +71,17 @@ To run the preview locally, clone the repository, run `node docs/serve.cjs`, and
 - Gateway responses are SSE streams of `chat.completion.chunk`; the `stream` field in the request body does not change the format.
 - Credit automation: automatic check-in is off by default. Once enabled, the scheduled run and "Run now" perform the same round: the three check-ins plus the WorkBuddy streak bonus and cat travel. The upstream advances the streak on a conversation, so the round reports one chat activity per account before reading the streak tiers, and a tier that comes due is unlocked and collected without the user opening WorkBuddy to send a message. The streak step also spends a make-up card when yesterday was missed, collects the one-off starter gift and campaign compensation, and spends the draws a redeemed tier awards. These growth steps run for domestic and international accounts alike; cat travel runs for domestic accounts only, because the international host has no such API.
 - Token keep-alive: on demand, on a card of its own. A snapshot the desktop client left behind is adopted into the plugin's own sign-in directory when the pool scans, and the plugin renews it from then on; the desktop app renews the sign-in it is using. "Refresh now" works on the plugin's own copies and judges by issue time: anything signed more than six hours ago is refreshed, and a token within five minutes of expiry takes the same path. The answer is written back into the sign-in file the plugin owns, so a sign-in the upstream refused is found the same day. When one account has sign-ins in several places, the newest issue time wins. Disabled accounts, disabled regions and accounts whose sign-in the upstream refused stay out.
-- Composer credits: with `showComposerPoints` on, the composer toolbar shows the balance of the account behind the current model; click it to switch accounts. Switching the feature off hides the popover and slows the poll to once every five minutes, so switching it back on recovers without a model change. The two WorkBuddy regions publish the same catalogue, so a model name both of them serve carries a gateway suffix (`… (Global)`), which the readout uses to tell the two account groups apart.
+- Composer credits: with `showComposerPoints` on, the composer toolbar shows the balance of the account behind the current model; click it to switch accounts. Switching the feature off hides the popover and slows the poll to once every five minutes, so switching it back on recovers without a model change. The two WorkBuddy regions publish the same catalogue, so a model name both of them serve carries a gateway suffix (`… (Global)`); the readout uses it to tell the two account groups apart.
 - Panel: account and pool state, model selection, the connection check and the growth centre all live in the plugin panel. The model catalogue loads at startup and refreshes on demand once its cache expires; it does not poll while idle. Disabled accounts and accounts whose sign-in the upstream refused are never probed.
 - Connection check: every finding carries a verdict. A gateway that is not listening, a catalogue that could not be read, a registered address that differs from the one actually bound, and a provider the host did not accept all count as failures and say what to change. A gateway whose start failed is reported with the reason, and the panel surfaces address drift as a restart hint. A check that fails on its own becomes a finding, and the rest of the report still appears.
 
 ## Install
 
-PI-Desktop → Plugins → Install local plugin, then select a locally built `.piplug`. You can also download the matching `.piplug` from [Releases](https://github.com/chengzhi-c/pi-desktop-wtq-pool/releases).
+PI-Desktop → Plugins → Install local plugin, then select the `.piplug` file. You can also download the matching release from [Releases](https://github.com/chengzhi-c/pi-desktop-wtq-pool/releases).
 
 Requires PI-Desktop 0.15.0 or later; see `engines.piDesktop` in `manifest.json`.
 
 > After upgrading from 1.1.x to 1.2.0, provider ids are `wtqpool-*`; reselect your model once.
-
-Develop and verify with `npm ci && npm run typecheck && npm run build && npm test`. Rebuild `lib/` after changing `src/`.
-
-Pack with PI-Desktop's plugin development tool: copy the runtime files into a staging directory, run `pack <staging dir>`, and validate with `check <dir>`; do not use a general-purpose ZIP tool. The staging directory holds only runtime files: `manifest.json`, `main.js`, `package.json`, `lib/`, `renderer/`, `LICENSE`, `README.md`, `README.en.md` and `CHANGELOG.md`. `src/`, `tests/`, `docs/`, `tools/`, build scripts and sign-in data stay out of the artifact. `contributes.providers` in `manifest.json` stays empty and is written by the plugin at run time.
 
 ## Usage
 
@@ -112,7 +104,7 @@ If the model groups do not appear, restart PI-Desktop as the note at the top of 
 - **Connection check**: reports line by line whether each gateway is listening, how many models its catalogue returned, whether the registered address matches the one actually bound, and whether the host accepted each provider, and can copy the whole report.
 - **Growth centre**: applies to WorkBuddy only. It lists one row per account, and expanding a row shows that account's streak tiers. "Read state" reads the current tiers and what is due; "Run now" claims them and runs the growth stage, reporting every step: the make-up card, the gift and compensation, the activity report, and the streak tiers with their draws. An account whose sign-in the upstream refused is skipped in that round.
 
-Check-in runs per account, or for a whole source from the title bar. Automatic check-in is off by default; when on it claims at 09:00 (Beijing time), and a slot missed earlier the same day is still claimed at the next start, while one from a previous day is not. Trae's daily check-in is once per device; Qoder's new round opens at 10:00 (Beijing time). An account whose sign-in the upstream refused is skipped in that round.
+Check-in runs per account, or for a whole source from the title bar. Automatic check-in is off by default; when on it claims at 09:00 (Beijing time), and a slot missed earlier the same day is still claimed at the next start, while one from a previous day is not. Trae's daily check-in is once per device; Qoder CN's new round opens at 10:00 (Beijing time). The international WorkBuddy, Trae and Qoder services have no daily check-in, and the panel shows no check-in entry for them. An account whose sign-in the upstream refused is skipped in that round.
 
 "Refresh now" reports refreshed, already fresh, failed and without a refresh token separately.
 
@@ -167,9 +159,9 @@ The DeepSeek Harness edition uses a separate range starting at 42831, so both pl
 
 The plugin reads the vendors' local sign-in files. Tokens are held by the plugin and go only to the relevant vendor endpoints. Gateways listen on `127.0.0.1`, so other local processes can call them and spend account quota. The host persists plugin settings; the plugin writes its model groups into its own manifest.
 
-The plugin's own data directory (the one `pi.plugin.getDataPath()` names) holds five files (a `deleted-signins.json.lock` appears for a moment while the delete record is written). `settings.json` is the plugin settings the host persists (a former plugin id's copy is carried over once on first load). `checkin-slots.json` records the check-in slots already collected and the pending Qoder retry time; slots are kept for three days. `doctor.txt` is the most recent connection report, item by item, and names no account. `credentials-archive.json` keeps the sign-ins a later account switch overwrote, access tokens included, by token expiry, dropping each 30 days after it. `deleted-signins.json` records deleted sign-ins as a token digest, the sign-in's issue time and a delete time, so a scan cannot take the same superseded snapshot back over from the desktop app; the entry lapses once that account signs in again.
+The plugin's own data directory (the one `pi.plugin.getDataPath()` names) holds five files (a `deleted-signins.json.lock` appears for a moment while the delete record is written). `settings.json` is the plugin settings the host persists (a former plugin id's copy is carried over once on first load). `checkin-slots.json` records the check-in slots already collected and the pending Qoder retry time; slots are kept for three days. `doctor.txt` is the most recent connection report, item by item, and lists no account label. `credentials-archive.json` keeps the sign-ins a later account switch overwrote: access and refresh tokens, account identifiers (nickname, uin/uid, enterprise id) and the local sign-in path. Entries are kept by token expiry, dropping each 30 days after it; an entry with no stated expiry is kept until the account is deleted. `deleted-signins.json` records deleted sign-ins as a token digest, the sign-in's issue time and a delete time, so a scan cannot take the same superseded snapshot back over from the desktop app; the entry lapses once that account signs in again. These files carry no additional encryption; access is bounded by the operating system's file ACLs.
 
-Every sign-in the plugin writes lives in `signins/` beside it: ones added from the panel, snapshots adopted from the desktop app, and renewed copies. Each file is named after the account's billing identity and read on the same terms as a desktop sign-in. "Delete" in the panel removes that file together with its archive entry, and the snapshot the desktop app left behind stops being adopted; signing the account in again brings it back. "Remove" only disables the account, and "Removed accounts" restores it.
+Every sign-in the plugin writes lives in `signins/` beside it: ones added from the panel, snapshots adopted from the desktop app, and renewed copies. Each file is named after the account's billing identity and read on the same terms as a desktop sign-in. These files are not additionally encrypted either; access is bounded by the operating system's file ACLs. "Delete" in the panel removes that file together with its archive entry, and the snapshot the desktop app left behind stops being adopted; signing the account in again brings it back. "Remove" only disables the account, and "Removed accounts" restores it.
 
 The plugin sends requests only to the vendor endpoints; panel links open only when clicked.
 
@@ -200,6 +192,10 @@ npm run typecheck   # tsc --noEmit
 npm run build       # compiles src/*.ts into lib/*.js
 npm test            # Node's own test runner, offline regressions
 ```
+
+Rebuild `lib/` after changing `src/`.
+
+Pack with PI-Desktop's plugin development tool: copy the runtime files into a staging directory, run `pack <staging dir>`, and validate with `check <dir>`; do not use a general-purpose ZIP tool. The staging directory holds only runtime files: `manifest.json`, `main.js`, `package.json`, `lib/`, `renderer/`, `LICENSE`, `README.md`, `README.en.md` and `CHANGELOG.md`. `src/`, `tests/`, `docs/`, `tools/`, build scripts and sign-in data stay out of the artifact. `contributes.providers` in `manifest.json` stays empty and is written by the plugin at run time.
 
 `main.js` is the plugin process entry: account scanning, the gateways, the panel RPC and the `contributes.providers` declaration all live there. `src/*.ts` is the host-agnostic core (the account pool, the model catalogue, the upstream clients, the gateways), compiled by `build.mjs` with esbuild into `lib/*.js`. `renderer/` holds the panel and the composer readout in plain JavaScript with no build step, and `tests/` holds the offline regressions.
 

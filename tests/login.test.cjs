@@ -81,6 +81,12 @@ test('a login started on the international realm uses its own gateway', async ()
   assert.equal(seen[0].origin, 'https://www.workbuddy.ai')
 })
 
+test('a login start refuses a url the desktop shell must not open', async () => {
+  const { startDeviceLogin } = require('../lib/login')
+  const { fetchImpl } = loginStub({ authUrl: 'javascript:alert(1)' })
+  await assert.rejects(startDeviceLogin('cn', fetchImpl), /https/i)
+})
+
 test('a business error while the browser has not finished reads as pending', async () => {
   const { pollDeviceLogin } = require('../lib/login')
   const { fetchImpl } = loginStub({ token: 'pending' })
