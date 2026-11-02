@@ -110,7 +110,10 @@ test('the composer refresh answers inside the host relay budget', async (t) => {
     }
     assert.equal(after.total, 4242, 'the late probe must still reach the popup cache')
   } finally {
-    if (service) await service.stop()
+    // Keep the fake client installed until a background probe finishes its reads.
+    const pendingRefresh = vm.runInContext('refreshInflight?.promise', context)
+    await plugin.onUnload()
+    await pendingRefresh
     fs.rmSync(temporary, { recursive: true, force: true })
   }
 })

@@ -311,6 +311,40 @@ test('a single claim is refused while a growth run walks the accounts', async (t
     fs.rmSync(temporary, { recursive: true, force: true })
   }
 })
+test('stopping growth sends no further mutations after an in-flight request settles', async (t) => {
+  for (const boundary of ['makeupCards', 'claimGift', 'claimCompensation', 'growthStreakFull', 'lotteryChances', 'drawLottery']) {
+    await t.test(boundary, async (t) => {
+      const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'xdpool-growth-stop-'))
+      const { plugin, spent, service } = await loadPlugin(t, temporary, {
+        streak: STREAK, makeupCards: 1, missedYesterday: true, chances: 2,
+      })
+      let release, reached
+      const gate = new Promise((resolve) => { release = resolve })
+      const waiting = new Promise((resolve) => { reached = resolve })
+      const original = WorkBuddyUpstreamClient.prototype[boundary]
+      t.mock.method(WorkBuddyUpstreamClient.prototype, boundary, async (...args) => {
+        const answer = await original(...args)
+        reached()
+        await gate
+        return answer
+      })
+      try {
+        const run = plugin.onPanelInvoke('xd.growthRun')
+        await waiting
+        const before = spent.length
+        await service.stop()
+        release()
+        await run
+        assert.deepEqual(spent.slice(before).map(([name]) => name).filter((name) => MUTATING.includes(name)), [])
+      } finally {
+        release()
+        await plugin.onUnload()
+        fs.rmSync(temporary, { recursive: true, force: true })
+      }
+    })
+  }
+})
+
 test('a stale run does not clear the guard of the run that replaced it', async (t) => {
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'xdpool-growth-'))
   const { plugin } = await loadPlugin(t, temporary, { streak: STREAK, chances: 0, gift: 0, compensation: 0 })

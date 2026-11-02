@@ -417,7 +417,7 @@ test('a path outside the plugin directory is refused however it is spelled', asy
  * unchanged list, which reads as a failed add, and the account had been written
  * and scanned all along.
  */
-test('a finished login answers with the document the panel adopts', async (t) => {
+test('only the current login writes credentials and returns the panel document', async (t) => {
   const vm = require('node:vm')
   const { createRequire } = require('node:module')
   const temporary = scratch('entry-login-ok-')
@@ -446,16 +446,19 @@ test('a finished login answers with the document the panel adopts', async (t) =>
   t.mock.method(upstream.WorkBuddyUpstreamClient.prototype, 'fetchCredits', async () => ({ total: 0, packages: [] }))
   t.mock.method(upstream.WorkBuddyUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ active: false }))
   const loginPath = require.resolve('../lib/login')
+  let starts = 0
+  let finishOld
   const loginStub = {
     startDeviceLogin: async (realm) => ({
-      state: 'st-ok', authUrl: `https://example.invalid/${realm}/login?state=st-ok`,
+      state: 'st-' + ++starts, authUrl: `https://example.invalid/${realm}/login`,
     }),
-    pollDeviceLogin: async () => ({
+    pollDeviceLogin: async (_realm, state) => ({
       status: 'ok',
       signIn: {
         region: 'cn', accessToken: 'at-added', refreshToken: 'rt-added',
         expiresAtMs: Date.now() + 3600_000, domain: 'www.codebuddy.cn',
-        uid: 'u-added', uin: '90000000021', enterpriseId: '', nickname: 'Added From Panel',
+        uid: 'u-added', uin: state === 'st-1' ? await new Promise((resolve) => { finishOld = resolve }) : '90000000021',
+        enterpriseId: '', nickname: 'Added From Panel',
       },
     }),
   }
@@ -496,6 +499,13 @@ test('a finished login answers with the document the panel adopts', async (t) =>
     await service.start()
 
     await plugin.onPanelInvoke('xd.startLogin', { realm: 'cn' })
+    const old = plugin.onPanelInvoke('xd.pollLogin', { realm: 'cn' })
+    assert.equal(typeof finishOld, 'function')
+    await plugin.onPanelInvoke('xd.startLogin', { realm: 'cn' })
+    const rejected = assert.rejects(old, (error) => error.code === 'NO_LOGIN')
+    finishOld('90000000022')
+    await rejected
+    assert.equal(fs.existsSync(path.join(own, 'workbuddy-panel-90000000022.info')), false)
     const answer = await plugin.onPanelInvoke('xd.pollLogin', { realm: 'cn' })
     assert.equal(answer.status, 'ok')
     assert.equal(answer.nickname, 'Added From Panel')
@@ -509,8 +519,8 @@ test('a finished login answers with the document the panel adopts', async (t) =>
     const state = await plugin.onPanelInvoke('xd.state')
     assert.equal(state.accounts.length, answer.state.accounts.length,
       'the answer and the next read agree, which is what makes the adoption visible')
-    await plugin.onUnload()
   } finally {
+    await context.module.exports.onUnload()
     delete require.cache[loginPath]
   }
 })
@@ -528,6 +538,7 @@ test('a deleted account is not remembered as switched off when it is added again
   const vm = require('node:vm')
   const { createRequire } = require('node:module')
   const temporary = scratch('entry-delete-forgets-')
+  t.after(() => fs.rmSync(temporary, { recursive: true, force: true }))
   const dataPath = path.join(temporary, 'data')
   const own = path.join(dataPath, 'signins')
   fs.mkdirSync(own, { recursive: true })
@@ -539,6 +550,8 @@ test('a deleted account is not remembered as switched off when it is added again
     // The region under test has to be live: a parked region is never scanned, so
     // its pool stays empty and there would be no account to delete.
     disabledRegions: ['workbuddy:global'],
+    authFile: path.join(own, 'fixture.info'),
+    autoCheckin: { enabled: false },
   }
   const upstream = require('../lib/upstream')
   t.mock.method(upstream.WorkBuddyUpstreamClient.prototype, 'fetchModels', async () => [])
@@ -566,8 +579,6 @@ test('a deleted account is not remembered as switched off when it is added again
   vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), context)
   const plugin = context.module.exports
   try {
-    await plugin.onLoad()
-    await service.start()
     const { writeOwnSignIn, ownSignInDir, workbuddyAccountId } = require('../lib/accounts')
     const signIn = {
       region: 'cn', accessToken: 'at-again', refreshToken: 'rt-again',
@@ -576,8 +587,9 @@ test('a deleted account is not remembered as switched off when it is added again
     }
     await writeOwnSignIn(ownSignInDir(dataPath), signIn)
     const id = workbuddyAccountId({ uin: signIn.uin, uid: signIn.uid, domain: signIn.domain })
-    // The service scans on start; the file is written after it, so ask once for the
-    // re-read the panel's own refresh button performs.
+    // Seed before startup so a background scan cannot capture an empty fixture.
+    await plugin.onLoad()
+    await service.start()
     await plugin.onPanelInvoke('xd.rescan')
     const listed = await plugin.onPanelInvoke('xd.state')
     assert.ok(listed.accounts.some((account) => account.id === id), 'the sign-in has to be in the pool before it can be deleted')

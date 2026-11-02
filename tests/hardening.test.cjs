@@ -4314,10 +4314,33 @@ test('a nested acknowledgement does not erase the outer refusal code', () => {
  */
 test('an SSE event that never separates is bounded', () => {
   const { SseDecoder } = require('../lib/trae-sse')
-  const decoder = new SseDecoder()
+  for (const [decoder, line] of [
+    [new SseDecoder(), 'data: {"x":1}\n'],
+    [new SseDecoder(() => {}), ': heartbeat\n'],
+  ]) {
+    assert.throws(() => {
+      for (let round = 0; round < 60000; round += 1) decoder.push(line.repeat(20))
+    }, /exceeded/, 'a stream that never separates its events is stopped, not buffered')
+  }
+  const tail = new SseDecoder(() => {})
   assert.throws(() => {
-    for (let round = 0; round < 60000; round += 1) decoder.push('data: {"x":1}\n'.repeat(20))
-  }, /exceeded/, 'a stream that never separates its events is stopped, not buffered')
+    tail.push(': ' + 'x'.repeat(4 * 1024 * 1024))
+    tail.finish()
+  }, /exceeded/, 'an unterminated raw frame has the same bound as a complete one')
+})
+
+test('raw SSE frames preserve comments, CRLF, multiline data and an unterminated tail', () => {
+  const { SseDecoder } = require('../lib/trae-sse')
+  const frames = []
+  const decoder = new SseDecoder((raw, event) => frames.push({ raw, data: event?.data }))
+  const input = ': heartbeat\r\n\r\nevent: output\r\ndata: first\r\ndata: second\r\n\r\ndata: [DONE]\r'
+  for (const character of input) decoder.push(character)
+  decoder.finish()
+  assert.deepEqual(frames, [
+    { raw: ': heartbeat\r\n\r\n', data: undefined },
+    { raw: 'event: output\r\ndata: first\r\ndata: second\r\n\r\n', data: 'first\nsecond' },
+    { raw: 'data: [DONE]\r', data: '[DONE]' },
+  ])
 })
 
 
@@ -4857,10 +4880,9 @@ test('a chat request carries the conversation header family', async () => {
  *
  * The international gateway refuses a request whose first message is not a
  * system prompt (code 11128, "first message is not system prompt"), and a host
- * that starts with the user's turn sends none. The injected prompt is empty on
- * purpose: it satisfies the check without adding an instruction the model would
- * follow, so the model still sees exactly what the host sent. The CN gateway
- * asks for neither, so the body it is sent is left alone.
+ * that starts with the user's turn sends none. The injected prompt is neutral
+ * and nonempty because Kimi rejects an empty placeholder. The CN gateway does
+ * not require a leading system turn, so its body is left alone.
  */
 test('an international turn opens with a system prompt', async () => {
   const { WorkBuddyUpstreamClient } = require('../lib/upstream')
@@ -4881,7 +4903,7 @@ test('an international turn opens with a system prompt', async () => {
   await client.chatStream(international, raw, undefined, { headersMs: 50 })
   const messages = JSON.parse(sent[0].body).messages
   assert.equal(messages[0].role, 'system', 'the first message is a system prompt')
-  assert.equal(messages[0].content, '', 'and it says nothing, so the model sees only the host\'s turn')
+  assert.ok(messages[0].content.trim(), 'the system placeholder must not trigger Kimi\'s empty-content check')
   assert.equal(messages[1].role, 'user', 'the host\'s own turn follows it unchanged')
   assert.equal(messages.length, 2, 'and nothing else is added')
 
@@ -5277,4 +5299,108 @@ test('the published window is read from the manifest the host loaded', () => {
     'a model the host does not hold has no published window')
   assert.equal(context.hostWindowOf('plugin:test:trae-ai', 'm-1'), undefined,
     'and neither does a provider it does not hold')
+})
+
+test('source check-in batches preserve the first safe refusal without retrying a terminal Qoder failure', async () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const safeMessage = require('../lib/loopback').safeMessage
+  const credentials = [
+    { label: 'one', region: 'cn', edition: 'cn' },
+    { label: 'two', region: 'cn', edition: 'solo' },
+    { label: 'three', region: 'cn', edition: 'cn' },
+  ]
+  const claim = async (credential) => credential.label === 'three'
+    ? { outcome: 'claimed' }
+    : { outcome: 'failed', reason: (credential.label === 'one' ? 'first' : 'second') + ' refusal: HTTP 403 Bearer secret-' + credential.label + '-credential', retry: false }
+  const context = vm.createContext({
+    safeMessage,
+    activeQoderRegions: () => ['cn'],
+    activeTraeRegions: () => ['cn'],
+    discoverQoderCredentials: async () => ({ credentials, failures: [] }),
+    discoverTraeCredentials: async () => ({ credentials, failures: [] }),
+    traeStorageCandidates: () => [],
+    traeRegionOfCredential: (credential) => credential.region,
+    traeRowLabel: (credential) => credential.label,
+    qoderRowLabel: (credential) => credential.label,
+    traeClaimFor: claim,
+    qoderClaimFor: claim,
+    markSourceCheckinRow() {},
+    currentCheckinSignal: () => ({ aborted: false }),
+    checkinPause: async () => {},
+    checkinDelay: async () => {},
+    QODER_ACCOUNT_DELAY_MS: 0,
+    TRAE_ACCOUNT_DELAY_MS: 0,
+    TRAE_ACCOUNT_JITTER_MS: 0,
+    QODER_RETRY_BACKOFF_MS: 300000,
+    log() {},
+    AbortController,
+    checkinAbort: new AbortController(),
+    checkinScope: { enterWith() {} },
+    checkinPassRunning: false,
+    checkinPassToken: 0,
+    growthPassRunning: false,
+    serviceStopped: false,
+    loadGeneration: 1,
+    stillLoaded: () => true,
+    checkinHours: () => [9],
+    autoCheckinSlots: new Set(),
+    autoCheckinLast: null,
+    autoCheckinEnabled: () => true,
+    qoderRetryAt: 0,
+    zonedDayHour: () => ({ day: '2026-11-01', hour: 12 }),
+    dueCheckinSlot: () => undefined,
+    checkinSlotId: () => '2026-11-01T12',
+    isolatedCheckinWorker: (work) => work,
+    scheduleRefresh() {},
+    saveCheckinSlots() {},
+    GROWTH_AFTER_CHECKIN_MS: 0,
+  })
+  vm.runInContext(entryFunctions(['qoderCheckinAll', 'traeCheckinAll', 'runCheckinPass', 'autoCheckinTick'], source), context)
+  for (const kind of ['qoder', 'trae']) {
+    const counts = await context[kind + 'CheckinAll']()
+    assert.equal(counts.failed, 2)
+    assert.equal(counts.claimed, 1, 'one refusal must not prevent a later account from collecting')
+    assert.equal(counts.reason, 'first refusal: HTTP 403 Bearer [redacted]', 'the panel needs the first refusal, without its echoed credential')
+  }
+  const answer = await context.runCheckinPass({ only: 'qoder', manual: true })
+  assert.equal(answer.error, undefined)
+  assert.equal(answer.qoder.failed, 2)
+  assert.equal(context.qoderRetryAt, 0, 'a terminal refusal remains visible but must not schedule another claim')
+  context.qoderRetryAt = Date.now() - 1
+  const deferred = await context.autoCheckinTick(new Date())
+  assert.equal(deferred.qoder.failed, 2)
+  assert.equal(context.qoderRetryAt, 0, 'a deferred terminal refusal must clear its retry as well')
+  context.discoverQoderCredentials = async () => { throw new Error('discovery unavailable') }
+  const transient = await context.runCheckinPass({ only: 'qoder', manual: true })
+  assert.equal(transient.qoder.failed, 1)
+  assert.ok(context.qoderRetryAt > Date.now(), 'a temporary discovery failure still needs a deferred retry')
+})
+
+test('a Qoder business refusal is redacted before the single-account answer', async () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const qoder = require('../lib/qoder-client')
+  class QoderClient extends qoder.QoderUpstreamClient {
+    constructor(options) {
+      super({ ...options, fetchImpl: async (_url, init) => new Response(JSON.stringify(init.method === 'GET'
+        ? { campaigns: [{ campaignId: 'daily', actionType: 'CLAIM_BENEFIT', claimStatus: 'CLAIMABLE' }] }
+        : { code: 4001, msg: 'Claim refused: Bearer echoed-secret-value; contact fixture@example.com' }), {
+        headers: { 'Content-Type': 'application/json' },
+      }) })
+    }
+  }
+  const context = vm.createContext({
+    ...qoder,
+    QoderUpstreamClient: QoderClient,
+    sourceCredentialExpired: () => false,
+    qoderClientCredential: (credential) => credential,
+    qoderRowLabel: () => 'fixture',
+    accountLogTag: () => 'fixture',
+    safeMessage: require('../lib/loopback').safeMessage,
+    log() {},
+  })
+  vm.runInContext(entryFunctions(['qoderClaimFor'], source), context)
+  const answer = await context.qoderClaimFor({ region: 'cn', userID: 'fixture', token: 'fixture-token' })
+  assert.equal(answer.outcome, 'failed')
+  assert.equal(answer.retry, false)
+  assert.equal(answer.reason, 'Claim refused: Bearer [redacted]; contact [account]')
 })

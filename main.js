@@ -2805,7 +2805,7 @@ async function refreshAll(reason, force) {
     // accounts to sign their gateways in with. `pool.acquire` scans lazily, but
     // only once a chat request arrives through a gateway - too late to publish a
     // model list, which is what the panel and the picker read.
-    if (poolNeedsScan) {
+    if (poolNeedsScan && activeRegions().length > 0) {
       poolNeedsScan = false;
       await settleWithin(core.pool.scan(), left());
       if (!stillLoaded(generation)) return stalePass();
@@ -4664,7 +4664,7 @@ async function onPanelInvoke(channel, payload) {
       // A rescan can pick up an account nobody had seen, or retire one whose
       // sign-in file is gone, so any held read describes the pool as it was.
       dropGrowthRead();
-      if (activeRegions().length > 0) await settleWithin(core.pool.scan(), left());
+      if (activeRegions().length > 0) await settleWithin(core.pool.rescan(), left());
       await settleWithin(startRuntimes(), left());
       // Trae/Qoder sign-ins live in their own app files, so a deliberate scan
       // re-reads them to pick up logins made while the panel was open.
@@ -5229,6 +5229,9 @@ async function onPanelInvoke(channel, payload) {
         throw panelError("the login link has expired; start again", "LOGIN_EXPIRED");
       }
       const answer = await pollDeviceLogin(realm, pending.state);
+      if (deviceLogins.get(realm) !== pending) {
+        throw panelError("this login is no longer waiting; start again", "NO_LOGIN");
+      }
       if (answer.status !== "ok") return { status: "pending" };
       deviceLogins.delete(realm);
       const directory = ownSignInDir(dataPath);
@@ -5505,6 +5508,7 @@ async function runCheckinPass(options) {
       const now = Date.now();
       const opening = typeof qoder?.opensAt === "number" && qoder.opensAt > now ? qoder.opensAt : 0;
       const backoff = Number(qoder?.failed) > 0
+        && qoder?.retry !== false
         && (typeof qoder?.reason === "string" || qoder?.retry === true)
         ? now + QODER_RETRY_BACKOFF_MS
         : 0;
@@ -5615,13 +5619,18 @@ async function redeemAccountStreak(account) {
   // separate endpoints, and one merged number could not tell the user which of
   // them actually did something.
   const detail = { makeup: 0, gift: 0, compensation: 0, activity: 0, streak: 0, lottery: 0, failed: 0 };
+  const result = { claimed: 0, credit: 0, energy: 0, detail };
+  const signal = currentCheckinSignal();
+  if (signal.aborted) return result;
   const conversationId = "wb2api-streak-" + Date.now();
   // Repair first: a missed yesterday breaks the run, and the run is what unlocks
   // the tiers this function is about to redeem. A card is only spent when one is
   // actually held, so a pool with none never pays for the two reads.
   try {
     const cards = await core.client.makeupCards(account.credential);
+    if (signal.aborted) return result;
     if (cards > 0 && await core.client.missedYesterday(account.credential)) {
+      if (signal.aborted) return result;
       const yesterday = zonedDay(-1);
       await core.client.useMakeupCard(account.credential, yesterday);
       detail.makeup += 1;
@@ -5637,6 +5646,7 @@ async function redeemAccountStreak(account) {
     ["gift", () => core.client.claimGift(account.credential)],
     ["compensation", () => core.client.claimCompensation(account.credential)],
   ]) {
+    if (signal.aborted) return result;
     try {
       const paid = await collect();
       if (paid > 0) {
@@ -5647,6 +5657,7 @@ async function redeemAccountStreak(account) {
       // Nothing waiting: the endpoints answer a business error for that.
     }
   }
+  if (signal.aborted) return result;
   try {
     await core.client.reportChatActivity(account.credential, conversationId);
     detail.activity += 1;
@@ -5655,20 +5666,19 @@ async function redeemAccountStreak(account) {
     log("warn", "streak " + accountLogTag(account.label) + ": activity report failed: " + safeMessage(error));
   }
   await checkinPause(STREAK_REPORT_READ_GAP_MS);
+  if (signal.aborted) return result;
   const status = await core.client.growthStreakFull(account.credential);
-  let claimed = 0;
-  let credit = 0;
-  let energy = 0;
   // A tier that fails is logged and left there. The upstream scheduler does not
   // count that as a failed account: locked and already-claimed tiers are normal,
   // and one redeem error must not paint the whole check-in as a failure.
   for (const tier of status.tiers) {
     if (tier.status !== "unlocked") continue;
+    if (signal.aborted) return result;
     try {
       await core.client.redeemStreakTier(account.credential, tier.tier);
-      claimed += 1;
-      credit += tier.credit;
-      energy += tier.energy;
+      result.claimed += 1;
+      result.credit += tier.credit;
+      result.energy += tier.energy;
       detail.streak += 1;
       log("info", "streak " + accountLogTag(account.label) + ": redeemed " + tier.tier + " (+" + tier.credit + "c +" + tier.energy + "e)");
     } catch (error) {
@@ -5680,9 +5690,11 @@ async function redeemAccountStreak(account) {
   // pays only when a tier actually opened a chance. The prize payload is passed
   // through as-is and logged: its shape is the campaign's, not the API's, so
   // there is no field to read a credit out of.
+  if (signal.aborted) return result;
   try {
     const chances = await core.client.lotteryChances(account.credential);
     for (let draw = 0; draw < chances; draw += 1) {
+      if (signal.aborted) return result;
       const prize = await core.client.drawLottery(account.credential);
       detail.lottery += 1;
       log("info", "streak " + accountLogTag(account.label) + ": draw " + (draw + 1) + "/" + chances + " " + JSON.stringify(prize).slice(0, 160));
@@ -5691,7 +5703,7 @@ async function redeemAccountStreak(account) {
     detail.failed += 1;
     log("warn", "streak " + accountLogTag(account.label) + ": lottery: " + safeMessage(error));
   }
-  return { claimed, credit, energy, detail };
+  return result;
 }
 
 /**
@@ -6046,7 +6058,7 @@ async function qoderCheckinAll() {
     // answer clears its retry time and never comes back for the day.
     const reason = safeMessage(error);
     log("warn", "[qoder] check-in could not read its sign-ins: " + reason);
-    return { ...counts, failed: 1, reason };
+    return { ...counts, failed: 1, reason, retry: true };
   }
   // An unreadable app directory does not throw; it comes back in `failures`.
   // Counting it keeps the deferred round alive instead of reading the empty
@@ -6065,6 +6077,7 @@ async function qoderCheckinAll() {
     seen += 1;
     const result = await qoderClaimFor(credential);
     counts[result.outcome] += 1;
+    if (result.outcome === "failed" && counts.reason === undefined && result.reason) counts.reason = safeMessage(result.reason);
     // The panel reads the source rows this pass just changed, not a probe taken
     // before it. Without this the card kept saying "claim" after a successful
     // batch, which read as an inert button.
@@ -6111,8 +6124,9 @@ async function qoderClaimFor(credential) {
       // 200 with a business error: a refusal the user has to see, not a
       // "nothing to collect" the panel can report as already done. It is a
       // verdict for this round, not a transient transport failure.
-      log("warn", "[qoder:" + credential.region + "] check-in refused for " + accountLogTag(qoderRowLabel(credential)) + ": " + result.reason);
-      return { outcome: "failed", reason: result.reason, retry: false };
+      const reason = safeMessage(result.reason);
+      log("warn", "[qoder:" + credential.region + "] check-in refused for " + accountLogTag(qoderRowLabel(credential)) + ": " + reason);
+      return { outcome: "failed", reason, retry: false };
     }
     // A receipt is a claim. Qoder's `replayed` flag marks an idempotent
     // answer, not a call that paid nothing: the campaign was CLAIMABLE in the
@@ -6173,6 +6187,7 @@ async function traeCheckinAll() {
     if (index > 0) await checkinPause(Math.max(1000, TRAE_ACCOUNT_DELAY_MS + Math.round((Math.random() * 2 - 1) * TRAE_ACCOUNT_JITTER_MS)));
     const result = await traeClaimFor(credential, desktopCandidates);
     counts[result.outcome] += 1;
+    if (result.outcome === "failed" && counts.reason === undefined && result.reason) counts.reason = safeMessage(result.reason);
     markSourceCheckinRow("trae", traeRowLabel(credential), "cn", result);
     // Once an account on this edition holds the device's daily claim, each
     // remaining account on the same edition can only be refused 9095. They are
@@ -6383,6 +6398,7 @@ async function autoCheckinTick(now) {
       // `failed: 1` and no claim, and clearing the retry time there lost the
       // day's Qoder credits outright. A terminal answer clears it.
       const backoff = Number(retry.failed) > 0
+        && retry.retry !== false
         && (typeof retry.reason === "string" || retry.retry === true)
         ? now + QODER_RETRY_BACKOFF_MS
         : 0;

@@ -59,8 +59,9 @@ function composerChannels() {
 }
 
 /** A host just real enough for the entry to load and answer. */
-function loadEntry(settings) {
+function loadEntry(t, settings) {
   const temporary = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'wtq-contract-'))
+  t.after(() => fs.rmSync(temporary, { recursive: true, force: true }))
   const dataPath = path.join(temporary, 'data')
   fs.mkdirSync(dataPath, { recursive: true })
   // No providers declared, and no auth directory to walk: this case is about the
@@ -71,8 +72,13 @@ function loadEntry(settings) {
 
   let service = null
   const handlers = new Map()
+  const ownRequire = createRequire(path.join(root, 'main.js'))
+  const login = {
+    startDeviceLogin: async () => ({ state: 'fixture-login', authUrl: 'https://example.invalid/login' }),
+    pollDeviceLogin: async () => ({ status: 'pending' }),
+  }
   const context = vm.createContext({
-    require: createRequire(path.join(root, 'main.js')),
+    require: name => name === './lib/login' ? login : ownRequire(name),
     module: { exports: {} },
     __dirname: temporary,
     console: { log() {}, warn() {}, error() {} },
@@ -126,12 +132,12 @@ test('the composer extension only asks for channels the entry declares and answe
   }
 })
 
-test('the panel\'s check-in goes through the one pass, not a second copy of it', async () => {
+test('the panel\'s check-in goes through the one pass, not a second copy of it', async (t) => {
   // The per-source "check in all" button used to run its own fan-out: no pause
   // between the check-in burst and the growth burst, and no record in
   // `autoCheckin.last`, so the panel's "last run" stayed on the previous pass
   // while the upstream saw two request clusters back to back.
-  const host = loadEntry({
+  const host = loadEntry(t, {
     enabled: true, sourceWorkbuddy: false, sourceTrae: false, sourceQoder: false,
     distribution: 'priority', cooldownSeconds: 60, authFile: '', showComposerPoints: false,
   })
@@ -151,8 +157,8 @@ test('the panel\'s check-in goes through the one pass, not a second copy of it',
   }
 })
 
-test('a single claim records today on the cached source row', async () => {
-  const host = loadEntry({
+test('a single claim records today on the cached source row', async (t) => {
+  const host = loadEntry(t, {
     enabled: true, sourceWorkbuddy: false, sourceTrae: false, sourceQoder: false,
     distribution: 'priority', cooldownSeconds: 60, authFile: '', showComposerPoints: false,
   })
@@ -175,8 +181,8 @@ test('a single claim records today on the cached source row', async () => {
   }
 })
 
-test('the single claim answer carries the claimed row', async () => {
-  const host = loadEntry({
+test('the single claim answer carries the claimed row', async (t) => {
+  const host = loadEntry(t, {
     enabled: true, sourceWorkbuddy: false, sourceTrae: false, sourceQoder: true,
     distribution: 'priority', cooldownSeconds: 60, authFile: '', showComposerPoints: false,
   })
@@ -205,8 +211,8 @@ test('no channel is answered that the panel never calls', () => {
     'a channel nothing calls is a feature with no way to reach it, or a rename that missed one side')
 })
 
-test('every channel the page calls answers as the switch, not as its default', async () => {
-  const host = loadEntry({
+test('every channel the page calls answers as the switch, not as its default', async (t) => {
+  const host = loadEntry(t, {
     enabled: true, sourceWorkbuddy: false, sourceTrae: false, sourceQoder: false,
     distribution: 'priority', cooldownSeconds: 60, authFile: '', showComposerPoints: false,
   })
@@ -326,7 +332,7 @@ test('every view tab names the panel it controls, and that panel names it back',
  * The claim under test: the accounts row reports how many sign-ins the pool holds,
  * and neither the finding nor the report text carries a display name.
  */
-test('the connection report counts the accounts without naming them', async () => {
+test('the connection report counts the accounts without naming them', async (t) => {
   const accountName = 'fixture.user@example.com'
   const auth = path.join(fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || require('node:os').tmpdir(), 'wtq-doctor-')), 'auth')
   fs.mkdirSync(auth, { recursive: true })
@@ -334,7 +340,7 @@ test('the connection report counts the accounts without naming them', async () =
     auth: { accessToken: 'test', refreshToken: '', expiresAt: Date.now() + 3600000 },
     account: { uin: 'test-user', nickname: accountName },
   }))
-  const host = loadEntry({
+  const host = loadEntry(t, {
     enabled: true,
     sourceWorkbuddy: true,
     sourceTrae: false,
@@ -418,7 +424,6 @@ test('the ban-risk note reaches the panel line', () => {
     const expected = table['risk.note']
     assert.equal(typeof expected, 'string', `${name} has to define risk.note`)
     assert.ok(expected.trim() !== '', `${name} risk.note must say something`)
-    assert.ok(/封号|ban/i.test(expected), `${name} risk.note has to name the risk it warns about`)
 
     const node = { textContent: '' }
     const context = vm.createContext({

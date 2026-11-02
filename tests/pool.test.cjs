@@ -14,7 +14,7 @@
  * `lib/*.js`, which is what the host loads.
  */
 const assert = require('node:assert/strict')
-const { test } = require('node:test')
+const { test, after } = require('node:test')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -22,7 +22,11 @@ const path = require('node:path')
 const { WorkBuddyAccountPool } = require('../lib/accounts')
 const { createWorkBuddyShim } = require('../lib/shim')
 
-const scratch = (label) => fs.mkdtempSync(path.join(os.tmpdir(), `wtq-pool-${label}-`))
+const scratch = (label) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), `wtq-pool-${label}-`))
+  after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  return directory
+}
 
 /** One readable sign-in file, the shape the desktop app writes. */
 function writeSignIn(dir, name, uid) {

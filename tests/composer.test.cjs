@@ -109,8 +109,19 @@ test('a label two pools both publish resolves to neither of them', () => {
 })
 
 /** A host just real enough for the entry to load, with one fixture sign-in. */
-function loadEntry(settings) {
+function loadEntry(t, settings) {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'wtq-composer-'))
+  const unexpectedFetch = t.mock.method(globalThis, 'fetch', async () => {
+    throw new Error('composer fixtures must not reach an upstream')
+  })
+  t.after(() => {
+    fs.rmSync(temporary, { recursive: true, force: true })
+    assert.equal(unexpectedFetch.mock.callCount(), 0, 'the fixture must stay offline')
+  })
+  const { WorkBuddyUpstreamClient } = require('../lib/upstream')
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchModels', async () => [])
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCredits', async () => ({ total: 0, packages: [] }))
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ active: false }))
   const dataPath = path.join(temporary, 'data')
   const own = path.join(dataPath, 'signins')
   fs.mkdirSync(own, { recursive: true })
@@ -189,15 +200,15 @@ function modelsWithoutAlias(manifestPath) {
   return missing
 }
 
-test('every published model label resolves to one pool, so the readout can answer', async () => {
-  const { plugin, manifestPath } = loadEntry({
+test('every published model label resolves to one pool, so the readout can answer', async (t) => {
+  const { plugin, manifestPath } = loadEntry(t, {
     enabled: true, sourceWorkbuddy: true, sourceTrae: false, sourceQoder: false,
     distribution: 'priority', cooldownSeconds: 60, authFile: '', showComposerPoints: true,
   })
   assert.equal(typeof plugin.onRendererCall, 'function',
     'the composer talks to this entry through onRendererCall; without it the chip can never appear')
-  await plugin.onLoad()
   try {
+    await plugin.onLoad()
     // The panel is what makes the entry publish a declaration, and it is the
     // declaration the host reads the chip text from.
     await plugin.onPanelInvoke('xd.state', {})
@@ -253,16 +264,16 @@ test('every published model label resolves to one pool, so the readout can answe
  * no single pool, so the readout has to answer nothing rather than pick one: a
  * balance shown against the wrong account group is worse than no balance.
  */
-test('a chip showing the model id still answers, unless two pools share that id', async () => {
+test('a chip showing the model id still answers, unless two pools share that id', async (t) => {
   // The host prints `alias || id`, so a chip carries the id until the alias has
   // been imported. An id only one pool publishes is as good an answer as its
   // label; one both regions publish names neither, exactly like a shared name.
-  const { plugin, manifestPath } = loadEntry({
+  const { plugin, manifestPath } = loadEntry(t, {
     enabled: true, sourceWorkbuddy: true, sourceTrae: false, sourceQoder: false,
     distribution: 'priority', cooldownSeconds: 60, authFile: '', showComposerPoints: true,
   })
-  await plugin.onLoad()
   try {
+    await plugin.onLoad()
     await plugin.onPanelInvoke('xd.state', {})
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
     const published = (manifest.contributes?.providers ?? []).flatMap((provider) =>
@@ -294,13 +305,13 @@ test('a chip showing the model id still answers, unless two pools share that id'
   }
 })
 
-test('an untagged spelling of a shared name answers nothing', async () => {
-  const { plugin, manifestPath } = loadEntry({
+test('an untagged spelling of a shared name answers nothing', async (t) => {
+  const { plugin, manifestPath } = loadEntry(t, {
     enabled: true, sourceWorkbuddy: true, sourceTrae: false, sourceQoder: false,
     distribution: 'priority', cooldownSeconds: 60, authFile: '', showComposerPoints: true,
   })
-  await plugin.onLoad()
   try {
+    await plugin.onLoad()
     await plugin.onPanelInvoke('xd.state', {})
     const labels = publishedLabels(manifestPath)
     const tagged = labels.find((label) => label.endsWith('(CN)'))

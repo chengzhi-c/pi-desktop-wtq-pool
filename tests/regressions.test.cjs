@@ -354,6 +354,7 @@ test('a Qoder round that is not open yet is collected when its window opens', as
   // deferred call flips it to an open round so the claim path is exercised too.
   const qoder = require('../lib/qoder-credentials')
   const client = require('../lib/qoder-client')
+  t.mock.method(client.QoderUpstreamClient.prototype, 'fetchModels', async () => [{ id: 'qoder-model' }])
   class FakeQoderClient extends client.QoderUpstreamClient {
     async fetchCampaigns() {
       // A round that exists but has not opened: exactly what an 09:00 pass sees.
@@ -362,7 +363,6 @@ test('a Qoder round that is not open yet is collected when its window opens', as
     }
     async claimCampaign() { return { success: true, grantId: 'claim-1' } }
     async fetchUsage() { return { userQuota: { remaining: 5, total: 10 }, dedicatedPackages: [] } }
-    async fetchModels() { return [{ id: 'qoder-model' }] }
   }
   const qoderDiscovery = Object.create(qoder, {
     discoverQoderCredentials: { value: async () => ({

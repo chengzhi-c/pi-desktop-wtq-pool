@@ -600,3 +600,38 @@ test('a queued write sees the edit the host made while it waited', async () => {
   } finally { entry.cleanup() }
 })
 
+test('refreshing disabled WorkBuddy regions does not discover or archive sign-ins', async (t) => {
+  for (const settings of [
+    { sourceWorkbuddy: false },
+    { sourceWorkbuddy: true, disabledRegions: ['workbuddy:cn', 'workbuddy:global'] },
+  ]) {
+    await t.test(settings.sourceWorkbuddy ? 'both regions parked' : 'source disabled', async () => {
+      const entry = loadEntry()
+      const auth = path.join(entry.temporary, 'auth')
+      const data = path.join(entry.temporary, 'data')
+      fs.mkdirSync(auth)
+      fs.writeFileSync(path.join(auth, 'fixture.info'), JSON.stringify({
+        auth: { accessToken: 'fixture-token', refreshToken: 'fixture-refresh', expiresAt: Date.now() + 3600000 },
+        account: { uin: 'fixture-off', nickname: 'Fixture' },
+      }))
+      fs.writeFileSync(path.join(entry.temporary, 'manifest.json'), '{"contributes":{"providers":[]}}')
+      entry.setDocument({
+        enabled: true, sourceTrae: false, sourceQoder: false, autoCheckin: { enabled: false },
+        authFile: path.join(auth, 'fixture.info'), ...settings,
+      })
+      try {
+        entry.read(`dataPath = ${JSON.stringify(data)}; serviceStopped = false;
+          core.pool = new WorkBuddyAccountPool({ authDirs: [${JSON.stringify(auth)}], dataPath: () => dataPath }); core.client = {}`)
+        await entry.read('refreshAll("test", true)')
+        assert.deepEqual({
+          accounts: entry.read('core.pool.list().length'),
+          archived: fs.existsSync(path.join(data, 'credentials-archive.json')),
+        }, { accounts: 0, archived: false })
+      } finally {
+        await entry.read('onUnload()')
+        entry.cleanup()
+      }
+    })
+  }
+})
+
