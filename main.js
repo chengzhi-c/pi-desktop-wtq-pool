@@ -6,11 +6,13 @@
  * PI-Desktop port of `dsh-workbuddy-xdpool` (MIT). Same behaviour as the
  * original, rewritten against the PI-Desktop plugin host:
  *
- *   1. discover EVERY WorkBuddy desktop sign-in on this machine (read-only),
+ *   1. discover EVERY desktop sign-in on this machine (read-only): WorkBuddy,
+ *      Trae and Qoder,
  *   2. serve each gateway (domestic / international) from its own loopback
  *      OpenAI-compatible endpoint,
- *   3. publish those endpoints as two providers in this plugin's own manifest
- *      (`contributes.providers`) - the only provider channel the host exposes,
+ *   3. publish every live endpoint as its own provider in this plugin's own
+ *      manifest (`contributes.providers`) - the only provider channel the host
+ *      exposes,
  *   4. rotate to the next account whenever the upstream answers 429.
  *
  * The host spawns plugins in a Node utility process with a stripped
@@ -20,7 +22,7 @@
  * Upstream traffic uses the platform `fetch` in that process rather than the
  * host's `net.fetch` bridge: the bridge buffers a response into text, and the
  * provider contract needs the upstream SSE body relayed as it arrives. Nothing
- * leaves this machine except to WorkBuddy's own endpoints.
+ * leaves this machine except to the vendors' own endpoints.
  */
 
 const path = require("node:path");
@@ -293,6 +295,8 @@ let settings = {};
  * a switch the user just flipped.
  */
 let settingsRevision = 0;
+/** Orders overlapping reads, so a slower older response cannot replace a newer one. */
+let settingsReadSequence = 0;
 /**
  * Bumped only by writes this process made, never by a document the host pushed.
  *
@@ -346,6 +350,8 @@ const gatewayStartFailures = new Map();
 const sourceStartFailures = new Map();
 /** One in-flight source-gateway start per region, shared by overlapping passes. */
 const sourceGatewayStarts = new Map();
+/** Source-gateway closes still releasing their ports, keyed by source and region. */
+const sourceGatewayStops = new Map();
 
 function sourceKey(source, region) {
   return source + ":" + region;
@@ -633,8 +639,12 @@ async function loadSettings() {
  * the switch the user had just flipped.
  */
 async function adoptHostSettings() {
+  const readSequence = ++settingsReadSequence;
   const revision = settingsRevision;
+  const generation = loadGeneration;
   const next = await loadSettings();
+  if (readSequence !== settingsReadSequence) return false;
+  if (generation !== loadGeneration) return false;
   if (next === undefined) {
     log("warn", "could not read settings; keeping the last known document");
     return false;
@@ -656,9 +666,12 @@ async function adoptHostSettings() {
  * read, and the panel answered success for a change that was gone.
  */
 async function saveSettings(patch) {
+  const generation = loadGeneration;
   return enqueueWrite(async () => {
+    if (generation !== loadGeneration) return false;
     try {
       await pi.plugin.setSettings(patch);
+      if (generation !== loadGeneration) return false;
       settings = { ...settings, ...patch };
       settingsRevision += 1;
       localSettingsRevision += 1;
@@ -702,16 +715,25 @@ function enqueueWrite(work) {
  * `undefined` means "no change", which skips the write entirely.
  */
 async function mutateSettings(key, mutate) {
+  const generation = loadGeneration;
   return enqueueWrite(async () => {
-    // A failed read is not fatal: the last known document is still the best
-    // answer available, and refusing the edit would drop a change the user can
-    // see they made.
-    await adoptHostSettings();
+    if (generation !== loadGeneration) return false;
+    // A read can lose to a newer concurrent read and answer false even though
+    // the host is healthy. Retry once so the mutation does not write from the
+    // stale local copy; a second failure refuses the edit.
+    let adopted = false;
+    for (let attempt = 0; attempt < 2 && !adopted; attempt += 1) {
+      adopted = await adoptHostSettings();
+      if (generation !== loadGeneration) return false;
+    }
+    if (!adopted) return false;
     const current = settings[key];
     const next = await mutate(current);
+    if (generation !== loadGeneration) return false;
     if (next === undefined) return true;
     try {
       await pi.plugin.setSettings({ [key]: next });
+      if (generation !== loadGeneration) return false;
       settings = { ...settings, [key]: next };
       settingsRevision += 1;
       localSettingsRevision += 1;
@@ -734,6 +756,7 @@ async function mutateSettings(key, mutate) {
  */
 async function onHostSettingsChanged(next) {
   if (next === null || typeof next !== "object" || Array.isArray(next)) return false;
+  const generation = loadGeneration;
   // A host announcement that was already in flight when a local save landed
   // carries the document from before that save. Queue it behind the write and
   // drop its stale copy. Re-reading instead of dropping the edit matters: the
@@ -741,9 +764,11 @@ async function onHostSettingsChanged(next) {
   // document is the merge of both.
   const localRevision = localSettingsRevision;
   return enqueueWrite(async () => {
+    if (generation !== loadGeneration) return false;
     const before = settings;
     if (localSettingsRevision !== localRevision) {
       if (!(await adoptHostSettings())) {
+        if (generation !== loadGeneration) return false;
         // The read failed, so there is no merged document to apply. The next
         // state read or reload still sees the host's copy; do not replace this
         // process's copy with the stale event.
@@ -758,6 +783,7 @@ async function onHostSettingsChanged(next) {
       settings = next;
       settingsRevision += 1;
     }
+    if (generation !== loadGeneration) return false;
     // A source switch in the host's own settings UI has to reach discovery the
     // same way the panel's does: the cached sign-in list was read while the
     // source was off, and the cache says nothing about that. Compare against
@@ -765,8 +791,8 @@ async function onHostSettingsChanged(next) {
     const toggled = Object.values(SOURCE_SETTING_KEYS)
       .some((key) => Object.hasOwn(settings, key) && before[key] !== settings[key]);
     if (toggled) resetDiscoveryCaches();
-    await applySettingsEverywhere(toggled);
-    return true;
+    const applied = await applySettingsEverywhere(toggled);
+    return applied !== false && generation === loadGeneration;
   });
 }
 
@@ -778,6 +804,7 @@ async function onHostSettingsChanged(next) {
  * document to merge.
  */
 async function applySettingsEverywhere(toggled) {
+  const generation = loadGeneration;
   applySettingsToCore();
   traeAccountRows = traeAccountRows.filter((row) => regionEnabled("trae", row.region));
   qoderAccountRows = qoderAccountRows.filter((row) => regionEnabled("qoder", row.region));
@@ -787,8 +814,11 @@ async function applySettingsEverywhere(toggled) {
   // what was there, and reconciling would start gateways for a stopped plugin.
   if (!serviceStopped) {
     await reconcileTraeGateways();
+    if (!stillLoaded(generation)) return false;
     await reconcileQoderGateways();
+    if (!stillLoaded(generation)) return false;
   }
+  if (generation !== loadGeneration) return false;
   syncDeclaration();
   // The cached billing answers belong to the accounts the last switch left in
   // the pool, so only a switch invalidates them. Blanking them on every edit
@@ -1233,10 +1263,10 @@ function sourceModelView(key, model, native) {
     ...Array.isArray(native.thinkingLevels) && native.thinkingLevels.length > 0
       ? { nativeThinkingLevels: [...native.thinkingLevels] }
       : {},
-    // The user's level list, when they set one. Every other field here has a
-    // `native` twin beside it; this one has none because a gateway publishes
-    // whatever levels it advertises rather than a stored default, and the
-    // declaration decides what to do with an edited list.
+    // The user's level list, when they set one. The fields above carry a
+    // `native` twin beside them; this one and `multiplier` do not, because a
+    // gateway publishes whatever levels it advertises rather than a stored
+    // default, and the declaration decides what to do with an edited list.
     ...Array.isArray(override.thinkingLevels) && override.thinkingLevels.length > 0
       ? { thinkingLevels: override.thinkingLevels }
       : {},
@@ -1456,6 +1486,15 @@ async function settleWithin(work, budgetMs) {
   }
 }
 
+async function waitForRuntimeStops(getStops = () => pendingRuntimeStops, deadline = Date.now() + PORT_RESERVE_ATTEMPTS * PORT_RESERVE_INTERVAL_MS) {
+  while (true) {
+    const stops = getStops();
+    if (!stops || stops.length === 0) return;
+    const left = deadline - Date.now();
+    if (left <= 0 || await settleWithin(Promise.allSettled(stops), left) === undefined) return;
+  }
+}
+
 /**
  * Try to bind one specific port once.
  *
@@ -1541,10 +1580,7 @@ function modelDisplayName(model) {
  *
  * An alias the user typed is used verbatim: it is a name, not a catalog row, so
  * appending a cost suffix to it would edit the user's own text back. Without an
- * alias the catalog name keeps its suffix, which is the existing behaviour. The
- * one exception is not this function's: a name two account pools both publish
- * gains its region in `disambiguateModelLabels`, because the chip beside the
- * composer has nothing else to tell the two pools apart.
+ * alias the catalog name keeps its suffix, which is the existing behaviour.
  */
 function modelLabel(model) {
   const alias = typeof model.alias === "string" ? model.alias.trim() : "";
@@ -1612,19 +1648,19 @@ function modelTag(source, region) {
  * carry the tag from an earlier write). Stripping the tag before counting makes
  * the pass idempotent: run on its own output it returns the same labels, so a
  * pass that changed nothing compares equal and does not rewrite the manifest.
- * Only this row's own tag is removed, and only in the two shapes this pass
- * produces, so a name that happens to end in parentheses keeps it.
+ * Only this row's own tag is removed, so a name that happens to end in
+ * parentheses keeps it.
  */
 function stripModelTag(name, tag) {
   if (tag === "" || !name.endsWith(")")) return name;
   const head = name.lastIndexOf(" (" + tag);
   if (head <= 0) return name;
   const tail = name.slice(head + tag.length + 2);
-  return tail === ")" || /^ · [^()]*\)$/.test(tail) ? name.slice(0, head).trim() : name;
+  return tail === ")" ? name.slice(0, head).trim() : name;
 }
 
 /**
- * Make every published model label unique across the whole declaration.
+ * Give every colliding published name its pool, so the chip can tell them apart.
  *
  * Two WorkBuddy regions publish one catalog, so the same name reaches the host
  * twice. The host keys a model by provider and id and is happy with that, but
@@ -1637,6 +1673,10 @@ function stripModelTag(name, tag) {
  * position alone, and a chip the host had not re-imported yet would answer with
  * that pool's balance while another one is selected. Tagged on both sides, an
  * ambiguous name answers nothing, which is the rule this readout follows.
+ *
+ * The tag is the pool's, never the model id: a label that spells out an internal
+ * id tells the user nothing they can act on, and the same two rows are already
+ * separated by provider and id inside the host.
  */
 function disambiguateModelLabels(providers) {
   const keyOf = (label) => String(label ?? "").trim().toLowerCase();
@@ -1650,7 +1690,6 @@ function disambiguateModelLabels(providers) {
         providerIndex,
         modelIndex,
         tag,
-        id: String(model.id || "").trim(),
         base: stripModelTag(raw, tag),
         label: "",
       });
@@ -1662,26 +1701,17 @@ function disambiguateModelLabels(providers) {
     return counts;
   };
   const baseCounts = countOf(flat.map((row) => row.base));
-  for (const row of flat) {
-    row.label = baseCounts.get(keyOf(row.base)) > 1 && row.tag !== ""
-      ? row.base + " (" + row.tag + ")"
-      : row.base;
-  }
-  // One provider that published the same name twice is still ambiguous here,
-  // and the model id is the only thing left that separates those rows.
-  const taggedCounts = countOf(flat.map((row) => row.label));
-  for (const row of flat) {
-    if (taggedCounts.get(keyOf(row.label)) <= 1) continue;
-    const detail = row.tag === "" ? row.id : row.tag + " · " + row.id;
-    row.label = row.base + " (" + detail + ")";
-  }
+  // A colliding name from a pool that has a tag takes it. Every other row keeps
+  // the name the vendor published: an id in the label is not a name, and the two
+  // rows are already separated by provider and id inside the host. The alias
+  // still travels for every row, because the chip prints the alias and the
+  // credit readout looks the model up by it.
   const out = providers.map((provider) => ({ ...provider, models: [...(provider.models || [])] }));
   for (const row of flat) {
     const models = out[row.providerIndex].models;
-    // The alias is what the host's model chip prints, so the label has to travel
-    // there too: with only `name` tagged, a shared name's chip falls back to the
-    // model id and the credit readout has nothing to look up.
-    models[row.modelIndex] = { ...models[row.modelIndex], name: row.label, alias: row.label };
+    const collides = baseCounts.get(keyOf(row.base)) > 1;
+    const label = collides && row.tag !== "" ? row.base + " (" + row.tag + ")" : row.base;
+    models[row.modelIndex] = { ...models[row.modelIndex], name: label, alias: label };
   }
   return out;
 }
@@ -1845,12 +1875,33 @@ function syncDeclaration() {
   // published a stale model list for as long as the source stayed switched on -
   // which is what the rule above says must not happen.
   const warming = warmingGatewayIds();
-  const retained = manifestProviders().filter((provider) => activeIds.has(provider.id)
-    && !currentIds.has(provider.id)
-    && warming.has(provider.id));
+  const retained = manifestProviders().flatMap((provider) => {
+    if (!activeIds.has(provider.id) || currentIds.has(provider.id) || !warming.has(provider.id)) return [];
+    const rebound = warmingDescriptor(provider);
+    return rebound === undefined ? [] : [rebound];
+  });
   const result = writeDeclaration([...current, ...retained]);
   runtimeState.write = result;
   return result;
+}
+
+/** Rebind a retained roster to the address the current run serves on. */
+function warmingDescriptor(provider) {
+  for (const [region, id] of Object.entries(PROVIDER_ID_BY_REGION)) {
+    if (id !== provider.id) continue;
+    const runtime = runtimes.get(region);
+    if (runtime?.baseUrl === PLACEHOLDER_BASE_URL) return undefined;
+    return { ...provider, baseUrl: descriptorFor(region).baseUrl };
+  }
+  for (const [region, id] of Object.entries(TRAE_PROVIDER_ID_BY_REGION)) {
+    if (id !== provider.id) continue;
+    return { ...provider, baseUrl: descriptorForTrae(region).baseUrl };
+  }
+  for (const [region, id] of Object.entries(QODER_PROVIDER_ID_BY_REGION)) {
+    if (id !== provider.id) continue;
+    return { ...provider, baseUrl: descriptorForQoder(region).baseUrl };
+  }
+  return undefined;
 }
 
 /**
@@ -1869,7 +1920,12 @@ function warmingGatewayIds() {
     // No runtime yet, or one mid-connect: the roster is still on its way. A
     // region whose start failed is not on its way - it is not coming.
     if (gatewayStartFailures.has(region)) continue;
-    if (runtime === undefined || runtime.connecting !== null) ids.add(PROVIDER_ID_BY_REGION[region]);
+    if (runtime === undefined || runtime.connecting !== null) {
+      ids.add(PROVIDER_ID_BY_REGION[region]);
+    } else {
+      const pool = core.pool?.status();
+      if (pool?.lastScanAtMs === 0 && pool.scanning === true) ids.add(PROVIDER_ID_BY_REGION[region]);
+    }
   }
   for (const [source, gateways, regions, idByRegion] of [
     ["trae", traeGateways, activeTraeRegions(), TRAE_PROVIDER_ID_BY_REGION],
@@ -2122,6 +2178,30 @@ async function createSourceRuntime(source, region) {
   return entry;
 }
 
+function trackSourceWork(key, stopping) {
+  const stops = sourceGatewayStops.get(key) ?? [];
+  sourceGatewayStops.set(key, stops);
+  stops.push(stopping);
+  const forget = () => {
+    const index = stops.indexOf(stopping);
+    if (index !== -1) stops.splice(index, 1);
+    if (stops.length === 0 && sourceGatewayStops.get(key) === stops) sourceGatewayStops.delete(key);
+  };
+  stopping.then(forget, forget);
+  return stopping;
+}
+
+function trackSourceStop(source, region, gateway) {
+  const stopping = (async () => {
+    try {
+      await gateway.close();
+    } catch (error) {
+      log("warn", "[" + source + ":" + region + "] gateway did not close cleanly: " + safeMessage(error));
+    }
+  })();
+  return trackSourceWork(sourceKey(source, region), stopping);
+}
+
 /** Start and stop one source's gateways so its map matches the source switch exactly. */
 async function reconcileSourceGateways(source) {
   const spec = SOURCE_SPECS[source];
@@ -2133,11 +2213,7 @@ async function reconcileSourceGateways(source) {
     if (active.includes(region)) continue;
     spec.gateways.delete(region);
     sourceStartFailures.delete(sourceKey(source, region));
-    try {
-      await entry.gateway.close();
-    } catch (error) {
-      log("warn", "[" + source + ":" + region + "] gateway did not close cleanly: " + safeMessage(error));
-    }
+    await trackSourceStop(source, region, entry.gateway);
   }
   for (const region of active) {
     // A stopped service, a source switch flipped off while the directory read
@@ -2146,21 +2222,34 @@ async function reconcileSourceGateways(source) {
     // close it. Same resolution as `startRuntimes`.
     if (serviceStopped || !stillLoaded(generation) || !regionEnabled(source, region) || spec.gateways.has(region)) continue;
     const key = sourceKey(source, region);
+    const deadline = Date.now() + PORT_RESERVE_ATTEMPTS * PORT_RESERVE_INTERVAL_MS;
+    if (sourceGatewayStops.has(key)) await waitForRuntimeStops(() => sourceGatewayStops.get(key), deadline);
+    if (!stillLoaded(generation) || !regionEnabled(source, region) || spec.gateways.has(region)) continue;
     // Two passes can reconcile the same source at once (a rescan beside the
     // background refresh). Without a shared promise both bind a gateway; the
     // loser's failure then overwrites the winner's health with EADDRINUSE. The
     // second caller waits for that start, so a rescan still sees the gateway.
     const pending = sourceGatewayStarts.get(key);
     if (pending !== undefined) {
-      await pending.catch(() => {});
-      continue;
+      try {
+        await pending;
+      } catch {
+        continue;
+      }
+      if (sourceGatewayStops.has(key)) await waitForRuntimeStops(() => sourceGatewayStops.get(key), deadline);
+      if (!stillLoaded(generation) || !regionEnabled(source, region) || spec.gateways.has(region)) continue;
+      const newer = sourceGatewayStarts.get(key);
+      if (newer !== undefined && newer !== pending) {
+        await newer.catch(() => {});
+        continue;
+      }
     }
     const starting = createSourceRuntime(source, region);
     sourceGatewayStarts.set(key, starting);
     try {
       const entry = await starting;
       if (!stillLoaded(generation) || !regionEnabled(source, region) || spec.gateways.has(region)) {
-        await entry.gateway.close();
+        await trackSourceStop(source, region, entry.gateway);
       } else {
         spec.gateways.set(region, entry);
         sourceStartFailures.delete(key);
@@ -2424,7 +2513,10 @@ async function startRuntimes() {
   if (!stillLoaded(generation)) return;
   // Gateways a settings change retired may still be closing; their ports are
   // only reusable once those closes settle. See `pendingRuntimeStops`.
-  if (pendingRuntimeStops.length > 0) await Promise.all(pendingRuntimeStops.splice(0));
+  if (pendingRuntimeStops.length > 0) {
+    await waitForRuntimeStops();
+    if (!stillLoaded(generation)) return;
+  }
   await Promise.all(activeRegions().map(async (region) => {
     if (runtimes.has(region)) return;
     try {
@@ -2495,7 +2587,7 @@ async function settleStartedRuntime(region, runtime, unwanted) {
   // one branch: `unwanted` says nobody is waiting for it, and `held` says another
   // runtime already serves the region. Neither can keep it.
   if (unwanted || held !== undefined) {
-    await stopRuntime(runtime);
+    await trackRuntimeStop(runtime);
     return false;
   }
   runtimes.set(region, runtime);
@@ -2511,13 +2603,34 @@ async function stopRuntime(runtime) {
   if (runtime.stopped === true) return;
   runtime.stopped = true;
   runtime.signedIn = false;
-  // The next start for this region begins from a clean slate: a failure left
-  // recorded here would keep a gateway that is being closed on purpose out of
-  // the "still warming" set the whole time it is down.
-  gatewayStartFailures.delete(runtime.region);
-  if (runtime.shim) await runtime.shim.close().catch((error) => {
+  // A late, unowned bind must not clear a newer activation's failure.
+  if (runtimes.get(runtime.region) === runtime) gatewayStartFailures.delete(runtime.region);
+  try {
+    if (runtime.shim) await runtime.shim.close();
+  } catch (error) {
     log("warn", "[workbuddy:" + runtime.region + "] gateway did not close cleanly: " + safeMessage(error));
-  });
+  }
+}
+
+function trackRuntimeWork(stopping) {
+  pendingRuntimeStops.push(stopping);
+  const forget = () => {
+    const index = pendingRuntimeStops.indexOf(stopping);
+    if (index !== -1) pendingRuntimeStops.splice(index, 1);
+  };
+  stopping.then(forget, forget);
+  return stopping;
+}
+
+function trackRuntimeStop(runtime) {
+  return trackRuntimeWork(stopRuntime(runtime));
+}
+
+function retireStartingGateways() {
+  for (const starting of runtimeStarts.values()) trackRuntimeWork(starting);
+  runtimeStarts.clear();
+  for (const [key, starting] of sourceGatewayStarts) trackSourceWork(key, starting);
+  sourceGatewayStarts.clear();
 }
 
 /**
@@ -2816,7 +2929,7 @@ async function refreshAll(reason, force) {
       // same list before it binds, for the same reason - see
       // `pendingRuntimeStops`.
       if (pendingRuntimeStops.length > 0) {
-        await Promise.all(pendingRuntimeStops.splice(0));
+        await waitForRuntimeStops();
         // Checked before the bind rather than only after it: a service that
         // stopped during the drain used to cost one full port reservation and
         // shim bind before the pass discovered it was stale.
@@ -2832,6 +2945,7 @@ async function refreshAll(reason, force) {
       try {
         runtime = await settleWithin(started, left());
       } catch (error) {
+        if (!stillLoaded(generation)) return stalePass();
         // A shim that could not bind (its port taken between the reservation and
         // the listen) rejects here. Letting it through failed the whole pass,
         // and with it the declaration write for every region that was fine.
@@ -2843,7 +2957,7 @@ async function refreshAll(reason, force) {
         // The late arrival is released only when nobody registered it: a second
         // caller shares this promise, and its own `runtimes.set` is the one that
         // matters.
-        started.then((late) => { if (runtimes.get(region) !== late) return stopRuntime(late); }, () => { /* it failed; nothing was bound */ });
+        started.then((late) => { if (runtimes.get(region) !== late) return trackRuntimeStop(late); }, () => { /* it failed; nothing was bound */ });
         continue;
       }
       // The stop can land while the shim binds: `runtimes.clear()` has already
@@ -3287,7 +3401,7 @@ function reconcileRuntimes() {
       // The close is recorded rather than awaited: this runs synchronously from
       // settings application, and `startRuntimes` drains the list before it
       // binds, which is where the port the close is releasing gets reused.
-      pendingRuntimeStops.push(stopRuntime(runtime));
+      trackRuntimeStop(runtime);
       runtimes.delete(region);
     }
   }
@@ -5687,17 +5801,16 @@ async function redeemAccountStreak(account) {
     }
   }
   // Draws come only from the tiers just redeemed, so this runs after them and
-  // pays only when a tier actually opened a chance. The prize payload is passed
-  // through as-is and logged: its shape is the campaign's, not the API's, so
-  // there is no field to read a credit out of.
+  // pays only when a tier actually opened a chance. The prize payload stays out
+  // of logs because its shape is controlled by the remote campaign.
   if (signal.aborted) return result;
   try {
     const chances = await core.client.lotteryChances(account.credential);
     for (let draw = 0; draw < chances; draw += 1) {
       if (signal.aborted) return result;
-      const prize = await core.client.drawLottery(account.credential);
+      await core.client.drawLottery(account.credential);
       detail.lottery += 1;
-      log("info", "streak " + accountLogTag(account.label) + ": draw " + (draw + 1) + "/" + chances + " " + JSON.stringify(prize).slice(0, 160));
+      log("info", "streak " + accountLogTag(account.label) + ": draw " + (draw + 1) + "/" + chances);
     }
   } catch (error) {
     detail.failed += 1;
@@ -6038,9 +6151,9 @@ async function travelAllAccounts() {
 
 /**
  * Claim today's Qoder round for every signed-in Qoder account whose region is
- * switched on. Each account is read first: one that already collected, or that
- * has no claimable round (international without the app's machine identity),
- * costs one GET and no mutation. One account failing never stops the rest.
+ * switched on. Each account is read first: one that already collected, or whose
+ * campaign list names no open round, costs one GET and no mutation. One account
+ * failing never stops the rest.
  */
 async function qoderCheckinAll() {
   const counts = { claimed: 0, skipped: 0, failed: 0, retry: false };
@@ -6572,7 +6685,9 @@ function stopAccountWatch() {
  * panel does not trigger detection of its own.
  */
 async function publishDeclarationEarly() {
+  const generation = loadGeneration;
   await adoptHostSettings();
+  if (!stillLoaded(generation)) return;
   // Published while disabled too: a manifest still carrying provider rows would
   // have the host offer a gateway this run never starts, until something else
   // rewrote it. `syncDeclaration` clears the rows when every source is off,
@@ -6594,9 +6709,13 @@ async function publishDeclarationEarly() {
   const bootstrapDeadline = Date.now() + LOAD_BOOTSTRAP_BUDGET_MS;
   const bootstrapLeft = () => Math.max(0, bootstrapDeadline - Date.now());
   await settleWithin(reconcileTraeGateways(), bootstrapLeft());
+  if (!stillLoaded(generation)) return;
   await settleWithin(reconcileQoderGateways(), bootstrapLeft());
+  if (!stillLoaded(generation)) return;
   if (activeRegions().length > 0) await settleWithin(core.pool.scan(), bootstrapLeft());
+  if (!stillLoaded(generation)) return;
   await settleWithin(startRuntimes(), bootstrapLeft());
+  if (!stillLoaded(generation)) return;
   // Bounded like every other read: the host gives `onLoad` seconds, and a roster
   // that does not answer inside them still leaves a declaration to publish -
   // the fallback roster plus the saved selection - while the read it cut short
@@ -6609,6 +6728,7 @@ async function publishDeclarationEarly() {
       log("warn", runtime.region + " failed to start during load: " + runtime.lastError);
     }
   })), LOAD_ROSTER_BUDGET_MS);
+  if (!stillLoaded(generation)) return;
   const written = syncDeclaration();
   if (written.ok !== true) log("warn", "declaration not written: " + String(written.error));
   // The count, not the path: the panel footer is the place that says where the
@@ -6627,6 +6747,10 @@ async function onServiceStart() {
   // perform the claims nobody would read. The entries re-arm for themselves,
   // which is what keeps a hand-started pass after a stop working.
   if (warmAbort.signal.aborted) warmAbort = new AbortController();
+  // The host cannot cancel a setSettings call already in flight. Let it land
+  // before this activation reads, or storage can move behind its cached copy.
+  await writeChain;
+  if (!stillLoaded(generation)) return;
   await adoptHostSettings();
   if (!stillLoaded(generation)) return;
   if (settings.enabled === false) {
@@ -6678,6 +6802,7 @@ async function onServiceStart() {
 
 async function onServiceStop() {
   serviceStopped = true;
+  core.pool?.clear();
   // Retires every pass this activation still has in flight: each one checks the
   // generation after its next await and gives up instead of re-opening what
   // this teardown is closing.
@@ -6700,36 +6825,29 @@ async function onServiceStop() {
   // A retry that outlived this stop would fire into the activation that follows
   // it and trigger a full refresh pass nobody asked for.
   clearModelRetries();
-  const closing = Array.from(runtimes.values()).map(stopRuntime);
+  const closing = Array.from(runtimes.values()).map(trackRuntimeStop);
   runtimes.clear();
   // A bind still in flight belongs to this activation; its owner releases it
   // through the post-await check in `startRuntimes` or the refresh pass.
-  runtimeStarts.clear();
-  sourceGatewayStarts.clear();
-  for (const entry of [...traeGateways.values(), ...qoderGateways.values()]) {
-    closing.push(entry.gateway.close().catch((error) => {
-      log("warn", "[" + entry.source + ":" + entry.region + "] gateway did not close cleanly: " + safeMessage(error));
-    }));
+  retireStartingGateways();
+  for (const [source, gateways] of [["trae", traeGateways], ["qoder", qoderGateways]]) {
+    for (const [region, entry] of gateways) closing.push(trackSourceStop(source, region, entry.gateway));
+    gateways.clear();
   }
-  traeGateways.clear();
-  qoderGateways.clear();
   // The failures belong to the activation that produced them: a source reloaded
   // into a working state must not keep reading as failed, and a region whose
   // close above was deliberate is not a drift.
   gatewayStartFailures.clear();
   sourceStartFailures.clear();
   await Promise.all(closing);
-  // A run recorded here was waiting on a runtime this teardown has just closed.
-  // Left in place it stays reachable through `startRuntimes` until the next
-  // activation drains it, holding a catalog nothing serves.
-  pendingRuntimeStops.length = 0;
 }
 
 async function onLoad() {
   // Cleared here, not only in `onServiceStart`: `publishDeclarationEarly` below
   // starts the gateways, and every creator refuses to run while this is set.
   serviceStopped = false;
-  loadGeneration += 1;
+  const generation = ++loadGeneration;
+  core.pool?.clear();
   // A reload can arrive without the previous unload. Abort the pass it still
   // has and stop its timers. The Trae and Qoder gateways are left alone:
   // `onUnload` closes them, and clearing the maps here dropped those
@@ -6797,19 +6915,22 @@ async function onLoad() {
   // maps are deliberately left alone: their gateway options are closures over
   // module-level functions, and clearing them dropped directories the next
   // warm-up had not yet read back.
-  for (const runtime of Array.from(runtimes.values())) pendingRuntimeStops.push(stopRuntime(runtime));
+  for (const runtime of Array.from(runtimes.values())) trackRuntimeStop(runtime);
   runtimes.clear();
   // A bind that outlived the previous activation must not make this one skip
   // its own start; its owner closes it after seeing the new generation.
-  runtimeStarts.clear();
-  sourceGatewayStarts.clear();
+  retireStartingGateways();
+  // A write issued by the previous activation may already be inside the host.
+  // Waiting here makes the read below the last word rather than a stale copy.
+  await writeChain;
+  if (!stillLoaded(generation)) return;
   await adoptHostSettings();
   // The teardown can run while this load is still between its awaits. An
   // activation disabled a moment after it started would otherwise register its
   // service and its check-in timer into a load that is already
   // gone, and nothing would ever stop them. Every step past this point is
   // re-checked the same way.
-  if (serviceStopped) return;
+  if (!stillLoaded(generation)) return;
   try {
     packageRoot = __dirname;
   } catch {
@@ -6819,21 +6940,26 @@ async function onLoad() {
   // loaded, and every Max decision is made against it rather than against what
   // this process writes afterwards.
   captureHostWindows();
+  let nextDataPath;
   try {
-    dataPath = await pi.plugin.getDataPath();
+    nextDataPath = await pi.plugin.getDataPath();
   } catch (error) {
-    dataPath = "";
+    nextDataPath = "";
     log("warn", "no plugin data path: " + safeMessage(error));
   }
+  if (!stillLoaded(generation)) return;
+  dataPath = nextDataPath;
   // Read before the check-in timer can start: the timer's first tick would
   // otherwise re-run a day an earlier run already collected.
   loadCheckinSlots();
-  if (serviceStopped) return;
+  if (!stillLoaded(generation)) return;
   // Reload right away when a previous id's file was taken over: the settings
   // were read above, before the copy existed, and a load that publishes the
   // declaration first would publish it with the defaults.
-  if (await adoptPreviousDataDir()) await adoptHostSettings();
-  if (serviceStopped) return;
+  const adoptedPreviousData = await adoptPreviousDataDir();
+  if (!stillLoaded(generation)) return;
+  if (adoptedPreviousData) await adoptHostSettings();
+  if (!stillLoaded(generation)) return;
   pi.services.register({ id: SERVICE_ID, start: onServiceStart, stop: onServiceStop });
   // The host pushes a settings document whenever the user edits this plugin in
   // its own settings UI. Without this listener those edits only took effect
@@ -6858,7 +6984,7 @@ async function onUnload() {
   } catch (error) {
     log("warn", "could not publish the declaration during unload: " + safeMessage(error));
   }
-  await onServiceStop();
+  const stopped = onServiceStop();
   probeCache.clear();
   // The module-level state a load builds is per-load state: a hold, an expiry
   // note or a rotation cursor left behind outlives the sign-ins it was keyed
@@ -6874,6 +7000,7 @@ async function onUnload() {
   // reload would otherwise be answered with a state this activation never issued.
   deviceLogins.clear();
   unsubscribeFromHostSettings();
+  await stopped;
 }
 
 function composerPointsEnabled() {

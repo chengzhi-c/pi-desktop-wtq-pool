@@ -72,6 +72,7 @@ async function loadPlugin(t, temporary, options = {}) {
   })))
 
   let service
+  const logs = []
   // Captured rather than armed: a pass that arms a timer would escape the test,
   // and there is no schedule left for one to serve anyway.
   const timers = new Set()
@@ -80,7 +81,7 @@ async function loadPlugin(t, temporary, options = {}) {
     // land where they were written to.
     require: createRequire(path.join(root, 'main.js')),
     module: { exports: {} }, __dirname: temporary,
-    console: { log() {} }, AbortController, AbortSignal, fetch,
+    console: { log: (...args) => logs.push(args.join(' ')) }, AbortController, AbortSignal, fetch,
     Date, setTimeout, clearTimeout,
     setInterval: (callback, ms) => {
       const timer = { callback, ms, at: Date.now() + ms }
@@ -102,17 +103,17 @@ async function loadPlugin(t, temporary, options = {}) {
   const plugin = context.module.exports
   await plugin.onLoad()
   await service.start()
-  return { plugin, spent, timers }
+  return { plugin, spent, timers, logs }
 }
 
 test('the keep-alive refreshes a token that is close to expiry', async (t) => {
   const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'xdpool-keepalive-'))
-  const { plugin, spent } = await loadPlugin(t, temporary, { expiresInMs: 60 * 1000 })
+  const { plugin, spent, logs } = await loadPlugin(t, temporary, { expiresInMs: 60 * 1000 })
   try {
     const answer = await plugin.onPanelInvoke('xd.keepAlive')
     assert.deepEqual(answer.keepAlive, {
       at: answer.keepAlive.at, refreshed: 1, fresh: 0, failed: 0, noToken: 0,
-    }, 'one account inside the margin is refreshed')
+    }, `one account inside the margin is refreshed: ${logs.join(' | ')}`)
     assert.ok(spent.some(([name]) => name === 'refreshToken'), 'and the refresh endpoint was actually called')
   } finally {
     await plugin.onUnload()

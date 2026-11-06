@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.chengzhi-c.pi-desktop-wtq-pool",
   "name": "WTQ Pool",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接入 PI-Desktop。限流或额度用尽时自动换号，三家各有开关。",
   "author": "chengzhi-c (PI-Desktop port of XDTrees/dsh-workbuddy-xdpool)",
   "license": "MIT",
@@ -142,5 +142,5 @@
     ],
     "providers": []
   },
-  "changelog": "1.2.2：修复 Kimi 空消息、签到反馈、并发登录、账号扫描与成长任务取消，收紧本地预览的访问范围。1.2.0 起提供商 ID 为 wtqpool-*，从 1.1.x 升级后需重新选择模型。"
+  "changelog": "1.2.3：兼容 WorkBuddy 加密登录与含工具调用的流式回合，加强账号并发、重载扫描、网关重启和凭据脱敏。1.2.0 起提供商 ID 为 wtqpool-*，从 1.1.x 升级后需重新选择模型。"
 }

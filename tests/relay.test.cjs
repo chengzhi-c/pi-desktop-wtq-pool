@@ -279,6 +279,44 @@ test('a truncated refusal body keeps the status the upstream chose', async () =>
 })
 
 /**
+ * A refusal body that never ends is abandoned, not waited out.
+ *
+ * The Trae relay read its refusals with `response.text()`, which has no bound at
+ * all: an upstream that answers 401 and then holds the socket open kept that
+ * attempt (and the account's rotation budget) for as long as the peer felt like
+ * holding it, and the 1024-byte preview was cut only after the whole body had
+ * arrived. Qoder's relay already read its refusals through `readErrorBody`; the
+ * Trae path now does too, and this pins the bound with a surface that never
+ * closes instead of an upstream that happens to.
+ *
+ * The echoed credential matters as much: a refusal body quotes the header the
+ * request was sent with, and this response is read by paths other than the
+ * gateway's own error writer.
+ */
+test('an endless refusal body is bounded and its echo is redacted', async () => {
+  const { openTraeResponse } = require('../lib/trae-shim')
+  const secret = 'abcdef1234567890'
+  let cancelled = false
+  const endless = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(`{"error":{"message":"Cloud-IDE-JWT ${secret} rejected"`))
+      // Never closes and never resolves a further read.
+    },
+    pull() { return new Promise(() => {}) },
+    cancel() { cancelled = true },
+  })
+  const started = Date.now()
+  const relayed = await openTraeResponse(new Response(endless, { status: 401 }), 'fixture-model', { refusalReadMs: 50 })
+  const elapsed = Date.now() - started
+  assert.equal(relayed.status, 401, 'the status the upstream chose must survive')
+  const body = await relayed.json()
+  assert.equal(body.error.message.includes(secret), false, 'the echoed credential must not ride out')
+  assert.match(body.error.message, /\[redacted\]/, 'and must be replaced, not merely dropped')
+  assert.equal(elapsed < 2000, true, `the refusal read took ${elapsed}ms instead of its bound`)
+  assert.equal(cancelled, true, 'the abandoned body must be cancelled, or its socket stays open')
+})
+
+/**
  * A login-expired frame buried under a details object still reads as one.
  *
  * Qoder nests the real message below `details`/`error`. Unwrapping walked into
@@ -318,6 +356,48 @@ test('a Qoder retry hint is read from wherever the frame carries it', () => {
   assert.equal(retryAfterSecondsOf({ message: 'no hint here' }), 0)
 })
 
+
+/**
+ * An acknowledgement frame is not a refusal, whatever words it carries.
+ *
+ * `{"code":0}` and `{"code":200}` are how Qoder acks a container it accepted.
+ * Clearing the code while keeping the `message` as the detail left
+ * `{"code":0,"message":"success"}` looking like a named failure: a healthy turn
+ * answered 502 with the word "success", and a mid-stream ack truncated the
+ * answer by turning the frame into an error chunk.
+ */
+test('a Qoder acknowledgement frame with words is not a refusal', () => {
+  const { decodeQoderFrame } = require('../lib/qoder-sse')
+  for (const frame of ['{"code":0,"message":"success"}', '{"code":200,"message":"ok"}', '{"code":"0","message":"ok"}']) {
+    const decoded = decodeQoderFrame(frame)
+    assert.equal(decoded.type, 'unknown', `${frame} must not be a failure`)
+  }
+  // A business code in the error spelling still means what it says.
+  assert.equal(decodeQoderFrame('{"errorCode":"10605","message":"Login expired"}').type, 'failure')
+})
+
+/**
+ * A refusal on the envelope survives the frame's `body` wrapper.
+ *
+ * Qoder wraps the answer one level down in `body`, and puts the refusal beside
+ * that wrapper rather than inside it. Reading only the inner object dropped
+ * `errorCode`/`code`, so `{"body":{"choices":[]},"code":401,"message":"Login
+ * expired"}` reached the decoder as a nameless object: the turn answered 200
+ * with an empty stream, never rotated to another account, and the client was
+ * never told to sign in again.
+ */
+test('a Qoder refusal beside a body wrapper still counts', () => {
+  const { decodeQoderFrame } = require('../lib/qoder-sse')
+  const stringBody = decodeQoderFrame('{"body":"{\\"choices\\":[]}","errorCode":"105","message":"TOKEN_EXPIRE"}')
+  assert.equal(stringBody.type, 'failure')
+  assert.equal(stringBody.code, '105')
+  assert.match(stringBody.detail, /TOKEN_EXPIRE/)
+  const objectBody = decodeQoderFrame('{"body":{"choices":[]},"code":401,"message":"Login expired"}')
+  assert.equal(objectBody.type, 'failure')
+  assert.equal(objectBody.code, '401')
+  // The wrapper's content still wins when the envelope carries no refusal.
+  assert.equal(decodeQoderFrame('{"body":"{\\"choices\\":[{\\"delta\\":{\\"content\\":\\"hi\\"}}]}"}').type, 'chunk')
+})
 
 /**
  * A pass that runs out of budget mid-start releases what it already bound.

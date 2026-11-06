@@ -19,6 +19,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const vm = require('node:vm')
 const { createRequire } = require('node:module')
+const { withoutComments } = require('../docs/capture-shape.cjs')
 
 const root = path.join(__dirname, '..')
 
@@ -477,11 +478,19 @@ test('the README screenshots show the panel the repository ships', () => {
   assert.ok(fs.existsSync(stampAt), 'docs/preview-capture.json has to exist: the capture writes it')
   const stamp = JSON.parse(fs.readFileSync(stampAt, 'utf8'))
   const digest = (file) => crypto.createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex')
+  // Comments and blank lines never reach a pixel, so the capture records each
+  // file with them gone: an edit to either never made a picture stale, and
+  // comparing whole files forced a re-stamp on every one of them. The
+  // screenshots keep their own whole-file hashes below, because those bytes are
+  // the picture.
+  const shape = (file) => crypto.createHash('sha256')
+    .update(withoutComments(fs.readFileSync(path.join(root, file), 'utf8'), file))
+    .digest('hex')
 
   assert.deepEqual(Object.keys(stamp.rendered).sort(), [...rendered].sort(),
     'the capture has to name every source that decides what the screenshots show')
   for (const file of rendered) {
-    assert.equal(stamp.rendered[file], digest(file),
+    assert.equal(stamp.rendered[file], shape(file),
       `${file} changed since the screenshots were taken: re-capture, then run node docs/stamp.cjs`)
   }
   assert.deepEqual(Object.keys(stamp.shots).sort(), [...shots].sort(),

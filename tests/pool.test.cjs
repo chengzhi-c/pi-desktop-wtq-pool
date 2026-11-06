@@ -451,6 +451,84 @@ test('a run survives the cooldown it just imposed', async () => {
     `a limit 16 minutes after the last one is still part of the run, so the window stays at the cap (got ${held}ms)`)
 })
 
+/**
+ * A sign-in with no identity stays one account across a renewal.
+ *
+ * The pool keys such a credential by its source path, so a renewal that wrote a
+ * copy into the plugin's directory under a new name became a *second account*:
+ * two ids, one token, and each id spent the one refresh token. The second
+ * rotation was refused and the account got a session hold while a working token
+ * sat beside it. Adoption already refuses this copy; renewal must too.
+ */
+test('a renewal does not split an identity-less sign-in into two accounts', async () => {
+  const dir = scratch('idless')
+  const file = path.join(dir, 'workbuddy-desktop.info')
+  fs.writeFileSync(file, JSON.stringify({
+    auth: {
+      accessToken: 'token-a', refreshToken: 'refresh-a',
+      expiresAt: Date.now() + 120_000, domain: 'www.codebuddy.cn',
+    },
+  }))
+  const dataDir = scratch('idless-data')
+  let rotations = 0
+  const pool = new WorkBuddyAccountPool({
+    authDirs: [dir],
+    dataPath: () => dataDir,
+    client: {
+      refreshToken: async () => {
+        rotations += 1
+        return { accessToken: `token-rot-${rotations}`, refreshToken: `refresh-rot-${rotations}`, expiresInSec: 3600 }
+      },
+    },
+  })
+  await pool.scan()
+  assert.equal(pool.list().length, 1, 'the optional fixture is one account to begin with')
+  const [account] = pool.list()
+  assert.equal(await pool.ensureFresh(account, true), 'refreshed')
+  const rows = await pool.scan()
+  assert.equal(rows.length, 1, 'a renewal must not add a second row for the same sign-in')
+  assert.equal(rows[0].credential.refreshToken, 'refresh-rot-1', 'and the renewed token is the one in force')
+})
+
+/**
+ * A renewal that cannot write its file keeps the token the upstream minted.
+ *
+ * The rotation retires the previous refresh token, so throwing the answer away
+ * loses the account: the old token is spent and the next renewal is refused. A
+ * disk that would not take the file must not cost a credential.
+ */
+test('a renewal whose file write fails keeps the new token in memory', async () => {
+  const dir = scratch('persistfail')
+  writeSignIn(dir, 'workbuddy-desktop', '90000000111')
+  const dataDir = scratch('persistfail-data')
+  let rotations = 0
+  const pool = new WorkBuddyAccountPool({
+    authDirs: [dir],
+    dataPath: () => dataDir,
+    client: {
+      refreshToken: async () => {
+        rotations += 1
+        return { accessToken: `token-rot-${rotations}`, refreshToken: `refresh-rot-${rotations}`, expiresInSec: 3600 }
+      },
+    },
+  })
+  await pool.scan()
+  const [account] = pool.list()
+  // The source is the desktop's file, which this plugin does not own, so the
+  // renewal writes a copy into the pool's own directory. Make that directory a
+  // file so every write under it fails, the way a full disk or a sharing
+  // violation does.
+  const ownDir = path.join(dataDir, 'signins')
+  fs.mkdirSync(dataDir, { recursive: true })
+  fs.writeFileSync(ownDir, 'not a directory')
+  const outcome = await pool.ensureFresh(account, true).catch(() => 'threw')
+  assert.equal(outcome, 'failed', 'the caller is told the renewal did not persist')
+  const [afterRow] = pool.list()
+  assert.equal(afterRow.credential.refreshToken, 'refresh-rot-1',
+    'the minted token is kept; discarding it loses an account the upstream already rotated')
+  assert.equal(rotations, 1)
+})
+
 test('a pool with every account cooling answers the cause, not a 500', async () => {
   const dir = scratch('exhausted')
   writeSignIn(dir, 'workbuddy-desktop', '90000000106')

@@ -391,6 +391,51 @@ test('an account whose first byte never arrives is skipped for the next one', as
   }
 })
 
+/**
+ * Two dead streams in a row must not end the turn before the healthy account
+ * behind them is tried.
+ *
+ * An empty 200 is an answer, not an unreachable host, so it got its own bound
+ * instead of spending the transport cap: with three accounts, two empty and one
+ * healthy, the old shared counter stopped at two and answered 502 without ever
+ * reaching the account that could serve. The advice was wrong too - it blamed
+ * the connection.
+ */
+test('an empty 200 stream does not spend the transport retry budget', async (t) => {
+  const dirs = signInDirs('empty3', 3)
+  t.after(() => { for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true }) })
+  let calls = 0
+  const client = {
+    prepareChatBody: (raw) => JSON.parse(raw),
+    chatStream: async () => {
+      calls += 1
+      if (calls <= 2) {
+        return {
+          ok: true,
+          response: new Response(new ReadableStream({ start(controller) { controller.close() } }), {
+            status: 200, headers: { 'content-type': 'text/event-stream' },
+          }),
+        }
+      }
+      return {
+        ok: true,
+        response: new Response('data: {"choices":[{"delta":{"content":"third"}}]}\n\ndata: [DONE]\n\n', {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        }),
+      }
+    },
+  }
+  const shim = await workbuddyShimFromDirs({ client, models: ['hy3'], dirs })
+  try {
+    const answer = await shim.turn()
+    assert.equal(answer.status, 200, 'the healthy account behind two dead streams still serves')
+    assert.match(answer.text, /third/)
+    assert.equal(calls, 3, 'every account up to the healthy one is tried once')
+  } finally {
+    await shim.close()
+  }
+})
+
 test('an empty 200 stream is a failed attempt, not the end of the turn', async (t) => {
   const dirs = signInDirs('empty', 2)
   t.after(() => { for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true }) })
@@ -453,6 +498,31 @@ for (const [name, chunks, finish] of [
     assert.notEqual(finishAt, -1, 'the terminator alone leaves the turn unfinished')
     assert.ok(finishAt < answer.text.indexOf('data: [DONE]'),
       'clients stop at [DONE], so the finish frame must precede it')
+  } finally {
+    await shim.close()
+  }
+})
+
+test('a completed tool call with a plain stop finish remains executable', async () => {
+  const toolCall = { index: 0, id: 'call_1', type: 'function', function: { name: 'echo', arguments: '{"value":1}' } }
+  const client = {
+    prepareChatBody: (raw) => JSON.parse(raw),
+    chatStream: async () => ({
+      ok: true,
+      response: new Response([
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [toolCall] }, finish_reason: null }] })}\n\n`,
+        'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+        'data: [DONE]\n\n',
+      ].join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    }),
+  }
+  const shim = await workbuddyShim({ client, models: ['hy3'] })
+  try {
+    const answer = await shim.turn()
+    const frames = answer.text.split(/\r?\n\r?\n/).filter((frame) => frame.startsWith('data: '))
+      .map((frame) => frame.slice(6)).filter((data) => data !== '[DONE]').map(JSON.parse)
+    const finish = frames.flatMap((frame) => frame.choices ?? []).find((choice) => choice.finish_reason)?.finish_reason
+    assert.equal(finish, 'tool_calls', 'the host must recognize the tool turn and execute it')
   } finally {
     await shim.close()
   }

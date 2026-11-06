@@ -179,6 +179,30 @@ test('a sealed sign-in keeps its account until the at-rest key is available', as
   }
 })
 
+test('candidateAuthDirs uses the caller environment for default roots', () => {
+  const { candidateAuthDirs } = require('../lib/accounts')
+  const temporary = scratch('auth-roots')
+  if (process.platform === 'win32') {
+    try {
+      const local = path.join(temporary, 'local')
+      const roaming = path.join(temporary, 'roaming')
+      assert.deepEqual(candidateAuthDirs({ LOCALAPPDATA: local, APPDATA: roaming }), [
+        path.join(local, 'CodeBuddyExtension', 'Data', 'Public', 'auth'),
+        path.join(roaming, 'CodeBuddyExtension', 'Data', 'Public', 'auth'),
+      ])
+    } finally { fs.rmSync(temporary, { recursive: true, force: true }) }
+  } else if (process.platform === 'linux') {
+    try {
+      const config = path.join(temporary, 'config')
+      assert.deepEqual(candidateAuthDirs({ XDG_CONFIG_HOME: config }), [
+        path.join(config, 'CodeBuddyExtension', 'Data', 'Public', 'auth'),
+      ])
+    } finally { fs.rmSync(temporary, { recursive: true, force: true }) }
+  } else {
+    fs.rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
 /**
  * Two sign-ins with no identity stay two accounts.
  *
@@ -1186,6 +1210,7 @@ test('a Qoder frame whose choices is not a list is not forwarded as a chunk', ()
 test('an at-rest key that is loaded is not reported as missing', async (t) => {
   const temporary = scratch('xdpool-atrest-test-')
   const stub = path.join(temporary, 'WorkBuddyStub.exe')
+  if (typeof process.geteuid === 'function' && process.geteuid() === 0) t.mock.method(process, 'geteuid', () => 1000)
   // The stub prints the payload the installed app prints; reading it back is
   // what the launcher is stubbed to do, so the fixture is a file rather than a
   // hard-coded string.
@@ -1198,17 +1223,13 @@ test('an at-rest key that is loaded is not reported as missing', async (t) => {
   // The signature pass is a separate call from the registry scan. The fixture
   // stub is not a signed binary, so the pass is answered with the policy's own
   // shape: only this candidate, reported as validly signed.
-  t.mock.method(childProcess, 'execFileSync', (file, args) => {
-    const script = Array.isArray(args) ? args[args.length - 1] : ''
-    if (typeof script === 'string' && script.includes('ConvertTo-Json')) {
-      return JSON.stringify([{ path: stub, status: 'Valid', signer: 'CN=Fixture' }])
-    }
-    return ''
-  })
+  t.mock.method(childProcess, 'execFileSync', () => JSON.stringify([path.parse(stub).root]))
   t.mock.method(childProcess, 'execFile', (file, args, options, callback) => {
     const script = Array.isArray(args) ? args[args.length - 1] : ''
     if (typeof script === 'string' && script.includes('ConvertTo-Json')) {
-      callback(null, JSON.stringify([{ path: stub, status: 'Valid', signer: 'CN=Fixture' }]), '')
+      callback(null, JSON.stringify({ elevated: false, entries: [{
+        path: stub, status: 'Valid', publicKeyHash: '2F95C8391B09328BC42D131C50CC7B4E06F9E2A7B1E3624E14C9070A1BE9CC97',
+      }] }), '')
       return
     }
     if (file !== stub) {
@@ -1331,10 +1352,19 @@ test('a second Qoder read in one process still opens the sealed session', async 
   const { readQoderCredential, resetQoderCredentialCache } = require('../lib/qoder-credentials')
   const { qoderStorageCandidates } = require('../lib/qoder-discovery')
   const temporary = scratch('xdpool-qoder-key-')
-  const restore = { APPDATA: process.env.APPDATA, USERPROFILE: process.env.USERPROFILE, HOME: process.env.HOME }
+  const restore = {
+    APPDATA: process.env.APPDATA, USERPROFILE: process.env.USERPROFILE, HOME: process.env.HOME,
+    PATH: process.env.PATH, PSModulePath: process.env.PSModulePath,
+    SystemRoot: process.env.SystemRoot, windir: process.env.windir, SystemDrive: process.env.SystemDrive,
+  }
   process.env.APPDATA = temporary
   process.env.USERPROFILE = temporary
   process.env.HOME = temporary
+  process.env.PATH = 'C:\\fixture-bin'
+  process.env.PSModulePath = 'C:\\fixture-modules'
+  process.env.SystemRoot = 'C:\\fixture-root'
+  process.env.windir = 'C:\\fixture-root'
+  process.env.SystemDrive = 'Q:'
   const key = Buffer.alloc(32, 7)
   const nonce = Buffer.alloc(12, 3)
   const cipher = createCipheriv('aes-256-gcm', key, nonce)
@@ -1345,7 +1375,11 @@ test('a second Qoder read in one process still opens the sealed session', async 
   const blob = Buffer.concat([Buffer.from('v10'), nonce, sealed, cipher.getAuthTag()])
   const child = require('node:child_process')
   const realSpawn = child.spawn
-  child.spawn = () => {
+  let unwrapEnvironment
+  let unwrapArguments
+  child.spawn = (_file, args, options) => {
+    unwrapEnvironment = options.env
+    unwrapArguments = args
     const fake = new EventEmitter()
     fake.stdout = new EventEmitter()
     fake.stdout.setEncoding = () => {}
@@ -1380,6 +1414,15 @@ test('a second Qoder read in one process still opens the sealed session', async 
     const second = await readQoderCredential(group)
     assert.equal(second.credential?.token, 'qoder-token',
       'the second read must open it too: the reader zeroes its own copy, not the cached key')
+    const trustedRoot = fs.realpathSync.native('\\\\?\\GLOBALROOT\\SystemRoot')
+    assert.equal(unwrapEnvironment.SystemRoot, trustedRoot, 'PowerShell must receive the trusted system root')
+    assert.equal(unwrapEnvironment.windir, trustedRoot)
+    assert.equal(unwrapEnvironment.SystemDrive, trustedRoot.slice(0, 2))
+    assert.equal(unwrapEnvironment.PATH, path.join(trustedRoot, 'System32'))
+    assert.equal(unwrapEnvironment.PSModulePath, path.join(trustedRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules'))
+    const script = unwrapArguments.at(-1)
+    assert.equal(script.indexOf("$env:PSModulePath=") < script.indexOf('Add-Type'), true,
+      'PowerShell must reset its module path before loading the DPAPI type')
   } finally {
     child.spawn = realSpawn
     for (const name of Object.keys(restore)) {
@@ -2309,16 +2352,6 @@ test('a load leaves the source gateways alone', () => {
   assert.doesNotMatch(body, /traeGateways\.clear\(\)/,
     'clearing Trae here drops its directory cache and its provider row with it')
   assert.doesNotMatch(body, /qoderGateways\.clear\(\)/, 'and the same for Qoder')
-  // A WorkBuddy runtime is different: it closed over the pool and the client this
-  // load has just replaced, so leaving it in the map serves the previous
-  // activation's account list. It is retired and cleared instead, and the clear
-  // is only allowed when every runtime it drops was first handed to a stop.
-  if (/runtimes\.clear\(\)/.test(body)) {
-    assert.match(body, /stopRuntime\(runtime\)/,
-      'a runtime cleared here must be closed first, or its port is never released')
-    assert.ok(body.indexOf('stopRuntime(runtime)') < body.indexOf('runtimes.clear()'),
-      'and stopped before the map lets go of it')
-  }
 })
 
 /**
@@ -2359,7 +2392,8 @@ test('a reload retires the runtimes bound to the core it replaced', async () => 
     traeGateways: new Map([['cn', { source: 'trae', region: 'cn' }]]),
     qoderGateways: new Map(),
     pendingRuntimeStops: [],
-    stopRuntime: async (runtime) => { stopped.push(runtime.region) },
+    trackRuntimeStop: async (runtime) => { stopped.push(runtime.region) },
+    retireStartingGateways: () => {},
     checkinAbort: { abort: () => {} },
     abortWarmups: () => {},
     stopAutoCheckin: () => {},
@@ -2375,7 +2409,9 @@ test('a reload retires the runtimes bound to the core it replaced', async () => 
   const body = entryFunctions(['onLoad'], source)
   const from = body.indexOf('for (const runtime of Array.from(runtimes.values()))')
   assert.notEqual(from, -1, 'the retirement must sit in the entry')
-  const retirement = body.slice(from, body.indexOf('await adoptHostSettings()', from))
+  const to = body.indexOf('await writeChain', from)
+  assert.notEqual(to, -1, 'the settings barrier must follow runtime retirement')
+  const retirement = body.slice(from, to)
   assert.ok(retirement.length > 0, 'the retirement must sit before the core is rebuilt')
   // The globals it assigns are not declared in this snippet, so they are declared
   // here as the module would have them.
@@ -3273,75 +3309,48 @@ test('a WorkBuddy field sealed under the at-rest key opens, and one sealed under
   }, key), /authenticate/i, 'an edited ciphertext must fail the tag, not decrypt to a token nobody issued')
 })
 
-/**
- * The signature scan is handed a module path its own edition can load.
- *
- * `powershell` is Windows PowerShell 5.1, and it binds
- * `Microsoft.PowerShell.Security` by walking `PSModulePath` in order. Any machine
- * with a Store-installed PowerShell 7 carries that build's Modules directory
- * ahead of the system one, because the Store install prepends it to the variable
- * the desktop host inherited. 5.1 then binds the 7 build's copy of the module, the
- * import dies on a type-data conflict, and `Get-AuthenticodeSignature` throws for
- * every candidate. The scan's own catch swallows that, the policy function is
- * handed an empty status, and the at-rest key reads as "no WorkBuddy executable
- * found" on a machine holding two signed installs - which is what it read as
- * here, until the scan was given a path of its own.
- *
- * The scan is driven with a stubbed `execFileSync` rather than a real PowerShell,
- * so the case proves the environment is handed over at all: dropping the option
- * fails it just as surely as getting the order wrong. It also runs on a machine
- * with no registry to plant an uninstall key in.
- */
-test('the signature scan is handed a module path 5.1 can load', () => {
+test('the registry scan uses the real system root and a minimal PowerShell environment', () => {
   const atRestSource = fs.readFileSync(path.join(root, 'lib/at-rest.js'), 'utf8')
   const spawns = []
-  const context = vm.createContext({
-    // esbuild's namespace import, the same shape the crypto case below stubs.
-    import_node_child_process: { execFileSync: (file, args, options) => { spawns.push({ file, args, options }); return '' } },
-    signatureScanEnv: require('../lib/at-rest').signatureScanEnv,
-    scanInterpreter: require('../lib/at-rest').scanInterpreter,
-    import_node_path: require('node:path'),
-    process,
-  })
-  vm.runInContext(entryFunctions(['cleanIconPath', 'systemRootOf', 'scanInterpreter', 'readRegistryAppPaths'], atRestSource), context)
-  vm.runInContext('readRegistryAppPaths()', context)
-  assert.equal(spawns.length, 1, 'the scan runs exactly once')
-  // By absolute path, not by bare name: a user-writable directory is on the
-  // default PATH, and the scan exists precisely because a user-level process can
-  // plant what it runs.
-  assert.ok(path.isAbsolute(spawns[0].file), 'the interpreter is pinned, not looked up on PATH')
-  assert.match(spawns[0].file, /WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/i)
-
-  const handed = spawns[0].options.env
-  assert.notEqual(handed, undefined, 'the child must be handed an environment of our own, not the ambient one')
-  const systemRoot = process.env['SystemRoot']
-  if (systemRoot !== undefined && systemRoot !== '') {
-    const modules = path.join(systemRoot, 'system32', 'WindowsPowerShell', 'v1.0', 'Modules')
-    assert.equal(handed.PSModulePath.split(';')[0], modules,
-      'the 5.1 modules directory leads the path the child is given, so it binds its own edition of the module')
+  const native = target => {
+    assert.equal(target, '\\\\?\\GLOBALROOT\\SystemRoot')
+    return 'C:\\Windows'
   }
-  // The ordering property itself, stated against a path shaped like the one that
-  // broke it, so the case holds on a machine whose own path is already clean.
-  const store = path.join('C:\\Program Files', 'WindowsApps', 'microsoft.powershell_7.6.7.0_x64__8wekyb3d8bbwe', 'Modules')
-  const ambient = [
-    path.join('C:\\Users\\fixture', 'Documents', 'PowerShell', 'Modules'),
-    path.join('C:\\Program Files', 'PowerShell', 'Modules'),
-    store,
-    path.join('C:\\Program Files', 'WindowsPowerShell', 'Modules'),
-    path.join('C:\\Windows', 'system32', 'WindowsPowerShell', 'v1.0', 'Modules'),
-  ].join(';')
-  const { signatureScanEnv } = require('../lib/at-rest')
-  const built = signatureScanEnv({ SystemRoot: 'C:\\Windows', PSModulePath: ambient, PATH: 'unchanged' })
-  const order = built.PSModulePath.split(';')
-  assert.ok(order.indexOf(path.join('C:\\Windows', 'system32', 'WindowsPowerShell', 'v1.0', 'Modules')) < order.indexOf(store),
-    'the system modules directory precedes the Store PowerShell 7 one, which is the whole fix')
-  assert.equal(order.length, ambient.split(';').length + 1,
-    'nothing is dropped: a user\'s own modules still resolve behind the system one')
-  assert.equal(built.PATH, 'unchanged', 'the rest of the environment is passed through untouched')
-  assert.equal(signatureScanEnv(built).PSModulePath, built.PSModulePath,
-    'building it twice is a no-op, so the path cannot grow on every scan')
-  assert.equal(signatureScanEnv({ PATH: 'unchanged' }).PATH, 'unchanged',
-    'with no SystemRoot to derive from the environment is left as it is rather than given an invented path')
+  const context = vm.createContext({
+    import_node_child_process: { execFileSync: (file, args, options) => { spawns.push({ file, args, options }); return '[]' } },
+    import_node_fs: { realpathSync: { native } },
+    import_node_path: require('node:path'),
+    process: { platform: 'win32', env: {
+      SystemRoot: 'C:\\untrusted', windir: 'C:\\untrusted', PATH: 'C:\\untrusted',
+      PSModulePath: 'C:\\untrusted', COR_ENABLE_PROFILING: '1', COR_PROFILER_PATH: 'C:\\untrusted\\profiler.dll',
+    } },
+  })
+  vm.runInContext(entryFunctions(['cleanIconPath', 'systemRootOf', 'signatureScanEnv', 'scanInterpreter', 'readRegistryAppPaths'], atRestSource), context)
+  vm.runInContext('readRegistryAppPaths()', context)
+  assert.equal(spawns.length, 1)
+  assert.equal(spawns[0].file, path.join('C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'))
+  assert.equal(spawns[0].options.cwd, path.join('C:\\Windows', 'System32'))
+  assert.deepEqual({ ...spawns[0].options.env }, {
+    SystemRoot: 'C:\\Windows', windir: 'C:\\Windows', PATH: path.join('C:\\Windows', 'System32'),
+    PSModulePath: path.join('C:\\Windows', 'system32', 'WindowsPowerShell', 'v1.0', 'Modules'),
+  })
+
+  context.import_node_fs.realpathSync.native = () => { throw new Error('unavailable') }
+  vm.runInContext('readRegistryAppPaths()', context)
+  assert.equal(spawns.length, 1, 'a failed system-root lookup must not start PowerShell')
+})
+
+test('only trusted WorkBuddy signing keys are accepted for a non-elevated host', () => {
+  const { signatureAccepts } = require('../lib/at-rest')
+  const domestic = '2F95C8391B09328BC42D131C50CC7B4E06F9E2A7B1E3624E14C9070A1BE9CC97'
+  const international = '307ECCDC80B73FF1662464E2591BF027124F11175039423BA2FEC1CDE64DB212'
+  assert.equal(signatureAccepts('Valid', domestic, false), true)
+  assert.equal(signatureAccepts('Valid', international, false), true)
+  assert.equal(signatureAccepts('Valid', 'CN=Tencent Technology (Shenzhen) Company Limited', false), false)
+  assert.equal(signatureAccepts('Valid', domestic, true), false)
+  assert.equal(signatureAccepts('Valid', domestic, undefined), false)
+  assert.equal(signatureAccepts('NotSigned', domestic, false), false)
+  assert.equal(signatureAccepts('Valid', '', false), false)
 })
 
 test('a standard install path is spawned only when its signature is valid', async (t) => {
@@ -3353,17 +3362,19 @@ test('a standard install path is spawned only when its signature is valid', asyn
   const atRestSource = fs.readFileSync(path.join(root, 'lib/at-rest.js'), 'utf8')
   const candidates = ['C:\\Users\\fixture\\AppData\\Local\\Programs\\WorkBuddy\\WorkBuddy.exe',
     'C:\\Program Files\\WorkBuddy\\WorkBuddy.exe']
+  const trustedKey = '2F95C8391B09328BC42D131C50CC7B4E06F9E2A7B1E3624E14C9070A1BE9CC97'
   const spawns = []
   const context = vm.createContext({
     import_node_child_process: {
       execFile: (file, args, options, callback) => {
         spawns.push({ file, args, options })
-        callback(null, JSON.stringify([
-          { path: candidates[0], status: 'NotSigned', signer: '' },
-          { path: candidates[1], status: 'Valid', signer: 'CN=Tencent Technology(Shenzhen) Company Limited' },
-        ]), '')
+        callback(null, JSON.stringify({ elevated: false, entries: [
+          { path: candidates[0], status: 'Valid', publicKeyHash: 'untrusted-key' },
+          { path: candidates[1], status: 'Valid', publicKeyHash: trustedKey },
+        ] }), '')
       },
     },
+    import_node_fs: require('node:fs'),
     import_node_path: require('node:path'),
     process, Buffer, JSON,
   })
@@ -3373,8 +3384,47 @@ test('a standard install path is spawned only when its signature is valid', asyn
   vm.runInContext('let signatureScanFailure = ""', context)
   const accepted = await vm.runInContext(`signedExecutables(${JSON.stringify(candidates)})`, context)
   assert.deepEqual([...accepted], [candidates[1]],
-    'the unsigned per-user copy must not be executable, and the signed install must still be found')
+    'a valid signature from another key must not allow an executable')
   assert.equal(spawns.length, 1, 'one signature pass covers every candidate')
+  assert.equal(spawns[0].options.cwd, path.join(fs.realpathSync.native('\\\\?\\GLOBALROOT\\SystemRoot'), 'System32'))
+})
+
+test('elevated or unknown Windows hosts reject even a trusted executable', async () => {
+  const atRestSource = fs.readFileSync(path.join(root, 'lib/at-rest.js'), 'utf8')
+  const candidate = 'C:\\Program Files\\WorkBuddy\\WorkBuddy.exe'
+  const trustedKey = '2F95C8391B09328BC42D131C50CC7B4E06F9E2A7B1E3624E14C9070A1BE9CC97'
+  for (const [elevated, reason] of [[true, /elevated/], [null, /could not be determined/], [undefined, /could not be determined/]]) {
+    const response = { elevated, entries: [{ path: candidate, status: 'Valid', publicKeyHash: trustedKey }] }
+    const context = vm.createContext({
+      import_node_child_process: { execFile: (file, args, options, callback) => callback(null, JSON.stringify(response), '') },
+      import_node_path: require('node:path'),
+      scanInterpreter: () => 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+      signatureScanEnv: () => ({}), process: { platform: 'win32', env: {} }, Buffer, JSON,
+    })
+    vm.runInContext(entryFunctions(['signatureAccepts', 'signedExecutables'], atRestSource), context)
+    vm.runInContext('let signatureScanFailure = ""', context)
+    assert.deepEqual([...await vm.runInContext(`signedExecutables(${JSON.stringify([candidate])})`, context)], [])
+    assert.match(vm.runInContext('signatureScanFailure', context), reason)
+  }
+})
+
+test('root or unknown POSIX hosts reject WorkBuddy executable candidates', async () => {
+  const atRestSource = fs.readFileSync(path.join(root, 'lib/at-rest.js'), 'utf8')
+  const candidate = '/home/fixture/WorkBuddy'
+  for (const [geteuid, expected] of [
+    [() => 0, []], [undefined, []], [() => { throw new Error('unavailable') }, []], [() => 1000, [candidate]],
+  ]) {
+    const context = vm.createContext({
+      process: { platform: 'linux', env: {}, geteuid },
+      WORKBUDDY_APP_EXECUTABLE_ENV: 'WORKBUDDY_APP_EXECUTABLE',
+      statExecutables: files => files,
+      signedExecutables: async files => files,
+    })
+    vm.runInContext(entryFunctions(['executableCandidates'], atRestSource), context)
+    vm.runInContext('let signatureScanFailure = ""', context)
+    assert.deepEqual([...await vm.runInContext(`executableCandidates({ WORKBUDDY_APP_EXECUTABLE: ${JSON.stringify(candidate)} })`, context)], expected)
+    if (expected.length === 0) assert.match(vm.runInContext('signatureScanFailure', context), /non-root|privileges could not be determined/)
+  }
 })
 
 test('a registry path is signed again before it is executed', async (t) => {
@@ -3387,15 +3437,23 @@ test('a registry path is signed again before it is executed', async (t) => {
   const scans = []
   const context = vm.createContext({
     import_node_child_process: {
-      execFileSync: () => JSON.stringify([real, injected]),
+      execFileSync: (file, args) => args.at(-1)?.includes('[IO.DriveInfo]::new')
+        ? JSON.stringify(['C:\\'])
+        : JSON.stringify([real, injected]),
       execFile: (file, args, options, callback) => {
         scans.push({ file, args, options })
-        callback(null, JSON.stringify([{ path: real, status: 'Valid', signer: 'CN=Real' }]), '')
+        callback(null, JSON.stringify({ elevated: false, entries: [
+          { path: real, status: 'Valid', publicKeyHash: '2F95C8391B09328BC42D131C50CC7B4E06F9E2A7B1E3624E14C9070A1BE9CC97' },
+          { path: injected, status: 'Valid', publicKeyHash: 'untrusted-key' },
+        ] }), '')
       },
     },
     import_node_path: require('node:path'),
     import_node_os: { homedir: () => 'C:\\Users\\fixture' },
-    import_node_fs: { statSync: (file) => ({ isFile: () => file === real || file === injected }) },
+    import_node_fs: {
+      lstatSync: () => ({ isSymbolicLink: () => false }),
+      statSync: (file) => ({ isFile: () => file === real || file === injected }),
+    },
     statSync: (file) => ({ isFile: () => file === real || file === injected }),
     homedir: () => 'C:\\Users\\fixture',
     scanInterpreter: () => 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
@@ -3406,7 +3464,7 @@ test('a registry path is signed again before it is executed', async (t) => {
     process, Buffer, JSON,
   })
   vm.runInContext(entryFunctions([
-    'cleanIconPath', 'localWindowsPath', 'readRegistryAppPaths', 'signatureAccepts', 'statExecutables',
+    'cleanIconPath', 'localWindowsPath', 'systemRootOf', 'fixedWindowsPaths', 'scanFixedRoots', 'windowsPathHasReparsePoint', 'readRegistryAppPaths', 'signatureAccepts', 'statExecutables',
     'signedExecutables', 'windowsRegistryAppPaths', 'executableCandidates',
   ], atRestSource), context)
   vm.runInContext('let registryAppPaths; let registryScannedAtMs = 0; let signatureScanFailure = ""', context)
@@ -3416,38 +3474,48 @@ test('a registry path is signed again before it is executed', async (t) => {
   assert.equal(scans.length, 1, 'the registry result is verified in one signature pass')
 })
 
-/**
- * A registry key naming a share must never be touched.
- *
- * The scan reads values a user process can write. `Test-Path` on a UNC path
- * opens an SMB connection and hands the named host an NTLM response before any
- * signature is checked, so the scan only enumerates and Node drops everything
- * that is not an absolute local drive path before it stats or signs it.
- */
-test('a registry path that names a share is never touched', (t) => {
+// A direct UNC path or a local-looking junction may contact an SMB server.
+test('network and reparse-point paths are rejected before a file is touched', (t) => {
   if (process.platform !== 'win32') return t.skip('the local-drive filter is Windows-specific')
   const atRestSource = fs.readFileSync(path.join(root, 'lib/at-rest.js'), 'utf8')
   const unc = '\\\\attacker.example\\share\\WorkBuddy.exe'
   const local = 'C:\\Program Files\\WorkBuddy\\WorkBuddy.exe'
+  const junctionRoot = 'C:\\Users\\fixture\\junction'
+  const junction = `${junctionRoot}\\WorkBuddy.exe`
+  const traversalJunction = 'C:\\Users\\fixture\\missing\\..\\junction\\WorkBuddy.exe'
+  const mapped = 'Z:\\WorkBuddy.exe'
   const relative = 'WorkBuddy\\WorkBuddy.exe'
   const device = '\\\\?\\C:\\Program Files\\WorkBuddy\\WorkBuddy.exe'
+  const candidates = [unc, local, relative, device, junction, traversalJunction, mapped]
   const statted = []
+  const lstatted = []
   const context = vm.createContext({
-    import_node_child_process: { execFileSync: () => JSON.stringify([unc, local, relative, device]) },
-    import_node_fs: { statSync: (file) => { statted.push(file); return { isFile: () => true } } },
+    import_node_child_process: {
+      execFileSync: (file, args) => args.at(-1)?.includes('[IO.DriveInfo]::new')
+        ? JSON.stringify(['C:\\'])
+        : JSON.stringify(candidates),
+    },
+    import_node_fs: {
+      lstatSync: (file) => {
+        lstatted.push(file)
+        return { isSymbolicLink: () => file.toLowerCase() === junctionRoot.toLowerCase() }
+      },
+      statSync: (file) => { statted.push(file); return { isFile: () => true } },
+    },
     import_node_path: require('node:path'),
     scanInterpreter: require('../lib/at-rest').scanInterpreter,
     signatureScanEnv: require('../lib/at-rest').signatureScanEnv,
     process, Buffer, JSON,
   })
   vm.runInContext(entryFunctions([
-    'cleanIconPath', 'localWindowsPath', 'readRegistryAppPaths', 'statExecutables',
+    'cleanIconPath', 'localWindowsPath', 'systemRootOf', 'fixedWindowsPaths', 'scanFixedRoots', 'windowsPathHasReparsePoint', 'readRegistryAppPaths', 'statExecutables',
   ], atRestSource), context)
   const listed = vm.runInContext('readRegistryAppPaths()', context)
-  assert.deepEqual([...listed], [local], 'only the local drive path survives enumeration')
-  const files = vm.runInContext(`statExecutables(${JSON.stringify([unc, local, relative, device])})`, context)
+  assert.deepEqual([...listed], [local, junction, traversalJunction, mapped], 'direct network and relative paths do not survive enumeration')
+  const files = vm.runInContext(`statExecutables(${JSON.stringify(candidates)})`, context)
   assert.deepEqual([...files], [local], 'and only the local drive path is stat\'ed')
-  assert.deepEqual(statted, [local], 'the share, relative and device paths never reach statSync')
+  assert.deepEqual(statted, [local], 'UNC, relative, device, mapped and junction paths never reach statSync')
+  assert.ok(lstatted.includes(junctionRoot), 'the local-looking path is inspected without following the junction')
 })
 
 test('a signature scan that cannot run does not call the install unsigned', async (t) => {
@@ -3455,15 +3523,18 @@ test('a signature scan that cannot run does not call the install unsigned', asyn
   const atRestSource = fs.readFileSync(path.join(root, 'lib/at-rest.js'), 'utf8')
   const context = vm.createContext({
     import_node_child_process: {
-      execFileSync: () => '',
+      execFileSync: (file, args) => args.at(-1)?.includes('[IO.DriveInfo]::new') ? JSON.stringify(['C:\\']) : '',
       execFile: () => { throw new Error('a missing interpreter must not be spawned') },
     },
     import_node_path: require('node:path'),
     import_node_os: { homedir: () => 'C:\\Users\\fixture' },
-    import_node_fs: { statSync: () => ({ isFile: () => true }) },
+    import_node_fs: {
+      lstatSync: () => ({ isSymbolicLink: () => false }),
+      statSync: () => ({ isFile: () => true }),
+    },
     statSync: () => ({ isFile: () => true }),
     homedir: () => 'C:\\Users\\fixture',
-    scanInterpreter: () => undefined,
+    scanInterpreter: () => 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
     signatureScanEnv: () => ({}),
     signatureAccepts: require('../lib/at-rest').signatureAccepts,
     APP_EXECUTABLE_NAMES: ['WorkBuddy.exe', 'WorkBuddyAI.exe'],
@@ -3471,7 +3542,7 @@ test('a signature scan that cannot run does not call the install unsigned', asyn
     process, Buffer, JSON,
   })
   vm.runInContext(entryFunctions([
-    'cleanIconPath', 'localWindowsPath', 'readRegistryAppPaths', 'signatureAccepts', 'statExecutables',
+    'cleanIconPath', 'localWindowsPath', 'systemRootOf', 'fixedWindowsPaths', 'scanFixedRoots', 'windowsPathHasReparsePoint', 'readRegistryAppPaths', 'signatureAccepts', 'statExecutables',
     'signedExecutables', 'windowsRegistryAppPaths', 'executableCandidates',
   ], atRestSource), context)
   vm.runInContext('let registryAppPaths; let registryScannedAtMs = 0; let signatureScanFailure = ""', context)
@@ -5221,6 +5292,7 @@ test('a service stop releases the refresh slot', async () => {
   const context = vm.createContext({
     console,
     ...state,
+    core: { pool: null },
     clearTimeout: () => { stopped.push('timer') },
     stopAutoCheckin: () => stopped.push('checkin'),
     stopAccountWatch: () => stopped.push('accountWatch'),
@@ -5234,8 +5306,10 @@ test('a service stop releases the refresh slot', async () => {
     qoderGateways: new Map(),
     gatewayStartFailures: new Map([['cn', 'boom']]),
     sourceStartFailures: new Map([['trae:cn', 'boom']]),
-    pendingRuntimeStops: [{ then: () => {} }],
+    pendingRuntimeStops: [new Promise(() => {})],
     stopRuntime: async () => {},
+    trackRuntimeStop: async () => {},
+    retireStartingGateways: () => {},
     log: () => {},
     safeMessage: (error) => String(error?.message ?? error),
   })
@@ -5249,8 +5323,8 @@ test('a service stop releases the refresh slot', async () => {
   assert.equal(context.gatewayStartFailures.size, 0,
     'a region whose failure belonged to this activation must not read as failed in the next')
   assert.equal(context.sourceStartFailures.size, 0, 'and the same for the two source regions')
-  assert.equal(context.pendingRuntimeStops.length, 0,
-    'a deferred stop waiting on a runtime this teardown closed has nothing left to wait for')
+  assert.equal(context.pendingRuntimeStops.length, 1,
+    'a previous close still in progress must remain visible to the next start')
 })
 
 /**

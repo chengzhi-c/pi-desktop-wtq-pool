@@ -40,7 +40,7 @@ function loadStarted(runtimes) {
   const context = vm.createContext({
     runtimes,
     gatewayStartFailures: new Map(),
-    stopRuntime: async (runtime) => {
+    trackRuntimeStop: async (runtime) => {
       stops.push(runtime)
       runtime.stopped = true
     },

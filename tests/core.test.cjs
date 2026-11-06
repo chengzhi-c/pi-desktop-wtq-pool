@@ -9,6 +9,7 @@
  * run after `npm run build` (the `pretest` script does that).
  */
 const assert = require('node:assert/strict')
+const crypto = require('node:crypto')
 const { test } = require('node:test')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -102,6 +103,29 @@ test('a damaged credential archive is left untouched', async () => {
   writeAccountSignIn(authDir, 'uin-next', 'Next')
   await pool.scan()
   assert.equal(fs.readFileSync(archive, 'utf8'), damaged, 'a parse failure must not be rewritten as a smaller archive')
+})
+
+test('a scan removes orphaned credential archive temp files under the archive lock', async () => {
+  const { WorkBuddyAccountPool } = require('../lib/accounts')
+  const root = scratch('orphaned-archive-temp')
+  try {
+    const authDir = path.join(root, 'auth')
+    const dataPath = path.join(root, 'data')
+    fs.mkdirSync(authDir, { recursive: true })
+    fs.mkdirSync(dataPath, { recursive: true })
+    const orphan = path.join(dataPath, `credentials-archive.json.${crypto.randomUUID()}.tmp`)
+    const lookalike = path.join(dataPath, 'credentials-archive.json.notes.tmp')
+    fs.writeFileSync(orphan, '{"accessToken":"synthetic-secret"}')
+    fs.writeFileSync(lookalike, 'keep')
+
+    const pool = new WorkBuddyAccountPool({ authDirs: [authDir], dataPath: () => dataPath })
+    await pool.scan()
+
+    assert.equal(fs.existsSync(orphan), false, 'a prior process can leave a credential-bearing temporary file')
+    assert.equal(fs.readFileSync(lookalike, 'utf8'), 'keep', 'cleanup is limited to archive temp names')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 /**
@@ -201,7 +225,10 @@ test('clearing the pool retires an in-flight scan before its next write', async 
         release()
         await scan
         assert.equal(pool.list().length, 0, 'the retired scan must not put credentials back into the pool')
-        assert.equal(fs.existsSync(archive), boundary === 'adoption mkdir', 'no archive write may start after clear')
+        assert.equal(fs.existsSync(archive), boundary === 'adoption mkdir',
+          boundary === 'adoption mkdir'
+            ? 'the archive write that precedes adoption has landed'
+            : 'no archive write may start after clear')
         assert.deepEqual(fs.existsSync(own) ? fs.readdirSync(own) : [], [], 'no sign-in may be adopted after clear')
         assert.equal(fs.existsSync(data) && fs.readdirSync(data).some((file) => file.endsWith('.tmp')), false,
           'a retired archive write must not leave its temporary credentials behind')

@@ -48,6 +48,7 @@ function loadEntry(options = {}) {
   let readFails = false
   let gate = null
   let writeGate = null
+  let controlledReads = null
   const baseRequire = createRequire(path.join(root, 'main.js'))
   const context = vm.createContext({
     require: (id) => {
@@ -61,6 +62,9 @@ function loadEntry(options = {}) {
     pi: {
       plugin: {
         getSettings: async () => {
+          if (controlledReads !== null) {
+            return await new Promise((resolve) => { controlledReads.push(resolve) })
+          }
           // Snapshot BEFORE the gate: a read that was issued before a save must
           // answer with the document as it stood then, which is the whole point
           // of the race case. Reading after the gate would hand back the newer
@@ -74,7 +78,7 @@ function loadEntry(options = {}) {
           if (writeGate !== null) await writeGate
           settingsDocument = { ...settingsDocument, ...patch }
         },
-        getDataPath: async () => path.join(temporary, 'data'),
+        getDataPath: options.getDataPath ?? (async () => path.join(temporary, 'data')),
         getManifest: () => ({ version: '0.0.0-test' }),
       },
       commands: { register: async () => {}, unregister: async () => {} },
@@ -99,10 +103,375 @@ function loadEntry(options = {}) {
       writeGate = new Promise((resolve) => { release = resolve })
       return release
     },
+    queueReads() {
+      controlledReads = []
+    },
+    releaseRead(index, value) {
+      controlledReads[index](value)
+    },
     read: (expression) => vm.runInContext(expression, context),
     cleanup() { fs.rmSync(temporary, { recursive: true, force: true }) },
   }
 }
+
+test('a queued settings event from a previous activation cannot overwrite the new settings', async () => {
+  const entry = loadEntry()
+  try {
+    entry.read(`
+      let releaseQueue
+      writeChain = new Promise(resolve => { releaseQueue = resolve })
+      loadGeneration = 1
+      serviceStopped = false
+      applySettingsEverywhere = async () => {}
+    `)
+    const old = entry.read('onHostSettingsChanged({ sourceWorkbuddy: true })')
+    entry.read('loadGeneration = 2; settings = { sourceWorkbuddy: false }; releaseQueue()')
+    assert.equal(await old, false)
+    assert.equal(entry.read('settings.sourceWorkbuddy'), false)
+  } finally {
+    entry.cleanup()
+  }
+})
+
+test('settings writes from a previous activation cannot reach the replacement', async (t) => {
+  await t.test('queued saveSettings and mutateSettings writes are dropped together', async () => {
+    const entry = loadEntry({ settings: { sourceWorkbuddy: true, authFile: '/old' } })
+    try {
+      entry.read(`
+        let releaseQueue
+        writeChain = new Promise(resolve => { releaseQueue = resolve })
+        loadGeneration = 1
+        serviceStopped = false
+        settings = { sourceWorkbuddy: true, authFile: '/old' }
+      `)
+      const saved = entry.read('saveSettings({ sourceWorkbuddy: false })')
+      const mutated = entry.read("mutateSettings('authFile', current => current + '/old')")
+      entry.read(`
+        loadGeneration = 2
+        settings = { sourceWorkbuddy: true, authFile: '/new' }
+        releaseQueue()
+      `)
+      assert.equal(await saved, false)
+      assert.equal(await mutated, false)
+      assert.equal(entry.read('settings.sourceWorkbuddy'), true)
+      assert.equal(entry.read('settings.authFile'), '/new')
+      assert.deepEqual(entry.getSettingsDocument(), { sourceWorkbuddy: true, authFile: '/old' })
+    } finally {
+      entry.cleanup()
+    }
+  })
+
+  await t.test('a settings read that crosses an activation is not written back', async () => {
+    const entry = loadEntry({ settings: { authFile: '/new' } })
+    try {
+      entry.read(`
+        let releaseRead, readStarted
+        const started = new Promise(resolve => { readStarted = resolve })
+        loadGeneration = 1
+        serviceStopped = false
+        settings = { authFile: '/new' }
+        pi.plugin.getSettings = () => {
+          readStarted()
+          return new Promise(resolve => { releaseRead = resolve })
+        }
+      `)
+      const mutated = entry.read("mutateSettings('authFile', current => current + '/old')")
+      await entry.read('started')
+      entry.read(`
+        loadGeneration = 2
+        settings = { authFile: '/new' }
+        releaseRead({ authFile: '/host' })
+      `)
+      assert.equal(await mutated, false)
+      assert.equal(entry.read('settings.authFile'), '/new')
+      assert.deepEqual(entry.getSettingsDocument(), { authFile: '/new' })
+    } finally {
+      entry.cleanup()
+    }
+  })
+})
+
+test('a replacement load waits for an in-flight settings write', async () => {
+  for (const start of ['module.exports.onLoad()', 'onServiceStart()']) {
+    const entry = loadEntry({ settings: { sourceWorkbuddy: false, enabled: false } })
+    try {
+      entry.read(`
+        captureHostWindows = () => {}
+        loadCheckinSlots = () => {}
+        adoptPreviousDataDir = async () => false
+        subscribeToHostSettings = () => {}
+        publishDeclarationEarly = async () => {}
+        syncDeclaration = () => ({ ok: true })
+      `)
+      const release = entry.holdWrite()
+      const saving = entry.read('saveSettings({ sourceWorkbuddy: true })')
+      await new Promise((resolve) => setImmediate(resolve))
+      if (start === 'onServiceStart()') entry.read('loadGeneration += 1')
+      let loaded = false
+      const loading = entry.read(start).then(() => { loaded = true })
+      await new Promise((resolve) => setImmediate(resolve))
+      assert.equal(loaded, false, `${start} must not read settings around the old write`)
+      release()
+      assert.equal(await saving, false, 'the retired activation still reports that its write did not commit')
+      await loading
+      assert.equal(entry.read('settings.sourceWorkbuddy'), true,
+        `${start} must read the host document after the old write lands`)
+    } finally {
+      await entry.read('module.exports.onUnload()')
+      entry.cleanup()
+    }
+  }
+})
+
+test('a host settings edit is applied while the service is stopped', async () => {
+  const entry = loadEntry()
+  try {
+    entry.read(`
+      core.pool = { applyConfig: () => false, applyRemoved() {}, prefer() {}, clear() {} }
+      syncDeclaration = () => ({ ok: true })
+    `)
+    assert.equal(await entry.read('onHostSettingsChanged({ cooldownSeconds: 120 })'), true)
+    assert.equal(entry.read('settings.cooldownSeconds'), 120)
+    assert.equal(entry.read('refreshTimer'), null, 'a stopped service must not start a refresh')
+  } finally {
+    await entry.read('onUnload()')
+    entry.cleanup()
+  }
+})
+
+test('an old load cannot replace the current data directory after a delayed host reply', async () => {
+  let releaseOldPath
+  let readStarted
+  let reads = 0
+  const started = new Promise(resolve => { readStarted = resolve })
+  const entry = loadEntry({
+    getDataPath: () => {
+      reads += 1
+      if (reads !== 1) return Promise.resolve('new-data-root')
+      return new Promise(resolve => { releaseOldPath = resolve; readStarted() })
+    },
+  })
+  try {
+    entry.read(`
+      captureHostWindows = () => {}
+      loadCheckinSlots = () => {}
+      adoptPreviousDataDir = async () => false
+      subscribeToHostSettings = () => {}
+      publishDeclarationEarly = async () => {}
+    `)
+    const oldLoad = entry.read('module.exports.onLoad()')
+    await started
+    await entry.read('module.exports.onLoad()')
+    assert.equal(entry.read('dataPath'), 'new-data-root')
+    releaseOldPath('old-data-root')
+    await oldLoad
+    assert.equal(entry.read('dataPath'), 'new-data-root', 'the retired load must leave the new data path in place')
+  } finally {
+    releaseOldPath?.('old-data-root')
+    await entry.read('module.exports.onUnload()')
+    entry.cleanup()
+  }
+})
+
+test('a failed gateway close does not abort a later start', async (t) => {
+  for (const failure of ['throw', 'reject']) {
+    await t.test(failure, async () => {
+      const entry = loadEntry()
+      try {
+        entry.read(`
+          core.pool = { clear() {} }
+          activeRegions = () => []
+          syncDeclaration = () => ({ ok: true })
+          serviceStopped = false
+          runtimes.set('cn', {
+            region: 'cn', stopped: false,
+            shim: { close: ${failure === 'throw' ? '() => { throw new Error("close failed") }' : '() => Promise.reject(new Error("close failed"))'} }
+          })
+        `)
+        const stopping = entry.read('onServiceStop()')
+        const starting = entry.read('serviceStopped = false; loadGeneration++; startRuntimes()')
+        const results = await Promise.allSettled([stopping, starting])
+        assert.deepEqual(results.map(result => result.status), ['fulfilled', 'fulfilled'])
+      } finally {
+        await entry.read('onUnload()')
+        entry.cleanup()
+      }
+    })
+  }
+})
+
+test('a refresh records a bind failure only for its own activation', async (t) => {
+  for (const retired of [false, true]) {
+    await t.test(retired ? 'after restart' : 'while active', async () => {
+      const entry = loadEntry()
+      let refresh
+      try {
+        entry.read(`
+          let rejectStart, signalStart, reconciles = 0
+          const started = new Promise(resolve => { signalStart = resolve })
+          core.pool = { clear() {} }
+          serviceStopped = false; loadGeneration++; poolNeedsScan = false
+          activeRegions = () => ['cn']
+          createRuntime = () => {
+            signalStart()
+            return new Promise((resolve, reject) => { rejectStart = reject })
+          }
+          adoptHostSettings = async () => true
+          applySettingsToCore = () => {}
+          reconcileTraeGateways = async () => { reconciles++ }
+          reconcileQoderGateways = async () => {}
+          refreshSourceAccounts = async () => {}
+          syncDeclaration = () => ({ ok: true })
+          statusDocument = async () => ({})
+        `)
+        refresh = entry.read("refreshAll('test', false)")
+        await entry.read('started')
+        if (retired) {
+          await entry.read('onServiceStop()')
+          entry.read('serviceStopped = false; loadGeneration++')
+        }
+        entry.read("rejectStart(new Error('bind failed'))")
+        await refresh
+        assert.equal(entry.read("gatewayStartFailures.has('cn')"), !retired)
+        assert.equal(entry.read('reconciles'), retired ? 0 : 1)
+      } finally {
+        entry.read("rejectStart?.(new Error('test finished'))")
+        await refresh?.catch(() => {})
+        await entry.read('onUnload()')
+        entry.cleanup()
+      }
+    })
+  }
+})
+
+test('a retired bind cannot clear a newer activation\'s failure', async () => {
+  const entry = loadEntry()
+  let oldStart, newStart, timeout
+  try {
+    entry.read(`
+      let releaseBind, signalBind, attempts = 0
+      const bindStarted = new Promise(resolve => { signalBind = resolve })
+      const bindGate = new Promise(resolve => { releaseBind = resolve })
+      core.pool = { clear() {} }
+      serviceStopped = false; loadGeneration++
+      activeRegions = () => ['cn']
+      createRuntime = async region => {
+        if (++attempts === 1) {
+          signalBind()
+          await bindGate
+          return { region, shim: { close: async () => {} } }
+        }
+        throw new Error('new bind failed')
+      }
+    `)
+    oldStart = entry.read('startRuntimes()')
+    await entry.read('bindStarted')
+    await entry.read('onServiceStop()')
+    entry.read('serviceStopped = false; loadGeneration++')
+    newStart = entry.read('startRuntimes()')
+    await Promise.race([
+      newStart,
+      new Promise((resolve, reject) => { timeout = setTimeout(() => reject(new Error('new start stayed blocked')), 5000) }),
+    ])
+    assert.equal(entry.read("gatewayStartFailures.get('cn')"), 'new bind failed')
+    entry.read('releaseBind()')
+    await oldStart
+    assert.equal(entry.read("gatewayStartFailures.get('cn')"), 'new bind failed')
+  } finally {
+    clearTimeout(timeout)
+    entry.read('releaseBind?.()')
+    await Promise.allSettled([oldStart, newStart])
+    await entry.read('onUnload()')
+    entry.cleanup()
+  }
+})
+
+test('a settings read from a previous activation cannot refresh its replacement', async () => {
+  const entry = loadEntry()
+  try {
+    entry.read(`
+      let releaseQueue, releaseRead, readStarted
+      const started = new Promise(resolve => { readStarted = resolve })
+      writeChain = new Promise(resolve => { releaseQueue = resolve })
+      pi.plugin.getSettings = () => { readStarted(); return new Promise(resolve => { releaseRead = resolve }) }
+      loadGeneration = 1
+      serviceStopped = false
+      let refreshes = 0
+      scheduleRefresh = () => { refreshes += 1 }
+    `)
+    const old = entry.read('onHostSettingsChanged({ sourceWorkbuddy: true })')
+    entry.read('localSettingsRevision++; releaseQueue()')
+    await entry.read('started')
+    entry.read('loadGeneration = 2; settings = { sourceWorkbuddy: false }; releaseRead({ sourceWorkbuddy: true })')
+    assert.equal(await old, false)
+    assert.equal(entry.read('settings.sourceWorkbuddy'), false)
+    assert.equal(entry.read('refreshes'), 0, 'the previous activation must not schedule a refresh')
+  } finally {
+    entry.read('if (refreshTimer !== null) clearTimeout(refreshTimer)')
+    entry.cleanup()
+  }
+})
+
+test('a completed settings read cannot reconcile a replacement activation', async () => {
+  const entry = loadEntry()
+  try {
+    entry.read(`
+      let releaseQueue, applied = 0, refreshes = 0
+      writeChain = new Promise(resolve => { releaseQueue = resolve })
+      loadGeneration = 1; serviceStopped = false
+      settings = { cooldownSeconds: 60 }
+      loadSettings = async () => {
+        Promise.resolve().then(() => Promise.resolve().then(() => {
+          loadGeneration = 2; settings = { cooldownSeconds: 30 }
+        }))
+        return { cooldownSeconds: 120 }
+      }
+      applySettingsToCore = () => { applied++ }
+      reconcileTraeGateways = async () => {}
+      reconcileQoderGateways = async () => {}
+      syncDeclaration = () => ({ ok: true })
+      scheduleRefresh = () => { refreshes++ }
+    `)
+    const old = entry.read('onHostSettingsChanged({ cooldownSeconds: 120 })')
+    entry.read('localSettingsRevision++; releaseQueue()')
+    assert.equal(await old, false)
+    assert.equal(entry.read('settings.cooldownSeconds'), 30)
+    assert.equal(entry.read('applied'), 0, 'a previous event must not apply settings to the replacement')
+    assert.equal(entry.read('refreshes'), 0)
+  } finally {
+    entry.cleanup()
+  }
+})
+
+test('a settings event whose gateway reconcile crosses activations is not reported as applied', async () => {
+  const entry = loadEntry()
+  let release
+  try {
+    entry.read(`
+      let refreshes = 0
+      let reconcileStarted
+      let releaseReconcile
+      const started = new Promise(resolve => { reconcileStarted = resolve })
+      const reconcile = new Promise(resolve => { releaseReconcile = resolve })
+      serviceStopped = false
+      applySettingsToCore = () => {}
+      reconcileTraeGateways = () => { reconcileStarted(); return reconcile }
+      reconcileQoderGateways = async () => {}
+      syncDeclaration = () => {}
+      scheduleRefresh = () => { refreshes += 1 }
+    `)
+    const old = entry.read('onHostSettingsChanged({ cooldownSeconds: 120 })')
+    await entry.read('started')
+    release = () => entry.read('releaseReconcile()')
+    entry.read('loadGeneration++')
+    release()
+    assert.equal(await old, false)
+    assert.equal(entry.read('refreshes'), 0, 'the old event must not schedule work for the new activation')
+  } finally {
+    release?.()
+    entry.cleanup()
+  }
+})
 
 /**
  * A failed settings read must not be answered with an empty document.
@@ -173,8 +542,9 @@ test('a host edit that raced a local save is re-read, not dropped', async () => 
     // document merge, so a no-op pool keeps reconciliation out of the way.
     entry.read(`core.pool = {
       applyConfig: () => false, applyRemoved: () => {}, prefer: () => {},
-      list: () => [], isDisabled: () => false,
-    }`)
+      list: () => [], isDisabled: () => false, clear: () => {},
+    }; serviceStopped = false; reconcileTraeGateways = async () => {}; reconcileQoderGateways = async () => {};
+      syncDeclaration = () => {}; scheduleRefresh = () => {}`)
     const release = entry.holdWrite()
     const saving = entry.read('saveSettings({ sourceTrae: true })')
     // The host stored its own edit while the save was in flight. The event it
@@ -188,6 +558,7 @@ test('a host edit that raced a local save is re-read, not dropped', async () => 
     assert.equal(current.sourceTrae, true, 'the local save must survive the host event')
     assert.equal(current.cooldownSeconds, 120, 'the host edit that raced the save must land too')
   } finally {
+    await entry.read('onUnload()')
     entry.cleanup()
   }
 })
@@ -262,6 +633,59 @@ test('a settings read that raced a save does not revert it', async () => {
     assert.equal(await entry.read('adoptHostSettings()'), true)
     assert.equal(entry.read('settings.sourceTrae'), false,
       'control: a read that raced nothing must still be adopted')
+  } finally {
+    entry.cleanup()
+  }
+})
+
+test('overlapping settings reads keep the newest document', async () => {
+  const entry = loadEntry()
+  try {
+    entry.read(`
+      let readCount = 0
+      let releaseOldRead, releaseNewRead
+      pi.plugin.getSettings = () => new Promise(resolve => {
+        if (readCount++ === 0) releaseOldRead = resolve
+        else releaseNewRead = resolve
+      })
+    `)
+    const older = entry.read('adoptHostSettings()')
+    const newer = entry.read('adoptHostSettings()')
+    await new Promise((resolve) => setImmediate(resolve))
+    entry.read(`
+      releaseNewRead({ sourceTrae: true })
+      releaseOldRead({ sourceTrae: false })
+    `)
+    assert.equal(await newer, true)
+    assert.equal(await older, false)
+    assert.equal(entry.read('settings.sourceTrae'), true)
+  } finally {
+    entry.cleanup()
+  }
+})
+
+test('an activation replaced while waiting for a write does not read settings', async () => {
+  const entry = loadEntry()
+  try {
+    entry.read(`
+      let reads = 0
+      pi.plugin.getSettings = async () => { reads += 1; return {} }
+      loadGeneration = 1
+      serviceStopped = false
+      applySettingsToCore = () => {}
+      syncDeclaration = () => ({ ok: true })
+      startAccountWatch = () => {}
+    `)
+    const release = entry.holdWrite()
+    const saving = entry.read('saveSettings({ sourceTrae: true })')
+    await new Promise((resolve) => setImmediate(resolve))
+    const starting = entry.read('onServiceStart()')
+    await new Promise((resolve) => setImmediate(resolve))
+    entry.read('loadGeneration += 1')
+    release()
+    await saving
+    await starting
+    assert.equal(entry.read('reads'), 0)
   } finally {
     entry.cleanup()
   }
@@ -597,6 +1021,32 @@ test('a queued write sees the edit the host made while it waited', async () => {
     assert.equal(await queued, true)
     assert.deepEqual(json(entry.getSettingsDocument().creditReserves), { 'account-a': 99, 'account-b': 20 },
       'the host edit must survive alongside the queued one')
+  } finally { entry.cleanup() }
+})
+
+test('a dictionary write that loses a settings read race does not overwrite the host value', async () => {
+  const entry = loadEntry({ settings: { creditReserves: { persisted: 1 } } })
+  try {
+    assert.equal(await entry.read('adoptHostSettings()'), true)
+    entry.queueReads()
+    const queued = entry.read(
+      'mutateSettings("creditReserves", (current) => ({ ...(current ?? {}), mine: 2 }))',
+    )
+    await new Promise((resolve) => setImmediate(resolve))
+    const newest = entry.read('adoptHostSettings()')
+    await new Promise((resolve) => setImmediate(resolve))
+
+    // The queued mutation gets an older read while a newer host read is still
+    // pending. It must not edit the stale document and commit it first.
+    entry.releaseRead(0, { creditReserves: { persisted: 1 } })
+    await new Promise((resolve) => setImmediate(resolve))
+    entry.releaseRead(2, { creditReserves: { host: 99 } })
+    assert.equal(await queued, true)
+    entry.releaseRead(1, { creditReserves: { host: 99 } })
+    await newest
+
+    assert.deepEqual(json(entry.getSettingsDocument().creditReserves), { host: 99, mine: 2 },
+      'the mutation must merge into the host value it retried to read')
   } finally { entry.cleanup() }
 })
 

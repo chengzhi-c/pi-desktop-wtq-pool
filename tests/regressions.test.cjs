@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict')
 const { test } = require('node:test')
 const fs = require('node:fs')
+const net = require('node:net')
 const os = require('node:os')
 const path = require('node:path')
 const vm = require('node:vm')
@@ -60,6 +61,443 @@ function panelFunctions(names, source) {
   if (ceiling) parts.unshift(ceiling[0])
   vm.runInContext(parts.join('\n'), context)
   return context
+}
+
+test('a previous unload cannot clear state installed by a new load', async () => {
+  const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'xdpool-unload-reload-'))
+  const listeners = new Set()
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  let releaseNew
+  const newGate = new Promise(resolve => { releaseNew = resolve })
+  const context = vm.createContext({
+    require: createRequire(path.join(root, 'main.js')),
+    module: { exports: {} }, __dirname: temporary,
+    console: { log() {} }, AbortController, AbortSignal, fetch,
+    setTimeout, clearTimeout, setInterval, clearInterval,
+    pi: {
+      plugin: { getSettings: async () => ({ enabled: false }), getDataPath: async () => temporary },
+      commands: { register: async () => {}, unregister: async () => {} },
+      services: { register() {} },
+      events: { on: (event, handler) => listeners.add(handler), off: (event, handler) => listeners.delete(handler) },
+    },
+  })
+  vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), context)
+  context.closeOldGateway = () => gate
+  context.closeNewGateway = () => newGate
+  vm.runInContext(`
+    syncDeclaration = () => ({ ok: true, changed: false })
+    subscribeToHostSettings()
+    probeCache.set('old', {})
+    sourceFailureHold.set('old', {})
+    sourceCreditExpiry.set('old', 1)
+    sourceRotation.set('old', 1)
+    travelAdoptTried.set('old', true)
+    traeIdentityBlockers.set('old', {})
+    gatewayStartFailures.set('old', 'old')
+    sourceStartFailures.set('old', 'old')
+    deviceLogins.set('old', {})
+    runtimes.set('cn', { region: 'cn', stopped: false, signedIn: true, shim: { close: closeOldGateway } })
+  `, context)
+  const plugin = context.module.exports
+  let unloading
+  try {
+    unloading = plugin.onUnload()
+    assert.equal(listeners.size, 0, 'the old settings listener must be detached before a new load')
+    for (const name of ['probeCache', 'sourceFailureHold', 'sourceCreditExpiry', 'sourceRotation', 'travelAdoptTried',
+      'traeIdentityBlockers', 'gatewayStartFailures', 'sourceStartFailures', 'deviceLogins']) {
+      assert.equal(vm.runInContext(`${name}.has('old')`, context), false, `${name} must not be inherited by the new activation`)
+    }
+    await plugin.onLoad()
+    assert.equal(listeners.size, 1)
+    vm.runInContext(`
+      probeCache.set('new', {})
+      sourceFailureHold.set('new', {})
+      sourceCreditExpiry.set('new', 1)
+      sourceRotation.set('new', 1)
+      travelAdoptTried.set('new', true)
+      traeIdentityBlockers.set('new', {})
+      gatewayStartFailures.set('new', 'new')
+      sourceStartFailures.set('new', 'new')
+      deviceLogins.set('new', {})
+      trackRuntimeStop({ region: 'global', stopped: false, shim: { close: closeNewGateway } })
+    `, context)
+    release()
+    await unloading
+    assert.equal(listeners.size, 1, 'the new settings listener must remain subscribed')
+    for (const name of ['probeCache', 'sourceFailureHold', 'sourceCreditExpiry', 'sourceRotation', 'travelAdoptTried',
+      'traeIdentityBlockers', 'gatewayStartFailures', 'sourceStartFailures', 'deviceLogins']) {
+      assert.equal(vm.runInContext(`${name}.has('new')`, context), true, `${name} must remain owned by the new activation`)
+    }
+    assert.equal(vm.runInContext('pendingRuntimeStops.length', context), 1)
+  } finally {
+    release()
+    releaseNew()
+    await unloading?.catch(() => {})
+    await plugin.onUnload()
+    fs.rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('gateway starts wait until the previous listener releases its port', async (t) => {
+  for (const reason of ['service restart', 'overlapping starts', 'unfinished startup restart', 'stalled close']) {
+    await t.test(reason, async () => {
+      const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'xdpool-close-port-'))
+      const server = net.createServer()
+      await new Promise((resolve, reject) => {
+        server.once('error', reject)
+        server.listen(0, '127.0.0.1', resolve)
+      })
+      const port = server.address().port
+      let release
+      const gate = new Promise(resolve => { release = resolve })
+      let releaseStart, startReached, closeReached
+      const startGate = new Promise(resolve => { releaseStart = resolve })
+      const started = new Promise(resolve => { startReached = resolve })
+      const closing = new Promise(resolve => { closeReached = resolve })
+      const closeOldGateway = async () => {
+        closeReached()
+        await gate
+        await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+      }
+      const context = vm.createContext({
+        require: createRequire(path.join(root, 'main.js')),
+        module: { exports: {} }, __dirname: temporary,
+        console: { log() {} }, AbortController, AbortSignal, fetch,
+        setTimeout, clearTimeout, setInterval, clearInterval,
+        closeOldGateway, port, startGate, startReached,
+        pi: { plugin: {}, services: { register() {} } },
+      })
+      vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), context)
+      vm.runInContext(`
+        syncDeclaration = () => ({ ok: true })
+        core.pool = { clear() {} }
+        activeRegions = () => ['cn']
+        preferredPort = () => port
+        delay = async () => {}
+        serviceStopped = false
+        let runtimeCreations = 0
+        const createRuntimeOnce = createRuntime
+        createRuntime = async region => {
+          runtimeCreations += 1
+          return createRuntimeOnce(region)
+        }
+      `, context)
+      let stopping, retiring
+      let starts = []
+      try {
+        if (reason === 'unfinished startup restart') {
+          vm.runInContext(`
+            const create = createRuntime
+            let first = true
+            createRuntime = async region => {
+              if (first) {
+                first = false
+                runtimeCreations += 1
+                startReached()
+                await startGate
+                return { region, stopped: false, shim: { close: closeOldGateway } }
+              }
+              return create(region)
+            }
+          `, context)
+          retiring = vm.runInContext('startRuntimes()', context)
+          await started
+          stopping = vm.runInContext('onServiceStop()', context)
+          vm.runInContext('serviceStopped = false; loadGeneration++', context)
+        } else if (reason === 'service restart' || reason === 'stalled close') {
+          vm.runInContext("runtimes.set('cn', { region: 'cn', stopped: false, shim: { close: closeOldGateway } })", context)
+          stopping = vm.runInContext('onServiceStop()', context)
+          vm.runInContext('serviceStopped = false; loadGeneration++', context)
+        } else {
+          vm.runInContext("trackRuntimeStop({ region: 'cn', stopped: false, shim: { close: closeOldGateway } })", context)
+        }
+        starts.push(vm.runInContext('startRuntimes()', context))
+        if (reason === 'overlapping starts') starts.push(vm.runInContext('startRuntimes()', context))
+        if (reason === 'stalled close') {
+          let timeout
+          try {
+            await Promise.race([
+              starts[0],
+              new Promise((resolve, reject) => { timeout = setTimeout(() => reject(new Error('gateway start stayed blocked')), 3000) }),
+            ])
+          } finally {
+            clearTimeout(timeout)
+          }
+          assert.equal(vm.runInContext("runtimes.get('cn')?.portFallback", context), true,
+            'a stalled close must eventually use the existing fallback')
+          return
+        }
+        await new Promise(resolve => setImmediate(resolve))
+        assert.equal(vm.runInContext('runtimeCreations', context), reason === 'unfinished startup restart' ? 1 : 0,
+          'no replacement bind should begin while the old listener is closing')
+        if (reason === 'unfinished startup restart') {
+          releaseStart()
+          await closing
+          await new Promise(resolve => setImmediate(resolve))
+          assert.equal(vm.runInContext('runtimeCreations', context), 1,
+            'the retired startup must release its port before a replacement bind starts')
+        }
+        release()
+        await Promise.all(starts)
+        assert.equal(vm.runInContext("runtimes.get('cn')?.portFallback", context), false)
+        assert.equal(Number(new URL(vm.runInContext("runtimes.get('cn').baseUrl", context)).port), port)
+      } finally {
+        release()
+        releaseStart()
+        await Promise.allSettled([...starts, ...(stopping ? [stopping] : []), ...(retiring ? [retiring] : [])])
+        await context.module.exports.onUnload()
+        if (server.listening) await new Promise(resolve => server.close(resolve))
+        fs.rmSync(temporary, { recursive: true, force: true })
+      }
+    })
+  }
+})
+
+test('source gateway restarts wait for the previous listener', async (t) => {
+  for (const source of ['trae', 'qoder']) {
+    const reasons = source === 'trae'
+      ? ['source toggle', 'unfinished startup', 'stalled close']
+      : ['service restart', 'unfinished startup restart']
+    for (const reason of reasons) {
+      await t.test(`${source}: ${reason}`, async () => {
+        const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'xdpool-source-close-'))
+        const server = net.createServer()
+        await new Promise((resolve, reject) => {
+          server.once('error', reject)
+          server.listen(0, '127.0.0.1', resolve)
+        })
+        const port = server.address().port
+        let release
+        const gate = new Promise(resolve => { release = resolve })
+        let releaseStart, closeStarted
+        const startGate = new Promise(resolve => { releaseStart = resolve })
+        const closingStarted = new Promise(resolve => { closeStarted = resolve })
+        const closeOldGateway = async () => {
+          closeStarted()
+          await gate
+          await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+        }
+        const context = vm.createContext({
+          require: createRequire(path.join(root, 'main.js')),
+          module: { exports: {} }, __dirname: temporary,
+          console: { log() {} }, AbortController, AbortSignal, fetch,
+          setTimeout, clearTimeout, setInterval, clearInterval,
+          closeOldGateway, port, source, reason, startGate,
+          pi: { plugin: {}, services: { register() {} } },
+        })
+        vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), context)
+        vm.runInContext(`
+          settings = { enabled: true, sourceWorkbuddy: false, sourceTrae: true, sourceQoder: true }
+          serviceStopped = false
+          core.pool = { clear() {} }
+          syncDeclaration = () => ({ ok: true })
+          delay = async () => {}
+          warmSourceDirectoryAtStartup = async () => true
+          let sourceCreations = 0
+          const createSourceRuntimeOnce = createSourceRuntime
+          createSourceRuntime = async (...args) => {
+            sourceCreations += 1
+            return createSourceRuntimeOnce(...args)
+          }
+          const spec = SOURCE_SPECS[source]
+          spec.ports.cn = port
+          spec.activeRegions = () => regionEnabled(source, 'cn') ? ['cn'] : []
+          if (spec.storageCandidates) spec.storageCandidates = () => []
+          const oldEntry = {
+            source, region: 'cn', gateway: { close: closeOldGateway }, baseUrl: 'http://127.0.0.1:' + port,
+          }
+          if (reason === 'unfinished startup' || reason === 'unfinished startup restart') {
+            const create = createSourceRuntime
+            let first = true
+            createSourceRuntime = async (...args) => {
+              if (first) { first = false; sourceCreations += 1; await startGate; return oldEntry }
+              return create(...args)
+            }
+          } else spec.gateways.set('cn', oldEntry)
+        `, context)
+        let stopping
+        const starts = []
+        try {
+          if (reason === 'unfinished startup restart') {
+            stopping = vm.runInContext('reconcileSourceGateways(source)', context)
+            await vm.runInContext('onServiceStop()', context)
+            vm.runInContext('serviceStopped = false; loadGeneration++', context)
+          } else if (reason === 'unfinished startup') {
+            stopping = vm.runInContext('reconcileSourceGateways(source)', context)
+            vm.runInContext("settings[source === 'trae' ? 'sourceTrae' : 'sourceQoder'] = false", context)
+            releaseStart()
+            await closingStarted
+            vm.runInContext("settings[source === 'trae' ? 'sourceTrae' : 'sourceQoder'] = true", context)
+          } else if (reason === 'source toggle') {
+            vm.runInContext("settings[source === 'trae' ? 'sourceTrae' : 'sourceQoder'] = false", context)
+            stopping = vm.runInContext('reconcileSourceGateways(source)', context)
+            vm.runInContext("settings[source === 'trae' ? 'sourceTrae' : 'sourceQoder'] = true", context)
+          } else {
+            stopping = vm.runInContext('onServiceStop()', context)
+            vm.runInContext('serviceStopped = false; loadGeneration++', context)
+          }
+          starts.push(vm.runInContext('reconcileSourceGateways(source)', context))
+          if (reason === 'unfinished startup') starts.push(vm.runInContext('reconcileSourceGateways(source)', context))
+          if (reason === 'stalled close') {
+            let timeout
+            try {
+              await Promise.race([
+                starts[0],
+                new Promise((resolve, reject) => { timeout = setTimeout(() => reject(new Error('gateway start stayed blocked')), 3000) }),
+              ])
+            } finally {
+              clearTimeout(timeout)
+            }
+            assert.equal(vm.runInContext("spec.gateways.get('cn')?.portFallback", context), true)
+            return
+          }
+          await new Promise(resolve => setImmediate(resolve))
+          assert.equal(vm.runInContext('sourceCreations', context),
+            reason === 'unfinished startup' || reason === 'unfinished startup restart' ? 1 : 0,
+            'no replacement source bind should begin while the old listener is closing')
+          if (reason === 'unfinished startup restart') {
+            releaseStart()
+            await closingStarted
+            await new Promise(resolve => setImmediate(resolve))
+            assert.equal(vm.runInContext('sourceCreations', context), 1,
+              'the retired source startup must release its port before a replacement bind starts')
+          }
+          release()
+          await Promise.all(starts)
+          assert.equal(vm.runInContext("spec.gateways.get('cn')?.portFallback", context), false)
+          assert.equal(Number(new URL(vm.runInContext("spec.gateways.get('cn').baseUrl", context)).port), port)
+        } finally {
+          release()
+          releaseStart()
+          await Promise.allSettled([stopping, ...starts])
+          await context.module.exports.onUnload()
+          if (server.listening) await new Promise(resolve => server.close(resolve))
+          fs.rmSync(temporary, { recursive: true, force: true })
+        }
+      })
+    }
+  }
+})
+
+for (const action of ['stop', 'unload', 'reload', 'disable', 'load-unload', 'load-reload']) {
+  test(`${action} retires an in-flight account scan`, async (t) => {
+    const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'xdpool-stop-scan-'))
+    const auth = path.join(temporary, 'auth')
+    const data = path.join(temporary, 'data')
+    const authFile = path.join(auth, 'workbuddy-desktop-2026-10-06T10-07-06-fixture.info')
+    fs.mkdirSync(auth)
+    fs.mkdirSync(data)
+    writeManifestFixture(temporary)
+    let service
+    let registrations = 0
+    let settings = { enabled: true, sourceWorkbuddy: true, sourceTrae: false, sourceQoder: false,
+      disabledRegions: ['workbuddy:global'], authFile, autoCheckin: { enabled: false } }
+    const context = vm.createContext({
+      require: createRequire(path.join(root, 'main.js')),
+      module: { exports: {} }, __dirname: temporary,
+      console: { log() {} }, AbortController, AbortSignal, fetch,
+      setTimeout, clearTimeout, setInterval, clearInterval,
+      pi: {
+        plugin: {
+          getSettings: async () => ({ ...settings }),
+          setSettings: async values => { settings = { ...settings, ...values } },
+          getDataPath: async () => data,
+        },
+        commands: { register: async () => {}, unregister: async () => {} },
+        services: { register: entry => { service = entry; registrations += 1 } },
+      },
+    })
+    vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), context)
+    const plugin = context.module.exports
+    const { WorkBuddyUpstreamClient } = require('../lib/upstream')
+    t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchModels', async () => [])
+    t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCredits', async () => ({ total: 0, packages: [] }))
+    t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ active: false }))
+    let release
+    let pending
+    let loading
+    try {
+      if (action === 'load-reload') {
+        let reached
+        let calls = 0
+        const stale = { ...settings }
+        settings = { ...settings, sourceWorkbuddy: false }
+        const started = new Promise(resolve => { reached = resolve })
+        const gate = new Promise(resolve => { release = resolve })
+        context.pi.plugin.getSettings = async () => {
+          if (calls++ === 0) { reached(); await gate; return stale }
+          return { ...settings }
+        }
+        loading = plugin.onLoad()
+        await started
+        await plugin.onLoad()
+        release()
+        await loading
+        assert.equal(registrations, 1, 'a superseded load must not register its service')
+        assert.equal(vm.runInContext('settings.sourceWorkbuddy', context), false)
+        return
+      }
+      if (action === 'load-unload') {
+        fs.writeFileSync(authFile, JSON.stringify({ auth: {
+          accessToken: 'fixture-token', expiresAt: Date.now() + 3600000,
+        }, account: { uin: 'fixture-user' } }))
+        let reached
+        const started = new Promise(resolve => { reached = resolve })
+        const gate = new Promise(resolve => { release = resolve })
+        context.holdTraeReconcile = () => { reached(); return gate }
+        vm.runInContext('reconcileTraeGateways = holdTraeReconcile', context)
+        loading = plugin.onLoad()
+        await started
+        await plugin.onUnload()
+        fs.rmSync(data, { recursive: true, force: true })
+        release()
+        await loading
+        assert.equal(fs.existsSync(data), false, 'a load that outlived unload must not start another scan')
+        assert.equal(vm.runInContext('core.pool.list().length', context), 0)
+        return
+      }
+      await plugin.onLoad()
+      fs.writeFileSync(authFile, JSON.stringify({ auth: {
+        accessToken: 'fixture-token', expiresAt: Date.now() + 3600000,
+      }, account: { uin: 'fixture-user' } }))
+      const fsp = require('node:fs/promises')
+      const readFile = fsp.readFile
+      let reached
+      const started = new Promise(resolve => { reached = resolve })
+      const gate = new Promise(resolve => { release = resolve })
+      t.mock.method(fsp, 'readFile', async (file, ...options) => {
+        const value = await readFile(file, ...options)
+        if (file === authFile) { reached(); await gate }
+        return value
+      })
+      const oldPool = vm.runInContext('core.pool', context)
+      pending = oldPool.scan()
+      await started
+      if (action === 'reload') loading = plugin.onLoad()
+      else if (action === 'disable') await plugin.onPanelInvoke('xd.setSource', { source: 'workbuddy', enabled: false })
+      else {
+        if (action === 'stop') await service.stop()
+        else await plugin.onUnload()
+        fs.rmSync(data, { recursive: true, force: true })
+      }
+      release()
+      await pending
+      assert.equal(oldPool.list().length, 0, 'the stopped pool must not publish an account')
+      if (action === 'stop' || action === 'unload') assert.equal(fs.existsSync(data), false, 'the stopped scan must not recreate plugin data')
+      if (action === 'stop') await service.start()
+      if (action === 'unload') await plugin.onLoad()
+      if (action === 'disable') await plugin.onPanelInvoke('xd.setSource', { source: 'workbuddy', enabled: true })
+      if (loading) await loading
+      assert.equal((await plugin.onPanelInvoke('xd.state')).accounts.length, 1, 'the next activation must rediscover the account')
+    } finally {
+      release?.()
+      await pending?.catch(() => {})
+      await loading?.catch(() => {})
+      await plugin.onUnload()
+      fs.rmSync(temporary, { recursive: true, force: true })
+    }
+  })
 }
 
 test('WorkBuddy refresh stays on demand across service restarts', async (t) => {
@@ -1436,7 +1874,7 @@ test('every gateway refuses a non-loopback Host, a foreign Origin and a malforme
 })
 
 test('a credential echoed by an upstream never survives into the client body', () => {
-  const { redactSecrets } = require('../lib/loopback')
+  const { liftUpstreamMessage, redactSecrets } = require('../lib/loopback')
   // A real base64 token carries `+`, `/`, `=` and `.`. A rule that stops at the
   // first of those redacts the head and leaves the tail in the response, so the
   // value is checked in every 8-character window, not as a whole.
@@ -1452,6 +1890,7 @@ test('a credential echoed by an upstream never survives into the client body', (
     `{"Cosy-Key":"${secret}"}`,
     `{"Cloud-IDE-JWT":"${secret}"}`,
     `{"X-Api-Key":"${secret}"}`,
+    `{"X-Ide-Token":["${secret}"]}`,
     `{"upstream":"{\\"Cosy-Key\\":\\"${secret}\\"}"}`,
     `{"accessToken":"${secret}"}`,
     `?access_token=${secret}&x=1`,
@@ -1474,6 +1913,333 @@ test('a credential echoed by an upstream never survives into the client body', (
   // The business code is the actionable half of an error and must survive.
   assert.equal(redactSecrets('{"code":6004}').includes('6004'), true)
   assert.equal(redactSecrets('{"code":"soft_rate"}').includes('soft_rate'), true)
+  assert.equal(redactSecrets('{"token":"12345678"}').includes('12345678'), false)
+  const echoed = JSON.stringify({
+    message: 'request headers: ' + JSON.stringify({ 'X-Ide-Token': [secret] }),
+  })
+  assert.equal(redactSecrets(liftUpstreamMessage(echoed)).includes(secret), false)
   // An address is account-identifying too, and error bodies reach the user.
   assert.equal(redactSecrets('mail lin.cn@example.com').includes('lin.cn'), false)
+})
+
+/**
+ * An array element is a whole credential, whatever characters it contains.
+ *
+ * The array rule used to be `\[[^\]]*\]`: it stopped at the first `]`, so an
+ * element that contained one - as a base64 or URL-safe token can - was cut
+ * short and the rest of the live credential was printed after the placeholder.
+ * The unclosed form leaked the entire value for the same reason, and it is the
+ * shape a body takes when the transport was cut off mid-token.
+ */
+test('an array element is redacted past a bracket or a missing close', () => {
+  const { redactSecrets } = require('../lib/loopback')
+  const secret = 'abcDEF123+/=ghiJKL456.mnoPQR789'
+  const windows = Array.from({ length: secret.length - 7 }, (_, i) => secret.slice(i, i + 8))
+  const shapes = [
+    `{"x-api-key":["a]${secret}"]}`,
+    `{"authorization":["${secret}]tail"]}`,
+    `{"authorization":[["${secret}"]]}`,
+    `{"authorization":[["a"],["b]${secret}"]]}`,
+    `{"x-api-key":[{"v":"${secret}"}],"code":6004}`,
+    `{"authorization":["${secret}}`,
+    `{"upstream":"{\\"x-api-key\\":[\\"${secret}\\"]}"}`,
+    `{"authorization":[123456789012]}`,
+  ]
+  for (const shape of shapes) {
+    const out = redactSecrets(shape)
+    for (const window of windows) {
+      assert.equal(out.includes(window), false, `a credential fragment leaked from: ${shape}`)
+    }
+    assert.equal(out.includes('123456789012'), false, `a numeric credential leaked from: ${shape}`)
+  }
+  // The fields behind an array are still the actionable half of the body.
+  assert.equal(redactSecrets(`{"x-api-key":["a]${secret}"],"code":6004}`).includes('"code":6004'), true)
+  assert.equal(redactSecrets('{"code":6004}'), '{"code":6004}')
+  assert.equal(redactSecrets('{"next":1}'), '{"next":1}')
+})
+
+/**
+ * A credential array longer than the scan budget still loses every element.
+ *
+ * The scan bounds how far past one opening bracket it will look, because an
+ * unterminated bracket must not be able to walk a whole body. What it finds in
+ * that span is a credential whatever its length is, so a long element cannot
+ * hide behind the bound.
+ */
+test('an over-long credential array is redacted whole', () => {
+  const { redactSecrets } = require('../lib/loopback')
+  const secret = 'abcDEF123+/=ghiJKL456.mnoPQR789'
+  for (const size of [1000, 5000, 20000, 70000]) {
+    const out = redactSecrets(`{"authorization":["${'a'.repeat(size)}","${secret}"],"code":6004}`)
+    assert.equal(out.includes(secret), false, `a credential leaked from a ${size}-byte array`)
+  }
+  // The fields after the array survive when its closer is inside the budget.
+  assert.equal(redactSecrets(`{"authorization":["${'a'.repeat(5000)}"],"code":6004}`).includes('"code":6004'), true)
+})
+
+/**
+ * A body of many unterminated brackets costs one pass, not one per bracket.
+ *
+ * What bounds the cost is not a line cut but the budget being spent: when the
+ * scan gives up, redaction swallows everything it looked at, so the next
+ * bracket starts past that span and no byte is scanned twice. Without that the
+ * cost grew with brackets times budget: 55 KB written as `{"token":[` lines
+ * took 49 ms, and doubling the count roughly doubled that again - a crafted
+ * body could make every other request in the plugin wait behind a redaction.
+ */
+test('many unterminated brackets are redacted in linear time', () => {
+  const { redactSecrets } = require('../lib/loopback')
+  const measure = (count) => {
+    const input = '{"token":[\n'.repeat(count)
+    const started = Date.now()
+    redactSecrets(input)
+    return Date.now() - started
+  }
+  const small = measure(1000)
+  const large = measure(8000)
+  // Eight times the input must not cost anything like sixty-four times the work.
+  assert.equal(large <= Math.max(small * 12, 40), true,
+    `8000 brackets took ${large}ms against ${small}ms for 1000`)
+})
+
+/**
+ * An array printed across lines loses its elements too.
+ *
+ * An upstream that quotes the request it was sent with `JSON.stringify(value,
+ * null, 2)` writes the bracket on one line and each element on the next. The
+ * scan used to stop at the first line break, which read this body as an array
+ * with nothing in it and left the token in place - the expanded echo is the
+ * most common shape a 400 takes, so that was the rule failing on its main case.
+ */
+test('a credential array split across lines is redacted whole', () => {
+  const { redactSecrets } = require('../lib/loopback')
+  const secret = 'LIVEACCESSTOKEN0123456789'
+  const shapes = [
+    JSON.stringify({ request: { 'x-api-key': [secret] }, code: 6004 }, null, 2),
+    JSON.stringify({ a: { b: { 'x-api-key': [secret, secret] } } }, null, 2),
+    `{"x-api-key": [${JSON.stringify(secret)}\n "${secret}"]}`,
+    `{"x-api-key":[\r\n  "${secret}"\r\n]}`,
+    JSON.stringify({ 'x-api-key': Array.from({ length: 200 }, () => secret) }, null, 2),
+  ]
+  for (const shape of shapes) {
+    const out = redactSecrets(shape)
+    assert.equal(out.includes(secret), false, `a token survived the array in: ${shape.slice(0, 120)}`)
+    assert.equal(out.includes('[redacted]'), true)
+  }
+  // The fields behind a closed array still reach the caller.
+  const expanded = redactSecrets(JSON.stringify({ 'x-api-key': [secret], code: 6004 }, null, 2))
+  assert.equal(expanded.includes('"code": 6004'), true)
+})
+
+/**
+ * A body that stops mid-token does not print the part it got through.
+ *
+ * An upstream that cuts the echo off leaves its partial line behind: the value
+ * before the cut is still the credential, and printing it would hand over
+ * however much of the token arrived. The scan spends its budget without finding
+ * a closer, so redaction consumes the whole span and the next line break.
+ */
+test('a truncated expanded array does not print its carried token', () => {
+  const { redactSecrets } = require('../lib/loopback')
+  const secret = 'LIVEACCESSTOKEN0123456789'
+  const out = redactSecrets(`{"request":{\n  "x-api-key": [\n    "${secret}"\n`)
+  assert.equal(out.includes(secret), false)
+  assert.equal(out.includes('LIVE'), false)
+})
+
+/**
+ * The credential directories are redacted even without a file extension.
+ *
+ * Trae keeps its token in `~/.trae-cn/trae-jwt-token`, which has no extension,
+ * so the rule that requires one matched nothing: an error naming that file
+ * printed the user's home layout. The names are listed rather than the rule
+ * widened, so an endpoint such as `/v1/chat/completions` still reads normally.
+ */
+test('a credential directory path is redacted but ordinary endpoints are not', () => {
+  const { redactSecrets } = require('../lib/loopback')
+  for (const path of [
+    '/root/.trae-cn/trae-jwt-token',
+    '/home/someone/.trae/credentials.json',
+    '/Users/someone/.workbuddy/auth',
+  ]) {
+    const out = redactSecrets(path)
+    assert.equal(out.includes('.trae') || out.includes('.workbuddy'), false, `a home layout leaked from ${path}`)
+  }
+  for (const text of [
+    'POST /v1/chat/completions returned 4001',
+    'the endpoint /v1/models answered 200',
+    '/api/v2/service/pro/sse/agent_chat_generation was rejected',
+  ]) {
+    assert.equal(redactSecrets(text), text, `an actionable endpoint was destroyed: ${text}`)
+  }
+})
+
+/**
+ * A body built to defeat the bracket scan is answered, not stalled.
+ *
+ * The scan has to find the closing bracket of an element that may contain one.
+ * A regular expression stating that (`(?:[^"]|"")*` around a quoted run) is
+ * ambiguous on a body that never closes, and Node's backtracking engine made
+ * the process hang: the gateway shares the host's event loop, so a crafted
+ * upstream body was enough to stop every other request in the plugin. The scan
+ * is linear; these inputs are the ones that measured it.
+ */
+test('a pathological bracket body is redacted in linear time', () => {
+  const { redactSecrets } = require('../lib/loopback')
+  const inputs = [
+    '{"authorization":' + '['.repeat(20000),
+    '{"token":' + '["'.repeat(10000),
+    '{"token":['.repeat(5000),
+    '{"authorization": ' + '"'.repeat(50000),
+    'y'.repeat(200000),
+  ]
+  for (const input of inputs) {
+    const started = Date.now()
+    redactSecrets(input)
+    const elapsed = Date.now() - started
+    assert.equal(elapsed < 2000, true, `redaction took ${elapsed}ms on ${input.length} bytes`)
+  }
+})
+
+/**
+ * The rotation matrices, held to the same split as the DSH build.
+ *
+ * A 502 answers two different things - "this sign-in gave me nothing" and "the
+ * service is down for everyone" - and only the first rotates.
+ * The status alone cannot tell them apart, so the peek records the class on the
+ * response. Only the DSH suite asserted which causes rotate, which left the
+ * predicate here free to be narrowed to 401 alone without a failing test.
+ */
+
+/**
+ * The rotation matrix: which refusals belong to the account and which do not.
+ *
+ * A 502 answers two very different things - "this sign-in gave me nothing" and
+ * "the service is down for everyone" - and only the first is worth spending
+ * another account on. The status alone cannot tell them apart, so the peek
+ * records the class on the response and the gateway rotates from that. This
+ * pins both halves of the split, because getting it backwards either leaves a
+ * dead sign-in at the head of the queue or cools every healthy one on an
+ * outage that had nothing to do with them.
+ */
+test('a Trae refusal rotates on account-level causes and not on an upstream outage', async () => {
+  const { createTraeGateway } = require('../lib/trae-gateway')
+  const QUIET = { info() {}, warn() {}, error() {}, debug() {} }
+  const credentials = [
+    { accessToken: 'first', refreshToken: '', expiresAtMs: 0, userId: 'first', edition: 'cn', source: 'desktop' },
+    { accessToken: 'second', refreshToken: '', expiresAtMs: 0, userId: 'second', edition: 'cn', source: 'desktop' },
+  ]
+  const cases = [
+    // [name, upstream answer, expected status, whether the second account must be tried]
+    ['a 401', { status: 401, body: 'nope', ct: 'text/plain' }, 401, true],
+    ['a 402', { status: 402, body: 'no credits', ct: 'text/plain' }, 402, true],
+    ['a 429', { status: 429, body: 'slow down', ct: 'text/plain', retryAfter: '30' }, 429, true],
+    ['a 500', { status: 500, body: 'boom', ct: 'text/plain' }, 500, false],
+    ['an empty 200', { status: 200, body: '', ct: 'text/event-stream' }, 502, true],
+    ['a code-less sign-in refusal', { status: 200, body: 'event: error\ndata: {"message":"Login expired"}\n\n', ct: 'text/event-stream' }, 401, true],
+    ['a spent balance', { status: 200, body: 'event: error\ndata: {"code":1005,"message":"insufficient credits"}\n\n', ct: 'text/event-stream' }, 402, true],
+    ['an upstream 5xxx', { status: 200, body: 'event: error\ndata: {"code":5001,"message":"upstream failed"}\n\n', ct: 'text/event-stream' }, 502, false],
+  ]
+  for (const [name, spec, expectedStatus, shouldRotate] of cases) {
+    const tried = []
+    const gateway = createTraeGateway({
+      port: 0, logger: QUIET,
+      credentials: async () => credentials,
+      identity: async () => ({ machineId: 'm', deviceId: 'd', platform: 'win32' }),
+      fetchImpl: async (url, init) => {
+        const target = String(url)
+        if (target.includes('get_detail_param')) {
+          return new Response(JSON.stringify({
+            config_info_list: [{
+              config_name: 'm1', function: 'solo_work_remote',
+              display_config: { display_name: 'M1' },
+              model_detail_map: { 'cn.solo_work_remote': { max_tokens: 8192, prompt_max_tokens: 4096 } },
+            }],
+          }), { status: 200, headers: { 'content-type': 'application/json' } })
+        }
+        if (target.includes('/model')) {
+          return new Response(JSON.stringify({ data: { list: [] } }), { status: 200, headers: { 'content-type': 'application/json' } })
+        }
+        tried.push(init?.headers?.['x-uid'])
+        const headers = { 'content-type': spec.ct }
+        if (spec.retryAfter) headers['retry-after'] = spec.retryAfter
+        return new Response(spec.body, { status: spec.status, headers })
+      },
+    })
+    try {
+      await gateway.ready
+      const answer = await fetch(gateway.baseUrl() + '/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', connection: 'close' },
+        body: JSON.stringify({ model: 'm1', messages: [{ role: 'user', content: 'hi' }] }),
+      })
+      await answer.text()
+      assert.equal(answer.status, expectedStatus, `${name}: the client gets the class it can act on`)
+      assert.equal(tried.length, shouldRotate ? 2 : 1,
+        shouldRotate ? `${name} belongs to the account, so the next sign-in must be tried`
+          : `${name} is the service's own failure, so no healthy sign-in may be spent on it`)
+    } finally {
+      await gateway.close().catch(() => {})
+    }
+  }
+})
+
+/**
+ * The Qoder rotation matrix, held to the same split as the Trae one.
+ *
+ * A 502 answers two different things - "this sign-in gave me nothing" and "the
+ * service is down for everyone" - and only the first rotates.
+ * The status alone cannot tell them apart, so the peek records the class on the
+ * response. Before that, an empty 200 was forwarded as a successful empty turn:
+ * the sign-in stayed at the head of the queue and the healthy ones never ran.
+ */
+test('a Qoder refusal rotates on account-level causes and not on an upstream outage', async () => {
+  const { createQoderGateway } = require('../lib/qoder-gateway')
+  const QUIET = { info() {}, warn() {}, error() {}, debug() {} }
+  const credentials = [
+    { token: 'first', userID: 'first', name: 'first' },
+    { token: 'second', userID: 'second', name: 'second' },
+  ]
+  const cases = [
+    ['a 401', { status: 401, body: 'nope', ct: 'text/plain' }, 401, true],
+    ['a 402', { status: 402, body: 'no credits', ct: 'text/plain' }, 402, true],
+    ['a 429', { status: 429, body: 'slow', ct: 'text/plain', retryAfter: '30' }, 429, true],
+    ['a 500', { status: 500, body: 'boom', ct: 'text/plain' }, 500, false],
+    ['an empty 200', { status: 200, body: '', ct: 'text/event-stream' }, 502, true],
+    ['a sign-in refusal', { status: 200, body: 'data: {"code":105,"message":"Login expired"}\n\n', ct: 'text/event-stream' }, 401, true],
+  ]
+  for (const [name, spec, expectedStatus, shouldRotate] of cases) {
+    const tried = []
+    const gateway = createQoderGateway({
+      port: 0, region: 'cn', logger: QUIET,
+      credentials: async () => credentials,
+      fetchImpl: async (url, init) => {
+        const target = String(url)
+        if (target.includes('chat/completions') || target.includes('agent_chat') || target.includes('generate')) {
+          tried.push(init?.headers?.['authorization'] ?? init?.headers?.['Authorization'] ?? '?')
+          const headers = { 'content-type': spec.ct }
+          if (spec.retryAfter) headers['retry-after'] = spec.retryAfter
+          return new Response(spec.body, { status: spec.status, headers })
+        }
+        return new Response(JSON.stringify({ chat: [{ key: 'qm', display_name: 'QM', enable: true }] }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })
+      },
+    })
+    try {
+      await gateway.ready
+      const answer = await fetch(gateway.baseUrl() + '/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', connection: 'close' },
+        body: JSON.stringify({ model: 'qm', messages: [{ role: 'user', content: 'hi' }] }),
+      })
+      await answer.text()
+      assert.equal(answer.status, expectedStatus, `${name}: the client gets the class it can act on`)
+      assert.equal(tried.length, shouldRotate ? 2 : 1,
+        shouldRotate ? `${name} belongs to the account, so the next sign-in must be tried`
+          : `${name} is the service's own failure, so no healthy sign-in may be spent on it`)
+    } finally {
+      await gateway.close().catch(() => {})
+    }
+  }
 })

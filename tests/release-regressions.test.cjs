@@ -63,21 +63,57 @@ for (const source of ['trae', 'qoder']) {
 test('a partial startup preserves enabled providers whose directories are still warming', () => {
   const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
   const fn = source.match(/^function syncDeclaration\(\) \{[^]*?^\}/m)[0]
-  const old = { id: 'wtqpool-qoder-cn', models: [{ id: 'saved-qoder' }] }
+  const rebound = source.match(/^function warmingDescriptor\(provider\) \{[^]*?^\}/m)[0]
+  const old = { id: 'wtqpool-qoder-cn', baseUrl: 'http://127.0.0.1:45110/v1', models: [{ id: 'saved-qoder' }] }
   const writes = []
   const context = vm.createContext({
     runtimes: new Map([['cn', { signedIn: true }]]),
+    qoderGateways: new Map([['cn', { baseUrl: 'http://127.0.0.1:41871' }]]),
     activeRegions: () => ['cn'], activeTraeRegions: () => [], activeQoderRegions: () => ['cn'],
     declarationModels: () => [{ id: 'workbuddy' }], traeDeclarationModels: () => [], qoderDeclarationModels: () => [],
     PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn' }, TRAE_PROVIDER_ID_BY_REGION: {}, QODER_PROVIDER_ID_BY_REGION: { cn: old.id },
-    descriptorFor: () => ({ id: 'wtqpool-cn', models: [{ id: 'workbuddy' }] }), descriptorForTrae() {}, descriptorForQoder() {},
+    descriptorFor: () => ({ id: 'wtqpool-cn', models: [{ id: 'workbuddy' }] }), descriptorForTrae() {}, descriptorForQoder: () => ({ baseUrl: 'http://127.0.0.1:41871/v1' }),
     manifestProviders: () => [old], writeDeclaration: rows => { writes.push(rows); return { ok: true } }, runtimeState: {},
     // A Qoder gateway whose directory has not answered yet is the one case a row
     // is republished for; everything else that cannot publish drops its row.
     warmingGatewayIds: () => new Set([old.id]),
   })
-  vm.runInContext(fn + '\nsyncDeclaration()', context)
+  vm.runInContext(fn + '\n' + rebound + '\nsyncDeclaration()', context)
   assert.deepEqual(Array.from(writes[0], row => row.id), ['wtqpool-cn', 'wtqpool-qoder-cn'])
+  assert.equal(writes[0][1].baseUrl, 'http://127.0.0.1:41871/v1')
+})
+
+test('a cold source keeps its saved row at the preferred port', () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const functions = ['syncDeclaration', 'warmingDescriptor', 'warmingGatewayIds'].map((name) => {
+    const match = source.match(new RegExp(`^function ${name}\\([^]*?^}$`, 'm'))
+    assert.ok(match, `${name} must exist`)
+    return match[0]
+  }).join('\n')
+  const oldWorkBuddy = { id: 'wtqpool-cn', baseUrl: 'http://127.0.0.1:3/v1', models: [{ id: 'saved-workbuddy' }] }
+  const oldTrae = { id: 'wtqpool-trae-cn', baseUrl: 'http://127.0.0.1:1/v1', models: [{ id: 'saved-trae' }] }
+  const oldQoder = { id: 'wtqpool-qoder-cn', baseUrl: 'http://127.0.0.1:2/v1', models: [{ id: 'saved-qoder' }] }
+  const writes = []
+  const context = vm.createContext({
+    runtimes: new Map(), gatewayStartFailures: new Map(),
+    traeGateways: new Map(), qoderGateways: new Map(), sourceStartFailures: new Map(),
+    sourceKey: (s, r) => s + ':' + r,
+    PLACEHOLDER_BASE_URL: 'http://127.0.0.1:1/v1',
+    activeRegions: () => ['cn'], activeTraeRegions: () => ['cn'], activeQoderRegions: () => ['cn'],
+    PROVIDER_ID_BY_REGION: { cn: oldWorkBuddy.id }, TRAE_PROVIDER_ID_BY_REGION: { cn: oldTrae.id },
+    QODER_PROVIDER_ID_BY_REGION: { cn: oldQoder.id },
+    declarationModels: () => [], traeDeclarationModels: () => [], qoderDeclarationModels: () => [],
+    descriptorFor: () => ({ baseUrl: 'http://127.0.0.1:41871/v1' }),
+    descriptorForTrae: () => ({ baseUrl: 'http://127.0.0.1:42841/v1' }),
+    descriptorForQoder: () => ({ baseUrl: 'http://127.0.0.1:45110/v1' }),
+    manifestProviders: () => [oldWorkBuddy, oldTrae, oldQoder],
+    writeDeclaration: rows => { writes.push(rows); return { ok: true } }, runtimeState: {},
+  })
+  vm.runInContext(`${functions}\nsyncDeclaration()`, context)
+  assert.deepEqual(Array.from(writes[0], row => row.id), [oldWorkBuddy.id, oldTrae.id, oldQoder.id])
+  assert.deepEqual(Array.from(writes[0], row => row.baseUrl), [
+    'http://127.0.0.1:41871/v1', 'http://127.0.0.1:42841/v1', 'http://127.0.0.1:45110/v1',
+  ])
 })
 
 /**
@@ -129,6 +165,7 @@ test('a runtime still connecting is warming and a settled signed-out one is not'
     PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn' },
     traeGateways: new Map(), activeTraeRegions: () => [], TRAE_PROVIDER_ID_BY_REGION: {},
     qoderGateways: new Map(), activeQoderRegions: () => [], QODER_PROVIDER_ID_BY_REGION: {},
+    core: { pool: { status: () => ({ lastScanAtMs: Date.now(), scanning: false }) } },
   })
   vm.runInContext(fn + '\nwarmingGatewayIds()', context)
   const warming = () => [...vm.runInContext('warmingGatewayIds()', context)]
@@ -142,6 +179,14 @@ test('a runtime still connecting is warming and a settled signed-out one is not'
   // rather than a wait.
   context.runtimes = new Map([['cn', { signedIn: false, connecting: null }]])
   assert.deepEqual(warming(), [], 'a runtime that has settled signed out must not read as warming')
+  // The gateway can settle before a slow at-rest account scan. Until that scan
+  // has either found an account or finished with none, its saved roster is still
+  // the only usable row for this provider.
+  context.core = { pool: { status: () => ({ lastScanAtMs: 0, scanning: true }) } }
+  assert.deepEqual(warming(), ['wtqpool-cn'],
+    'a settled runtime whose first account scan is still running remains warming')
+  context.core.pool.status = () => ({ lastScanAtMs: Date.now(), scanning: false })
+  assert.deepEqual(warming(), [], 'the row is dropped once the account scan has finished')
   // No runtime at all is still a roster on its way - the same row is at stake.
   context.runtimes = new Map()
   assert.deepEqual(warming(), ['wtqpool-cn'],
@@ -294,7 +339,8 @@ test('a Trae start that throws is recorded before the pass returns', async () =>
     loadGeneration: 1,
     stillLoaded: () => true,
     sourceStartFailures: new Map(), sourceKey: (s, r) => s + ':' + r,
-    sourceGatewayStarts: new Map(),
+    sourceGatewayStarts: new Map(), sourceGatewayStops: new Map(),
+    PORT_RESERVE_ATTEMPTS: 6, PORT_RESERVE_INTERVAL_MS: 250,
     serviceStopped: false,
     regionEnabled: () => true,
     createSourceRuntime: async () => { throw new Error('listen EADDRINUSE 127.0.0.1:41851') },
@@ -332,7 +378,8 @@ test('overlapping source reconciles share one gateway start', async () => {
     loadGeneration: 1,
     stillLoaded: () => true,
     sourceStartFailures: new Map(), sourceKey: (s, r) => s + ':' + r,
-    sourceGatewayStarts: new Map(),
+    sourceGatewayStarts: new Map(), sourceGatewayStops: new Map(),
+    PORT_RESERVE_ATTEMPTS: 6, PORT_RESERVE_INTERVAL_MS: 250,
     serviceStopped: false,
     regionEnabled: () => true,
     createSourceRuntime: async (sourceName, region) => {

@@ -715,6 +715,7 @@ for (const [name, invoke] of [
       assert.equal(after.growth.read, null, 'the rows go with the accounts they name')
     } finally {
       await plugin.onUnload()
+      fs.rmSync(temporary, { recursive: true, force: true })
     }
   })
 }
