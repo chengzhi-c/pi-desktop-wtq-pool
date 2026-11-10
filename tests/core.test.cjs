@@ -117,6 +117,9 @@ test('a scan removes orphaned credential archive temp files under the archive lo
     const lookalike = path.join(dataPath, 'credentials-archive.json.notes.tmp')
     fs.writeFileSync(orphan, '{"accessToken":"synthetic-secret"}')
     fs.writeFileSync(lookalike, 'keep')
+    // A scan removes only a leftover no live write can still own.
+    const old = new Date(Date.now() - 11 * 60 * 1000)
+    fs.utimesSync(orphan, old, old)
 
     const pool = new WorkBuddyAccountPool({ authDirs: [authDir], dataPath: () => dataPath })
     await pool.scan()

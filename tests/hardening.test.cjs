@@ -226,6 +226,13 @@ test('two identity-less sign-ins from different files are two accounts', () => {
     workbuddyAccountId({ uin: '90000000001', sourcePath: '/fixture/auth/b.info' }),
     'the same account in two files must still be one account',
   )
+  // A nickname is not an identity: two accounts can share one, and hashing it
+  // alone made the second credential overwrite the first.
+  assert.notEqual(
+    workbuddyAccountId({ nickname: 'Alice', sourcePath: '/fixture/auth/a.info' }),
+    workbuddyAccountId({ nickname: 'Alice', sourcePath: '/fixture/auth/b.info' }),
+    'two sign-ins with the same nickname but no uin/uid stay two accounts',
+  )
 })
 
 /**
@@ -341,9 +348,9 @@ test('a check-in-only probe keeps the cached balance and cannot satisfy a full r
       fetchCheckinStatus: async () => ({ active: true, todayCheckedIn: false }),
     },
   }
-  new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'signInRefused', 'safeMessage',
+  new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'PROBE_RETRY_MS', 'signInRefused', 'safeMessage',
     entryFunctions(['accountProbe'], source) + '\nmodule.exports = { accountProbe }',
-  )(mod, mod.exports, core, probeCache, 60000, () => false, (error) => String(error?.message ?? error))
+  )(mod, mod.exports, core, probeCache, 60000, 15000, () => false, (error) => String(error?.message ?? error))
 
   const full = await mod.exports.accountProbe(account, true, false)
   assert.equal(full.credits.total, 7, 'the full read stores the balance')
@@ -360,6 +367,58 @@ test('a check-in-only probe keeps the cached balance and cannot satisfy a full r
   const again = await mod.exports.accountProbe(account, true, false)
   assert.equal(again.credits.total, 7, 'a full read refills a balance the cache never had')
   assert.equal(creditReads, 1, 'and does not serve the check-in-only entry as a balance')
+})
+
+/**
+ * A transient balance failure must not hold the composer on "—" for the full
+ * cache window.
+ */
+test('a failed balance read is retried before its cache window ends', async () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const mod = { exports: {} }
+  const account = { id: 'a', credential: { domain: 'www.codebuddy.cn' } }
+  const probeCache = new Map()
+  let creditReads = 0
+  const core = {
+    pool: {
+      list: () => [account],
+      isDisabled: () => false,
+      readAfterRefresh: async (_id, read) => read({}),
+      setCreditBalance: () => {},
+    },
+    client: {
+      fetchCredits: async () => {
+        creditReads += 1
+        return { total: 11, packages: [] }
+      },
+      fetchCheckinStatus: async () => ({ active: true, todayCheckedIn: false }),
+    },
+  }
+  new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'PROBE_RETRY_MS',
+    'signInRefused', 'safeMessage', 'regionEnabled', 'regionOf',
+    entryFunctions(['accountProbe', 'probesStale'], source) + '\nmodule.exports = { accountProbe, probesStale }',
+  )(mod, mod.exports, core, probeCache, 60000, 15000, () => false,
+    (error) => String(error?.message ?? error), () => true, () => 'cn')
+
+  const failed = { creditsError: 'upstream unavailable' }
+  probeCache.set(account.id, { atMs: Date.now() - 20000, value: failed })
+  assert.equal(mod.exports.probesStale(), true, 'an old failed read is stale before the success TTL')
+  const recovered = await mod.exports.accountProbe(account, true, false)
+  assert.equal(recovered.credits.total, 11, 'the retry replaces the failure with the balance')
+  assert.equal(creditReads, 1)
+
+  probeCache.set(account.id, { atMs: Date.now(), value: failed })
+  assert.equal(mod.exports.probesStale(), false, 'a fresh failure is not retried on every poll')
+  creditReads = 0
+  const held = await mod.exports.accountProbe(account, true, false)
+  assert.equal(held.creditsError, 'upstream unavailable', 'and the cached failure is served meanwhile')
+  assert.equal(creditReads, 0)
+
+  probeCache.set(account.id, {
+    atMs: Date.now() - 20000,
+    value: { credits: { total: 7, packages: [] }, checkin: { active: true } },
+  })
+  assert.equal(mod.exports.probesStale(), false, 'a good read keeps the full cache window')
 })
 
 /**
@@ -1294,8 +1353,13 @@ test('a composer answer carries at most eight packages', async () => {
     core: { pool: {
       list: () => [{ id: 'acct-1', label: 'Fixture' }],
       available: () => [{ id: 'acct-1', label: 'Fixture' }],
+      resolvedPreferredId: () => 'acct-1',
     } },
     probeCache: new Map([['acct-1', { value: { credits: { total: 1000, packages } } }]]),
+    // No other provider publishes a model in this fixture.
+    externalModels: { texts: new Set(), ids: new Set(), at: Date.now() },
+    EXTERNAL_MODELS_TTL_MS: 60000,
+    refreshExternalModels: () => Promise.resolve(),
     preferredAccountId: () => 'acct-1',
     distributionSetting: () => 'round-robin',
     probesStale: () => false,
@@ -1306,6 +1370,7 @@ test('a composer answer carries at most eight packages', async () => {
     // The chip text is resolved against the published declaration, and this
     // fixture stands in for one WorkBuddy region.
     manifestProviders: () => [{ id: 'wtqpool-cn', models: [{ id: 'fixture', name: 'Fixture Model' }] }],
+    hostManifestProviders: () => [],
     PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn', global: 'wtqpool-global' },
     TRAE_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-trae-cn', ai: 'wtqpool-trae-ai' },
     QODER_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-qoder-cn', global: 'wtqpool-qoder-global' },
@@ -1318,7 +1383,7 @@ test('a composer answer carries at most eight packages', async () => {
     ceiling[0],
     entryFunctions(['composerPointsEnabled', 'composerModels', 'composerChipText', 'composerChipTextOf',
       'matchComposerModel', 'composerPackages', 'workbuddyComposerAccounts', 'composerPoints',
-      'routeOfProviderId', 'modelTag', 'onRendererCall'], source),
+      'routeOfProviderId', 'modelTag', 'stripModelTag', 'externalModelsReady', 'onRendererCall'], source),
   ].join('\n'), context)
   const answer = await context.onRendererCall('xd.composerPoints',
     { chip: 'Fixture Model', provider: 'wtqpool-cn', model: 'fixture' })
@@ -1389,6 +1454,7 @@ test('a second Qoder read in one process still opens the sealed session', async 
     // The unwrap writes the blob on stdin and reads the key on stdout; both
     // listeners are attached by the time stdin is ended.
     fake.stdin = {
+      on: () => {},
       end: () => {
         fake.stdout.emit('data', key.toString('base64'))
         fake.emit('close', 0)
@@ -3015,6 +3081,7 @@ test('a declaration that already says the same thing is not rewritten', () => {
     // exactly as given and the case stays about the canonical comparison.
     PROVIDER_ID_BY_REGION: {}, TRAE_PROVIDER_ID_BY_REGION: {}, QODER_PROVIDER_ID_BY_REGION: {},
     REGIONS: [], TRAE_REGIONS: [], QODER_REGIONS: [],
+    externalChipTexts: () => new Set(),
   })
   vm.runInContext(entryFunctions([
     'canonicalJson', 'writeDeclaration', 'disambiguateModelLabels', 'stripModelTag', 'modelTag', 'routeOfProviderId',
@@ -3051,6 +3118,7 @@ test('a declaration written over its own output is unchanged', () => {
     TRAE_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-trae-cn', ai: 'wtqpool-trae-ai' },
     QODER_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-qoder-cn', global: 'wtqpool-qoder-global' },
     REGIONS: ['cn', 'global'], TRAE_REGIONS: ['cn', 'ai'], QODER_REGIONS: ['cn', 'global'],
+    externalChipTexts: () => new Set(),
   })
   vm.runInContext(entryFunctions([
     'disambiguateModelLabels', 'stripModelTag', 'modelTag', 'routeOfProviderId',
@@ -3077,6 +3145,59 @@ test('a declaration written over its own output is unchanged', () => {
   // A name that merely ends in parentheses is not a tag and has to survive.
   const plain = context.disambiguateModelLabels([{ id: 'wtqpool-cn', models: roster('Model (beta)') }])
   assert.equal(plain[0].models[0].name, 'Model (beta)', 'a name that ends in parentheses keeps it')
+
+  // One pool, two models, one display name. The pool tag is the same on both,
+  // so it cannot make the chip text unique; the model id can.
+  const twins = context.disambiguateModelLabels([{
+    id: 'wtqpool-cn',
+    models: [{ id: 'twin-a', name: 'Twin' }, { id: 'twin-b', name: 'Twin' }],
+  }])
+  assert.deepEqual(JSON.parse(JSON.stringify(twins[0].models.map((model) => model.name))),
+    ['Twin (CN) #twin-a', 'Twin (CN) #twin-b'],
+    'two rows of one pool publishing one name keep distinct chip texts')
+})
+
+/**
+ * A name another provider publishes is tagged even when this plugin serves it
+ * from one pool only.
+ *
+ * The chip carries a display text, not a provider id. Two providers printing the
+ * same text makes the selected route unknowable, and an untagged label would let
+ * the readout answer for the wrong one.
+ */
+test('a name another provider publishes carries its pool tag', () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const context = vm.createContext({
+    PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn', global: 'wtqpool-global' },
+    TRAE_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-trae-cn', ai: 'wtqpool-trae-ai' },
+    QODER_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-qoder-cn', global: 'wtqpool-qoder-global' },
+    REGIONS: ['cn', 'global'], TRAE_REGIONS: ['cn', 'ai'], QODER_REGIONS: ['cn', 'global'],
+    externalChipTexts: () => new Set(['shared \u00b7 x0.29']),
+  })
+  vm.runInContext(entryFunctions([
+    'disambiguateModelLabels', 'stripModelTag', 'modelTag', 'routeOfProviderId',
+  ], source), context)
+  const tagged = context.disambiguateModelLabels([
+    { id: 'wtqpool-trae-ai', models: [{ id: 'm', name: 'Shared \u00b7 x0.29' }] },
+  ])
+  assert.equal(tagged[0].models[0].name, 'Shared \u00b7 x0.29 (Trae Global)',
+    'an outside provider printing the same text forces this row to name its pool')
+
+  // The control: with no outside provider, the plain name stays.
+  const alone = vm.createContext({
+    PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn', global: 'wtqpool-global' },
+    TRAE_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-trae-cn', ai: 'wtqpool-trae-ai' },
+    QODER_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-qoder-cn', global: 'wtqpool-qoder-global' },
+    REGIONS: ['cn', 'global'], TRAE_REGIONS: ['cn', 'ai'], QODER_REGIONS: ['cn', 'global'],
+    externalChipTexts: () => new Set(),
+  })
+  vm.runInContext(entryFunctions([
+    'disambiguateModelLabels', 'stripModelTag', 'modelTag', 'routeOfProviderId',
+  ], source), alone)
+  const plain = alone.disambiguateModelLabels([
+    { id: 'wtqpool-trae-ai', models: [{ id: 'm', name: 'Shared \u00b7 x0.29' }] },
+  ])
+  assert.equal(plain[0].models[0].name, 'Shared \u00b7 x0.29', 'a name no one else prints keeps its text')
 })
 
 /**
@@ -3118,6 +3239,10 @@ test('composer points tell the readout to stop when the feature is off', () => {
   const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
   const context = vm.createContext({
     settings: { showComposerPoints: false },
+    // No other provider publishes a model in this fixture.
+    externalModels: { texts: new Set(), ids: new Set(), at: Date.now() },
+    EXTERNAL_MODELS_TTL_MS: 60000,
+    refreshExternalModels: () => Promise.resolve(),
     activeRegions: () => [],
     declarationModels: () => [],
     activeTraeRegions: () => [],
@@ -3127,6 +3252,7 @@ test('composer points tell the readout to stop when the feature is off', () => {
     // The label a chip carries is resolved against what the host was given, and
     // nothing has been published here.
     manifestProviders: () => [],
+    hostManifestProviders: () => [],
     PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn', global: 'wtqpool-global' },
     TRAE_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-trae-cn', ai: 'wtqpool-trae-ai' },
     QODER_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-qoder-cn', global: 'wtqpool-qoder-global' },
@@ -3139,6 +3265,7 @@ test('composer points tell the readout to stop when the feature is off', () => {
   })
   vm.runInContext(entryFunctions([
     'composerPointsEnabled', 'composerPoints', 'matchComposerModel', 'composerChipTextOf',
+    'externalModelsReady',
     'composerModels', 'composerChipText', 'composerChipTexts', 'routeOfProviderId',
   ], source), context)
   const off = context.composerPoints({ chip: 'anything' })
@@ -3171,6 +3298,8 @@ test('a forced refresh holds the pass slot until the background pass has finishe
     loadGeneration: 1,
     refreshInflight: null,
     refreshTimer: null,
+    refreshPending: false,
+    scheduleRefresh: () => {},
     REFRESH_PASS_BUDGET_MS: 18000,
     // Stands in for the handover budget. Shrunk so the test
     // does not spend two seconds waiting for a handover that no longer exists:
@@ -3937,6 +4066,35 @@ test('a sticky conversation keeps the account it started on', async () => {
     'the same conversation must keep its account, or the upstream prompt cache is discarded mid-conversation')
   assert.notEqual(other?.id, first?.id,
     'and a different conversation takes a different one, which is what spreads the spend')
+  assert.equal(pool.readoutPreview(pool.available(Date.now()))?.id, other?.id,
+    'the composer readout names the account the latest turn ran on instead of a dash')
+  assert.equal(pool.preview(pool.available(Date.now())), undefined,
+    'the panel still marks no next account: sticky has no single next one')
+})
+
+test('a rotating mode names the account the composer readout will show', async () => {
+  const dir = scratch('round-robin-preview')
+  for (const name of ['one', 'two', 'three']) {
+    fs.writeFileSync(path.join(dir, name + '.info'), JSON.stringify({
+      auth: { accessToken: 'token-' + name, refreshToken: 'r', expiresAt: 0, domain: 'www.workbuddy.cn' },
+      account: { uin: 'uin-' + name, nickname: name },
+    }))
+  }
+  const { WorkBuddyAccountPool } = require('../lib/accounts')
+  const pool = new WorkBuddyAccountPool({ authDirs: [dir], cooldownMs: 60000, distribution: 'round-robin' })
+  const first = await pool.acquire()
+  const order = pool.list().map((account) => account.id)
+  const next = pool.preview(pool.available(Date.now()))
+  assert.equal(next?.id, order[1 % order.length],
+    'the readout names the account the next request takes, without advancing the cursor')
+  assert.equal(pool.preview(pool.available(Date.now()))?.id, next?.id,
+    'a read does not move the rotation')
+  const second = await pool.acquire()
+  assert.equal(second?.id, next?.id, 'the request follows the account the readout named')
+  assert.equal(pool.preview(pool.available(Date.now()))?.id, order[2 % order.length])
+  assert.equal(pool.readoutPreview(pool.available(Date.now()))?.id, order[2 % order.length],
+    'the composer readout and the panel next-up agree in round-robin')
+  assert.equal(first?.id, order[0], 'the first request takes the head of the rotation')
 })
 
 /**
@@ -4677,10 +4835,10 @@ test('the panel keeps polling while every account is cooling', () => {
   const disabled = new Set()
   const regionsOff = new Set()
   const core = { pool: { list: () => accounts, isDisabled: (id) => disabled.has(id) } }
-  new Function('module', 'exports', 'require', 'core', 'regionEnabled', 'regionOf', 'probeCache', 'PROBE_TTL_MS',
+  new Function('module', 'exports', 'require', 'core', 'regionEnabled', 'regionOf', 'probeCache', 'PROBE_TTL_MS', 'PROBE_RETRY_MS',
     grab('cooldownPending') + '\n' + grab('probesStale') + '\nmodule.exports = { cooldownPending, probesStale };',
   )(mod, mod.exports, require, core, (source, region) => !regionsOff.has(source + ':' + region),
-    () => 'cn', new Map(), 60000)
+    () => 'cn', new Map(), 60000, 15000)
   const accounts = [{ id: 'a', credential: { domain: 'www.codebuddy.cn' }, cooldownUntilMs: Date.now() + 60000 }]
   assert.equal(mod.exports.probesStale(accounts), false, 'a cooling account is never probed')
   assert.equal(mod.exports.cooldownPending(accounts), true,
@@ -4800,9 +4958,9 @@ test('a probe invalidated by a claim does not write its pre-claim answer back', 
       },
     },
   }
-  new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'signInRefused', 'safeMessage',
+  new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'PROBE_RETRY_MS', 'signInRefused', 'safeMessage',
     entryFunctions(['accountProbe'], source) + '\nmodule.exports = { accountProbe }',
-  )(mod, mod.exports, core, probeCache, 60000, () => false, (error) => String(error?.message ?? error))
+  )(mod, mod.exports, core, probeCache, 60000, 15000, () => false, (error) => String(error?.message ?? error))
 
   const old = mod.exports.accountProbe(account, true, false)
   await started
@@ -5477,4 +5635,107 @@ test('a Qoder business refusal is redacted before the single-account answer', as
   assert.equal(answer.outcome, 'failed')
   assert.equal(answer.retry, false)
   assert.equal(answer.reason, 'Claim refused: Bearer [redacted]; contact [account]')
+})
+
+/**
+ * A host provider row is still this plugin's when its id carries the owner
+ * prefix.
+ *
+ * The host names a plugin-owned row `plugin:<plugin-id>:<provider-id>`, while
+ * the manifest declares the bare provider id. The external collision scan has to
+ * recognize both, or every one of this plugin's own models is treated as another
+ * provider's and the credit readout hides for all of them.
+ */
+test('a prefixed host provider id counts as this plugin\'s own', () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const context = vm.createContext({
+    OWN_PROVIDER_IDS: new Set(['wtqpool-cn', 'wtqpool-trae-ai']),
+    PLUGIN_ID: 'io.github.chengzhi-c.pi-desktop-wtq-pool',
+  })
+  vm.runInContext(entryFunctions(['isOwnProviderId'], source), context)
+  assert.equal(context.isOwnProviderId('wtqpool-cn'), true, 'the bare declaration id is ours')
+  assert.equal(context.isOwnProviderId('plugin:io.github.chengzhi-c.pi-desktop-wtq-pool:wtqpool-cn'), true,
+    'the host row id that wraps it is ours too')
+  assert.equal(context.isOwnProviderId('plugin:io.github.chengzhi-c.pi-desktop-wtq-pool:wtqpool-trae-ai'), true,
+    'every provider this plugin publishes is covered')
+  assert.equal(context.isOwnProviderId('cat-guo'), false, 'an outside provider is not ours')
+  assert.equal(context.isOwnProviderId('plugin:other.plugin:wtqpool-other'), false,
+    'another plugin reusing the prefix is not ours')
+  assert.equal(context.isOwnProviderId('plugin:other.plugin:wtqpool-cn'), false,
+    'another plugin reusing one of our provider ids is not ours')
+  assert.equal(context.isOwnProviderId(''), false, 'an empty id names nothing')
+})
+
+/**
+ * Two sign-ins can share a display name.
+ *
+ * The picked account, a failure hold and a check-in row are keyed by that
+ * label. A duplicate let one account's failure hide the other, so a repeated
+ * name gets the vendor's own user id appended; a unique name is untouched.
+ */
+test('two source accounts with one display name get distinct labels', () => {
+  const { uniqueSourceLabels } = require('../lib/source-pool')
+  const rows = [
+    { name: 'Alice', id: 'user-1' },
+    { name: 'Alice', id: 'user-2' },
+    { name: 'Bob', id: 'user-3' },
+  ]
+  assert.deepEqual(uniqueSourceLabels(rows, (row) => row.name, (row) => row.id),
+    ['Alice#user1', 'Alice#user2', 'Bob'],
+    'only the repeated name carries a suffix, and the suffix is the vendor id')
+  assert.deepEqual(uniqueSourceLabels(rows.slice(2), (row) => row.name, (row) => row.id), ['Bob'],
+    'a name used once stays exactly as the vendor publishes it')
+  const noId = [{ name: 'Twin' }, { name: 'Twin' }]
+  assert.deepEqual(uniqueSourceLabels(noId, (row) => row.name, () => ''), ['Twin', 'Twin'],
+    'without an id there is nothing stable to append; the pool must not invent one')
+  const sequential = [
+    { name: 'Twin', id: '22733912345' },
+    { name: 'Twin', id: '22733912346' },
+  ]
+  assert.deepEqual(uniqueSourceLabels(sequential, (row) => row.name, (row) => row.id),
+    ['Twin#33912345', 'Twin#33912346'],
+    'ids sharing a prefix must still produce distinct labels')
+})
+
+/**
+ * A retired activation's refresh is not this pool's answer.
+ *
+ * A source switch clears the roster and rebuilds it from disk; the same account
+ * id can return. The in-flight map survived that clear, so the new account
+ * awaited a refresh that had updated the old object and received a verdict for
+ * a token it never held.
+ */
+test('a pool clear drops in-flight refreshes', () => {
+  const { WorkBuddyAccountPool } = require('../lib/accounts')
+  const pool = new WorkBuddyAccountPool({ authDirs: [] })
+  pool.refreshInflight.set('old-account', Promise.resolve('refreshed'))
+  pool.clear()
+  assert.equal(pool.refreshInflight.size, 0, 'the next scan must start its own refresh')
+})
+
+/**
+ * A nickname is not a billing identity.
+ *
+ * The account id now includes the source path when there is no uin/uid, so the
+ * adoption guard must use the same rule. Treating a nickname as enough let the
+ * plugin copy the same snapshot into a new file on every scan, each copy a new
+ * account spending the same refresh token.
+ */
+test('a nickname-only sign-in is not adopted into a new copy on every scan', async () => {
+  const dir = scratch('nickname-only-')
+  const data = path.join(dir, 'plugin-data')
+  fs.mkdirSync(data, { recursive: true })
+  fs.writeFileSync(path.join(dir, 'workbuddy-desktop.info'), JSON.stringify({
+    auth: { accessToken: 'token-nick', refreshToken: 'refresh-nick', expiresAt: Date.now() + 3600_000, domain: 'www.workbuddy.cn' },
+    account: { nickname: 'OnlyName' },
+  }))
+  const { WorkBuddyAccountPool } = require('../lib/accounts')
+  const pool = new WorkBuddyAccountPool({ authDirs: [dir], dataPath: () => data, cooldownMs: 60_000 })
+  try {
+    assert.equal((await pool.scan()).length, 1)
+    assert.equal((await pool.scan()).length, 1,
+      'a snapshot with no uin/uid keeps serving from where it lies; it must not spawn a copy per scan')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })

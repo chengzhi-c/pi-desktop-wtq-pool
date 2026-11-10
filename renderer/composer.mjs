@@ -321,6 +321,10 @@ function ComposerPoints() {
                 .then((next) => {
                   if (chipRef.current !== requestedChip) return;
                   if (next && next.show === true) setData(next);
+                  // The manual read is the freshest answer there is; re-arm the
+                  // poll from it so unread credits retry on the fast cadence
+                  // instead of waiting out the slow timer a settled answer set.
+                  restartPollRef.current();
                 })
                 .catch((failure) => {
                   if (chipRef.current !== requestedChip) return;

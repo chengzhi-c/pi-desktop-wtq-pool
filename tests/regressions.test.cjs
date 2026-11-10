@@ -1910,10 +1910,39 @@ test('a credential echoed by an upstream never survives into the client body', (
   // Prose that merely contains a scheme word is not a credential.
   assert.equal(redactSecrets('the bearer of bad news arrived'), 'the bearer of bad news arrived')
   assert.equal(redactSecrets('invalid Bearer format'), 'invalid Bearer format')
+  // An error page has no size limit. Redacting it whole drove the path rules
+  // into quadratic backtracking and stalled every gateway in the process.
+  const startedAt = Date.now()
+  const bounded = redactSecrets('a.'.repeat(50_000))
+  assert.ok(bounded.length <= 16_384, 'redaction keeps only the prefix it can show')
+  assert.ok(Date.now() - startedAt < 3_000, 'a path-shaped error page must not stall the process')
   // The business code is the actionable half of an error and must survive.
   assert.equal(redactSecrets('{"code":6004}').includes('6004'), true)
   assert.equal(redactSecrets('{"code":"soft_rate"}').includes('soft_rate'), true)
   assert.equal(redactSecrets('{"token":"12345678"}').includes('12345678'), false)
+  // Bare account identifiers and cookies are credentials too: an upstream echo
+  // that prints them identifies the account even when no token is present.
+  assert.equal(redactSecrets('{"uin":123456789,"uid":"u_987654321"}').includes('123456789'), false)
+  assert.equal(redactSecrets('{"uin":123456789,"uid":"u_987654321"}').includes('u_987654321'), false)
+  assert.equal(redactSecrets('Cookie: SESSION=abcdef0123456789; uid=123456789').includes('abcdef0123456789'), false)
+  assert.equal(redactSecrets('Cookie: SESSION=abcdef0123456789; uid=123456789').includes('123456789'), false)
+  // A cookie header is a set, not one value: every cookie after the first `;`
+  // is a credential too, and a quoted Set-Cookie carries one as well.
+  for (const cookie of [
+    'Cookie: a=1; session=SECRETVALUE123',
+    'Cookie: SESSION=abcdef0123456789; other=SECRETVALUE123',
+    'Set-Cookie: session="SECRETVALUE123"; Path=/',
+    '{"Cookie":"session=\"SECRETVALUE123\""}',
+    '{"Set-Cookie":"session=\"SECRETVALUE123\"; Path=/","code":6004}',
+    '{"Cookie":"session="SECRETVALUE123""}',
+    '{"Cookie":"a=1, session=SECRETVALUE123","code":6004}',
+  ]) {
+    assert.equal(redactSecrets(cookie).includes('SECRETVALUE123'), false, `a cookie leaked from: ${cookie}`)
+  }
+  const cookieJson = redactSecrets('{"Cookie":"a=1; session=SECRETVALUE123","code":6004}')
+  assert.equal(cookieJson.includes('SECRETVALUE123'), false, 'a JSON cookie leaked')
+  assert.equal(cookieJson.includes('"code":6004'), true, 'the field after a cookie stays readable')
+  assert.equal(redactSecrets('User-Id: abcdef123456').includes('abcdef123456'), false)
   const echoed = JSON.stringify({
     message: 'request headers: ' + JSON.stringify({ 'X-Ide-Token': [secret] }),
   })

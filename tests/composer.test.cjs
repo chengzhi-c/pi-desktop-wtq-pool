@@ -30,7 +30,7 @@ const root = path.join(__dirname, '..')
  * `manifestProviders` stands in for the declaration the host was handed, which
  * is what a chip text is resolved against.
  */
-function loadComposer(providers) {
+function loadComposer(providers, external, hostProviders) {
   const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
   const named = /^function ([A-Za-z_$][\w$]*)\(/gm
   const names = []
@@ -40,7 +40,8 @@ function loadComposer(providers) {
     match = named.exec(source)
   }
   const wanted = ['composerModels', 'composerChipText', 'composerChipTextOf', 'composerChipTexts',
-    'matchComposerModel', 'composerPointsEnabled', 'composerPoints', 'routeOfProviderId']
+    'matchComposerModel', 'composerPointsEnabled', 'composerPoints', 'routeOfProviderId',
+    'modelTag', 'stripModelTag', 'externalModelsReady']
   const bodies = wanted.map((name) => {
     if (!names.includes(name)) throw new Error(`main.js no longer defines ${name}`)
     const start = source.search(new RegExp(`^function ${name}\\(`, 'm'))
@@ -50,6 +51,12 @@ function loadComposer(providers) {
   })
   const context = vm.createContext({
     manifestProviders: () => providers,
+    // The declaration the host loaded. Empty unless a case exercises the
+    // generation gap between the file and the host's copy.
+    hostManifestProviders: () => hostProviders ?? [],
+    // The names providers outside this plugin publish. Empty unless a case
+    // exercises the collision between one of their models and one of ours.
+    externalModels: external ?? { texts: new Set(), ids: new Set(), at: Date.now() },
     PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn', global: 'wtqpool-global' },
     TRAE_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-trae-cn', ai: 'wtqpool-trae-ai' },
     QODER_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-qoder-cn', global: 'wtqpool-qoder-global' },
@@ -106,6 +113,81 @@ test('a label two pools both publish resolves to neither of them', () => {
   const alone = loadComposer([shared])
   assert.equal(alone.matchComposerModel('Step-5-Preview \u00b7 x0.00')?.region, 'cn',
     'a label one pool publishes resolves to it')
+})
+
+/**
+ * A name another provider prints is not this plugin's, even when it matches.
+ *
+ * The composer slot hands over the chip text and nothing else, so a model an
+ * outside provider serves under the same alias or id produces exactly the same
+ * text as one of this plugin's. The host's ready-model list is the only place
+ * that distinction exists; without it the readout showed a pool's balance
+ * beside a model that pool never serves.
+ */
+test('a chip text another provider also prints resolves to no pool of ours', () => {
+  const provider = {
+    id: 'wtqpool-trae-ai',
+    models: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash' }],
+  }
+  const colliding = {
+    texts: new Set(['deepseek-v4.1-flash']),
+    ids: new Set(['deepseek-v4.1-flash']),
+    at: Date.now(),
+  }
+  const context = loadComposer([provider], colliding)
+  assert.equal(context.matchComposerModel('DeepSeek-V4.1-Flash'), undefined,
+    'the same name outside this plugin makes the chip text ambiguous')
+  assert.equal(context.matchComposerModel('deepseek-v4.1-flash'), undefined,
+    'and so does a shared model id, which the chip prints before the alias is imported')
+
+  // The control: the same declaration with no outside provider resolves.
+  const alone = loadComposer([provider])
+  assert.equal(alone.matchComposerModel('DeepSeek-V4.1-Flash')?.region, 'ai',
+    'a name only this plugin publishes still resolves')
+})
+
+/**
+ * An empty set from a failed read is not evidence that the name is ours.
+ *
+ * The host list may be missing, refused, or still in flight. Treating that empty
+ * answer as "no other provider publishes this" re-enabled exactly the wrong
+ * balance the external set exists to prevent. A host with no model-list API is
+ * different: there is nothing to wait for, so the older best-effort answer stays.
+ */
+test('an unread host model list cannot resolve a chip text', () => {
+  const provider = {
+    id: 'wtqpool-trae-ai',
+    models: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash' }],
+  }
+  const unread = loadComposer([provider], {
+    texts: new Set(), ids: new Set(), at: Date.now(), known: false, available: true,
+  })
+  assert.equal(unread.matchComposerModel('DeepSeek-V4.1-Flash'), undefined,
+    'an empty set from a read that has not answered says nothing about the name')
+  const unsupported = loadComposer([provider], {
+    texts: new Set(), ids: new Set(), at: Date.now(), known: false, available: false,
+  })
+  assert.equal(unsupported.matchComposerModel('DeepSeek-V4.1-Flash')?.region, 'ai',
+    'a host without the API keeps the earlier best-effort answer')
+})
+
+/**
+ * A label the host has not re-imported yet still resolves.
+ *
+ * The plugin rewrites its manifest after the host read it, so a label change
+ * reaches the picker and the chip one load later. The chip keeps printing the
+ * previous declaration's text until then; resolving only against the file would
+ * hide the readout for every model whose label the plugin just changed.
+ */
+test('the chip text from the host\'s loaded declaration still resolves', () => {
+  const file = [{ id: 'wtqpool-cn', models: [{ id: 'hy4free', name: 'Hy4 \u00b7 x0.00' }] }]
+  const host = [{ id: 'wtqpool-cn', models: [{ id: 'hy4free', name: 'Hy4 \u00b7 x0.00 (CN)' }] }]
+  const context = loadComposer(file, undefined, host)
+  assert.equal(context.matchComposerModel('Hy4 \u00b7 x0.00 (CN)')?.region, 'cn',
+    'the text the host is actually printing resolves to its pool')
+  // The file's own spelling is not what the picker shows yet; it must not be
+  // offered as a second answer for the same model.
+  assert.equal(context.composerModels().length, 1, 'one model, not one per declaration generation')
 })
 
 /** A host just real enough for the entry to load, with one fixture sign-in. */

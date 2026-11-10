@@ -507,12 +507,40 @@ test('WorkBuddy closes at a split terminal frame without treating content as a m
   }
 })
 
+test('PI counts the host label of another provider as a colliding chip text', async () => {
+  const entry = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const fn = entry.match(/^function refreshExternalModels\(\) \{[^]*?^\}/m)[0]
+  const context = vm.createContext({
+    EXTERNAL_MODELS_TTL_MS: 60000,
+    externalModels: { texts: new Set(), ids: new Set(), at: 0, known: false, available: true },
+    externalModelsInFlight: null,
+    isOwnProviderId: id => id === 'wtqpool-cn',
+    loadGeneration: 1,
+    log() {},
+    safeMessage: error => String(error),
+    pi: { models: { list: async () => [
+      { providerId: 'other', modelId: 'opus-4', label: 'opus-4 (Other)', alias: '' },
+      { providerId: 'wtqpool-cn', modelId: 'fixture', label: 'fixture (WTQ)', alias: '' },
+    ] } },
+  })
+  vm.runInContext(fn, context)
+  await vm.runInContext('refreshExternalModels()', context)
+  assert.equal(context.externalModels.texts.has('opus-4'), true)
+  assert.equal(context.externalModels.texts.has('opus-4 (other)'), true,
+    'the label is the spelling the host list carries for every row, so a picker can hand it back')
+  assert.equal(context.externalModels.texts.has('fixture'), false,
+    'this plugin\'s own rows are not evidence of another provider printing the name')
+})
+
+
 test('WorkBuddy composer starts a background probe for cold credits without a panel open', async () => {
   const entry = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
   const fn = entry.match(/^function composerPoints\(args\) \{[^]*?^\}/m)[0]
   let total = null, scheduled = 0
   const context = vm.createContext({
     composerPointsEnabled: () => true,
+    externalModels: { at: Date.now() }, EXTERNAL_MODELS_TTL_MS: 60000,
+    refreshExternalModels: async () => {},
     matchComposerModel: () => ({ source: 'workbuddy', region: 'cn', id: 'fixture' }),
     workbuddyComposerAccounts: () => [{ active: true, label: 'fixture', total }],
     probesStale: () => total === null,
@@ -561,6 +589,21 @@ test('PI account selection restarts credit polling after a successful preference
   assert.equal(restarted, 1, 'a preference save must not leave unread credits on the old five-minute timer')
 })
 
+test('PI manual credit refresh restarts polling from the fresh answer', async () => {
+  const renderer = fs.readFileSync(path.join(root, 'renderer/composer.mjs'), 'utf8')
+  const refresh = renderer.slice(renderer.indexOf('method: "xd.composerRefresh"'))
+  const body = refresh.match(/\}\)\n {16}\.then\(\(next\) => \{([^]*?)\n {16}\}\)\n {16}\.catch/)[1]
+  let restarted = 0, shown = null
+  const context = vm.createContext({
+    next: { show: true, total: null }, chipRef: { current: 'fixture' }, requestedChip: 'fixture',
+    setData(value) { shown = value },
+    restartPollRef: { current: () => { restarted++ } },
+  })
+  await vm.runInContext('(async () => {' + body + '\n})()', context)
+  assert.equal(shown && shown.show, true)
+  assert.equal(restarted, 1, 'a manual read must not leave unread credits on the slow timer')
+})
+
 /**
  * Both sit in one flex line at the right end of an account row. The delete
  * button inherited the default `button` padding while the remove button carried
@@ -573,4 +616,99 @@ test('the account row ships one box for the remove and delete buttons', () => {
   assert.ok(shared, 'the two buttons must be sized by one rule, not by the default button padding')
   assert.match(shared[1], /padding:\s*4px 10px/, 'and that rule must set the row padding both of them share')
   assert.match(shared[1], /font-size:\s*12\.5px/, 'with the row font size, so their heights match')
+})
+
+/**
+ * A source label does not depend on which other regions are switched on.
+ *
+ * Labels are the row key for holds, pack expiry and the panel's account state.
+ * Computing them after the region filter renamed the surviving account whenever
+ * another region was disabled: the duplicate suffix appeared or vanished with a
+ * setting that says nothing about this account.
+ */
+test('Discovering source labels ignores the enabled-region filter', async () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const match = source.match(/^async function refreshSourceAccounts\([^]*?^}/m)
+  assert.ok(match, 'refreshSourceAccounts must exist')
+  const { uniqueSourceLabels } = require('../lib/source-pool')
+  const { traeRegionOfCredential } = require('../lib/trae-discovery')
+  const credentials = [
+    { userId: 'user-cn', accountName: 'Same Name', edition: 'cn', source: 'desktop', expiresAtMs: 0 },
+    { userId: 'user-ai', accountName: 'Same Name', edition: 'sg', source: 'desktop', expiresAtMs: 0 },
+  ]
+  const run = async (regions) => {
+    const context = vm.createContext({
+      activeTraeRegions: () => regions,
+      activeQoderRegions: () => [],
+      discoverTraeCredentials: async () => ({ credentials: credentials.map((item) => ({ ...item })), failures: [] }),
+      discoverQoderCredentials: async () => ({ credentials: [], failures: [] }),
+      stillLoaded: () => true,
+      uniqueSourceLabels,
+      traeRegionOfCredential,
+      traeBaseLabel: (credential) => credential.accountName ?? credential.userId,
+      traeLabelKey: (credential) => traeRegionOfCredential(credential) + '\n' + credential.userId,
+      traeAppLabelOf: () => 'Trae',
+      traeRowProbe: async () => undefined,
+      noteSourceExpiry() {},
+      sourceCredentialExpired: () => false,
+      regionEnabled: () => true,
+      log() {},
+      safeMessage: (error) => String(error),
+      loadGeneration: 1,
+      traeAccountRows: [],
+      traeLabelOverrides: new Map(),
+      qoderAccountRows: [],
+      qoderLabelOverrides: new Map(),
+      pruneSourceState() {},
+    })
+    vm.runInContext(match[0], context)
+    await context.refreshSourceAccounts(1)
+    return context.traeAccountRows.filter((row) => row.region === 'cn')
+  }
+  const both = (await run(['cn', 'ai'])).find((row) => row.region === 'cn')
+  const cnOnly = await run(['cn'])
+  assert.ok(both)
+  assert.equal(cnOnly.length, 1)
+  assert.equal(cnOnly[0].label, both.label,
+    'switching the other region off must not rename this account')
+  assert.match(cnOnly[0].label, /#usercn$/u, 'the duplicate suffix is what keeps the two rows apart')
+})
+
+/**
+ * A failing model roster is retried a bounded number of times per gateway.
+ *
+ * The previous chain re-armed itself every retry, and each retry triggered a
+ * refresh pass whose failures started the chain from attempt one again. A
+ * gateway stuck on a bad sign-in therefore retried without end.
+ */
+test('A failing model roster retries per gateway and stops at the attempt cap', () => {
+  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+  const body = source.match(/^function scheduleModelRetries\(runtime\) \{[^]*?^}/m)[0]
+    + '\n' + source.match(/^function clearModelRetries\(\) \{[^]*?^}/m)[0]
+  const timers = []
+  let refreshes = 0
+  const runtime = { stopped: false, catalogRetryAttempt: 0, catalogRetryTimer: undefined }
+  const context = vm.createContext({
+    serviceStopped: false,
+    MODEL_RETRY_ATTEMPTS: 4,
+    CATALOG_RETRY_MS: 15,
+    runtimes: new Map([['cn', runtime]]),
+    modelRetryTimers: new Set(),
+    scheduleRefresh: () => { refreshes += 1 },
+    setTimeout: (callback) => { const timer = { callback }; timers.push(timer); return timer },
+    clearTimeout() {},
+  })
+  vm.runInContext(body, context)
+  context.scheduleModelRetries(runtime)
+  context.scheduleModelRetries(runtime)
+  assert.equal(timers.length, 1, 'a second failing pass must not arm a second timer for the same gateway')
+  let fired = 0
+  while (timers.length > 0 && fired < 10) {
+    timers.shift().callback()
+    fired += 1
+    // The pass this retry triggered fails the same way and asks again.
+    context.scheduleModelRetries(runtime)
+  }
+  assert.equal(fired, 4, 'the initial read plus three retries, then the gateway stops retrying')
+  assert.equal(refreshes, 4, 'every retry runs exactly one pass')
 })

@@ -59,12 +59,22 @@ const { createQoderGateway } = require("./lib/qoder-gateway");
 const { QoderUpstreamClient, qoderClaimableCampaignIdOf, qoderCheckinStateFrom, qoderNormalizeClaimResult, qoderRewardExpiryMs, qoderRewardValidityDaysOf } = require("./lib/qoder-client");
 const { safeMessage, redactSecrets } = require("./lib/loopback");
 const { startDeviceLogin, pollDeviceLogin } = require("./lib/login");
-const { createSourcePool } = require("./lib/source-pool");
+const { createSourcePool, uniqueSourceLabels } = require("./lib/source-pool");
 
 /** The ids this plugin used before it was renamed, newest first; only the migration reads them. */
 const PREVIOUS_PLUGIN_IDS = ["io.github.chengzhi-c.pi-desktop-xdpool", "local.pi-desktop-xdpool", "local.pi-desktop-workbuddy", "local.pi-workbuddy-xdpool"];
+const PLUGIN_ID = "io.github.chengzhi-c.pi-desktop-wtq-pool";
 /** The one background service the manifest declares. */
 const SERVICE_ID = "provider-host";
+/**
+ * The command-palette entry that opens this panel.
+ *
+ * PI-Desktop 0.22 moved plugin panels into the global launcher and dropped the
+ * "open panel" button from the plugin card. A command keeps the panel reachable
+ * without knowing the shortcut: it is listed in the command palette and matched
+ * by the keywords declared beside it in the manifest.
+ */
+const OPEN_PANEL_COMMAND = "wtqpool.open";
 
 /** The two gateways, matching the provider ids written into the manifest. */
 const REGIONS = ["cn", "global"];
@@ -168,6 +178,29 @@ const QODER_PROVIDER_NAME_BY_REGION = {
 };
 /** Fixed ports, clear of 41811/41812, 41821/41822 and the two pairs above. */
 const QODER_PORTS = { cn: 41871, global: 41881 };
+/** Every provider id this plugin publishes, whatever the source. */
+const OWN_PROVIDER_IDS = new Set([
+  ...Object.values(PROVIDER_ID_BY_REGION),
+  ...Object.values(TRAE_PROVIDER_ID_BY_REGION),
+  ...Object.values(QODER_PROVIDER_ID_BY_REGION),
+]);
+/**
+ * Whether a host provider id names one of this plugin's own rows.
+ *
+ * The host rows carry their owner in the id (`plugin:<plugin-id>:<provider-id>`),
+ * while the declaration uses the bare provider id. Both spellings have to count
+ * as ours: treating the prefixed one as foreign would put every one of this
+ * plugin's own model names into the external collision set.
+ */
+function isOwnProviderId(providerId) {
+  const id = String(providerId ?? "");
+  if (OWN_PROVIDER_IDS.has(id)) return true;
+  // The host spells an owned row `plugin:<this plugin>:<provider>`. Matching
+  // just the tail treated any other plugin that reused a `wtqpool-*` id as
+  // ours, which put its same-named models back in the collision-free set.
+  const prefix = "plugin:" + PLUGIN_ID + ":";
+  return id.startsWith(prefix) && OWN_PROVIDER_IDS.has(id.slice(prefix.length));
+}
 /** region -> { region, gateway, baseUrl, portFallback, lastError }. */
 const qoderGateways = new Map();
 /** Regions whose source is switched on and which are not parked. */
@@ -224,6 +257,13 @@ const PLACEHOLDER_BASE_URL = "http://127.0.0.1:1/v1";
  * paint, so opening it never waits on a billing call per account.
  */
 const PROBE_TTL_MS = 60000;
+/**
+ * How long a failed billing read is reused.
+ *
+ * A failure at startup is usually transient, and holding it for the full cache
+ * window left the readout on "—" until the next TTL or a manual refresh.
+ */
+const PROBE_RETRY_MS = 15000;
 /** How often the desktop sign-ins are re-read while the service runs. */
 const ACCOUNT_WATCH_MS = 60000;
 /**
@@ -354,7 +394,7 @@ const sourceGatewayStarts = new Map();
 const sourceGatewayStops = new Map();
 
 function sourceKey(source, region) {
-  return source + ":" + region;
+  return sourceRegionKey(source, region);
 }
 
 /**
@@ -395,6 +435,14 @@ const core = { client: null, pool: null };
 let refreshTimer = null;
 /** The background refresh in flight, so two passes never overlap. */
 let refreshInflight = null;
+/**
+ * A refresh asked for while a pass held the slot.
+ *
+ * The pass that is running read settings and rosters when it started, so a
+ * change that arrived after that point was otherwise dropped and took effect on
+ * the next unrelated pass. One follow-up consumes every such request.
+ */
+let refreshPending = false;
 /** The host settings listener, kept so onUnload can detach it. */
 let settingsChangedHandler = null;
 
@@ -467,6 +515,20 @@ function dropGrowthRead() {
   // Bumped so a read already in flight cannot write its answer back over the drop:
   // it was computed against the pool that existed before the user's change.
   growthReadEpoch += 1;
+}
+
+/**
+ * Drop the Trae/Qoder state keyed to the previous activation's sign-ins.
+ *
+ * Called from both load and unload: a reload can start a new activation while
+ * this one is still closing, and the load path must not inherit its holds.
+ */
+function resetSourceActivationState() {
+  sourceFailureHold.clear();
+  sourceCreditExpiry.clear();
+  sourceRotation.clear();
+  travelAdoptTried.clear();
+  traeIdentityBlockers.clear();
 }
 /**
  * Set when the plugin is going away, so a pass already in flight stops early.
@@ -806,6 +868,10 @@ async function onHostSettingsChanged(next) {
 async function applySettingsEverywhere(toggled) {
   const generation = loadGeneration;
   applySettingsToCore();
+  // A plugin loaded disabled never reached the service-start path that begins
+  // the watch, so a sign-in overwritten in that window was never adopted.
+  if (settings.enabled === false) stopAccountWatch();
+  else startAccountWatch();
   traeAccountRows = traeAccountRows.filter((row) => regionEnabled("trae", row.region));
   qoderAccountRows = qoderAccountRows.filter((row) => regionEnabled("qoder", row.region));
   // A parked region must lose its gateway now, not at the next refresh: its
@@ -1628,6 +1694,103 @@ function declarationModels(region) {
 }
 
 /**
+ * The model texts and ids published by providers outside this plugin.
+ *
+ * The composer slot hands this plugin the text on the host's model chip and
+ * nothing else. A model another provider serves under the same name or id is
+ * indistinguishable from one of this plugin's on that text, so a balance shown
+ * for it would belong to an account that never serves the request. The host's
+ * own ready-model list is the only place that distinction exists; it carries no
+ * credentials, only provider and model metadata.
+ *
+ * The cache is read synchronously while the declaration is written and while a
+ * chip is resolved; a background read replaces it. A failed read keeps the
+ * previous answer rather than treating every name as free.
+ */
+const EXTERNAL_MODELS_TTL_MS = 60_000;
+let externalModels = { texts: new Set(), ids: new Set(), at: 0, known: false, available: true };
+let externalModelsInFlight = null;
+
+/**
+ * Whether the external set has been read at least once.
+ *
+ * A host with the API is not trusted until its list arrives: an empty set is
+ * indistinguishable from "no other provider publishes this name", and treating
+ * an unread list that way showed a balance on another provider's model. A host
+ * without the API keeps the older best-effort behaviour, because hiding every
+ * readout on a host that cannot answer is not a fix.
+ */
+function externalModelsReady() {
+  return externalModels.available === false || externalModels.known !== false;
+}
+
+/** The set of chip texts another provider can print. */
+function externalChipTexts() {
+  return externalModels.texts;
+}
+
+/**
+ * Refresh the external model list, at most once per TTL.
+ *
+ * A host without the model-list API leaves the cache empty: every name is then
+ * treated as this plugin's own, which is the behaviour that existed before the
+ * host exposed the list. A host that has it but refuses the read also keeps the
+ * previous answer, so a transient failure cannot turn a known collision back on.
+ */
+function refreshExternalModels() {
+  const now = Date.now();
+  if (now - externalModels.at < EXTERNAL_MODELS_TTL_MS) return Promise.resolve(externalModels);
+  if (externalModelsInFlight !== null) return externalModelsInFlight;
+  if (!pi.models || typeof pi.models.list !== "function") {
+    externalModels = { ...externalModels, available: false };
+    return Promise.resolve(externalModels);
+  }
+  const generation = loadGeneration;
+  const work = (async () => {
+    try {
+      const rows = await pi.models.list();
+      const texts = new Set();
+      const ids = new Set();
+      for (const row of Array.isArray(rows) ? rows : []) {
+        if (row === null || typeof row !== "object") continue;
+        const providerId = typeof row.providerId === "string" ? row.providerId : "";
+        if (providerId === "" || isOwnProviderId(providerId)) continue;
+        const modelId = typeof row.modelId === "string" ? row.modelId.trim() : "";
+        const alias = typeof row.alias === "string" ? row.alias.trim() : "";
+        if (modelId !== "") ids.add(modelId.toLowerCase());
+        // The chip prints an alias when the host has one and the model id until
+        // it does. The host's own label is the third spelling: it rides on every
+        // row of the list, and a picker built from it hands that text back.
+        const shown = alias === "" ? modelId : alias;
+        if (shown !== "") texts.add(shown.toLowerCase());
+        const label = typeof row.label === "string" ? row.label.trim() : "";
+        if (label !== "") texts.add(label.toLowerCase());
+      }
+      // A reload resets the cache; a read from the activation it replaced must
+      // not put its names back.
+      if (generation !== loadGeneration) return externalModels;
+      externalModels = { texts, ids, at: Date.now(), known: true, available: true };
+    } catch (error) {
+      log("warn", "could not read the host model list: " + safeMessage(error));
+      if (generation !== loadGeneration) return externalModels;
+      // A failed read keeps a set that was already known, so a transient error
+      // cannot re-enable a collision. A host that never answered is treated as
+      // having no list at all: hiding every readout until a read happens to
+      // succeed is worse than the older best-effort answer.
+      const known = externalModels.known === true;
+      externalModels = { ...externalModels, at: Date.now(), known, available: known };
+    }
+    return externalModels;
+  })();
+  const run = work.finally(() => {
+    // A later load may already own the slot; only this read's entry may clear it.
+    if (externalModelsInFlight === run) externalModelsInFlight = null;
+  });
+  externalModelsInFlight = run;
+  return run;
+}
+
+/**
  * The tag a pool's models carry when two of them publish one name.
  *
  * Derived from the source and region rather than the provider id, so the entry
@@ -1677,9 +1840,15 @@ function stripModelTag(name, tag) {
  * The tag is the pool's, never the model id: a label that spells out an internal
  * id tells the user nothing they can act on, and the same two rows are already
  * separated by provider and id inside the host.
+ *
+ * A name another provider publishes outside this plugin is tagged the same way.
+ * The chip cannot say which provider it belongs to, so a plain name shared with
+ * a model this plugin does not serve would otherwise put one of its balances
+ * beside someone else's model.
  */
 function disambiguateModelLabels(providers) {
   const keyOf = (label) => String(label ?? "").trim().toLowerCase();
+  const external = externalChipTexts();
   const flat = [];
   providers.forEach((provider, providerIndex) => {
     const route = routeOfProviderId(provider.id);
@@ -1709,9 +1878,24 @@ function disambiguateModelLabels(providers) {
   const out = providers.map((provider) => ({ ...provider, models: [...(provider.models || [])] }));
   for (const row of flat) {
     const models = out[row.providerIndex].models;
-    const collides = baseCounts.get(keyOf(row.base)) > 1;
+    const key = keyOf(row.base);
+    const collides = baseCounts.get(key) > 1 || external.has(key);
     const label = collides && row.tag !== "" ? row.base + " (" + row.tag + ")" : row.base;
     models[row.modelIndex] = { ...models[row.modelIndex], name: label, alias: label };
+  }
+  // One pool can publish two models under one name, and the pool tag cannot
+  // separate them. The model id is already the host's key, so it becomes the
+  // suffix that keeps the chip text resolvable to one row.
+  const finalCounts = countOf(out.flatMap((provider) => (provider.models || []).map((model) => model.name || model.id || "")));
+  for (const row of flat) {
+    const models = out[row.providerIndex].models;
+    const model = models[row.modelIndex];
+    const key = keyOf(model.name || model.id || "");
+    if ((finalCounts.get(key) ?? 0) < 2) continue;
+    const id = String(model.id || "").trim();
+    if (id === "") continue;
+    const label = (model.name || id) + " #" + id;
+    models[row.modelIndex] = { ...model, name: label, alias: label };
   }
   return out;
 }
@@ -1965,6 +2149,13 @@ async function warmSourceDirectory(entry, signal) {
     const warm = await fetch(entry.baseUrl + "/v1/models", {
       signal: bounds.length === 1 ? bounds[0] : AbortSignal.any(bounds),
     });
+    // The status is all this read is for. Leaving the body unread holds the
+    // socket until GC or the upstream timeout, and every load-time warm leaves
+    // one behind.
+    if (warm.body !== null) await warm.body.cancel().catch(() => {});
+    // A load that retired this pass while the response was in flight must not
+    // write the next activation's manifest.
+    if (signal && signal.aborted) return false;
     entry.lastError = warm.ok ? "" : "directory answered HTTP " + warm.status;
   } catch (error) {
     if (signal && signal.aborted) return false;
@@ -2097,9 +2288,8 @@ const SOURCE_SPECS = {
       rotate,
     ).map(qoderClientCredential),
     /** The gateway holds mapped credentials, so the label is rebuilt the way `qoderRowLabel` builds it. */
-    failureLabel: (credential) => typeof credential.name === "string" && credential.name !== ""
-      ? credential.name
-      : credential.userID,
+    failureLabel: (credential, region) => qoderLabelOverrides.get(qoderLabelKey(credential, region))
+      ?? (typeof credential.name === "string" && credential.name !== "" ? credential.name : credential.userID),
   },
 };
 
@@ -2148,7 +2338,7 @@ async function createSourceRuntime(source, region) {
     // happened to fail. See `captureHostWindows`.
     publishedWindowOf: (modelId) => hostWindowOf(spec.providerIds[region], modelId),
     onAttemptFailure: (credential, outcome) => {
-      noteSourceFailure(source, region, spec.failureLabel(credential), outcome.retryAfter);
+      noteSourceFailure(source, region, spec.failureLabel(credential, region), outcome.retryAfter);
     },
     port: bound,
     logger: {
@@ -2465,6 +2655,8 @@ async function createRuntime(region) {
     portFallback: false,
     connecting: null,
     catalogFetchedAtMs: 0,
+    catalogRetryAttempt: 0,
+    catalogRetryTimer: undefined,
   };
   applyEffectiveSelection(region, runtime);
   // The preferred port is reserved before the listener is created, so a run
@@ -2644,14 +2836,22 @@ function retireStartingGateways() {
  * pass nobody asked for.
  */
 const modelRetryTimers = new Set();
-function scheduleModelRetries(attempt = 1) {
-  if (serviceStopped) return;
+function scheduleModelRetries(runtime) {
+  if (serviceStopped || runtime.stopped) return;
+  // One pending attempt per gateway. The previous chain re-armed itself after
+  // every try and each try triggered a refresh pass, whose failures started the
+  // chain from attempt one again: a gateway stuck on a bad sign-in retried
+  // without end instead of stopping at the attempt cap.
+  if (runtime.catalogRetryTimer !== undefined || runtime.catalogRetryAttempt >= MODEL_RETRY_ATTEMPTS) return;
   const timer = setTimeout(() => {
     modelRetryTimers.delete(timer);
+    runtime.catalogRetryTimer = undefined;
+    if (runtime.stopped || serviceStopped) return;
+    runtime.catalogRetryAttempt += 1;
     scheduleRefresh("model-list-retry");
-    if (attempt < MODEL_RETRY_ATTEMPTS) scheduleModelRetries(attempt + 1);
   }, CATALOG_RETRY_MS);
   if (typeof timer.unref === "function") timer.unref();
+  runtime.catalogRetryTimer = timer;
   modelRetryTimers.add(timer);
 }
 
@@ -2659,6 +2859,7 @@ function scheduleModelRetries(attempt = 1) {
 function clearModelRetries() {
   for (const timer of modelRetryTimers) clearTimeout(timer);
   modelRetryTimers.clear();
+  for (const runtime of runtimes.values()) runtime.catalogRetryTimer = undefined;
 }
 
 /**
@@ -2695,7 +2896,7 @@ async function connect(runtime, force) {
     // finished scan may park it.
     if (core.pool.status().lastScanAtMs === 0) {
       runtime.catalogFetchedAtMs = Date.now() - CATALOG_TTL_MS + CATALOG_RETRY_MS;
-      scheduleModelRetries();
+      scheduleModelRetries(runtime);
       return false;
     }
     // Mark this gateway as settled even though nothing was fetched: a gateway
@@ -2719,6 +2920,14 @@ async function connect(runtime, force) {
       if (runtime.stopped) return false;
       runtime.catalog.update(catalogFromUpstream(models));
       runtime.catalogFetchedAtMs = Date.now();
+      // A roster that read is the end of this gateway's failure streak, and the
+      // retry still waiting for it has nothing left to do.
+      runtime.catalogRetryAttempt = 0;
+      if (runtime.catalogRetryTimer !== undefined) {
+        clearTimeout(runtime.catalogRetryTimer);
+        modelRetryTimers.delete(runtime.catalogRetryTimer);
+        runtime.catalogRetryTimer = undefined;
+      }
     } catch (error) {
       runtime.lastWarning = "model list failed: " + safeMessage(error);
       // Keep the previous roster (or the static fallback), but do not count a
@@ -2727,7 +2936,7 @@ async function connect(runtime, force) {
       // picker - for the whole TTL after one slow start. The next attempt comes
       // on the retry clock instead.
       runtime.catalogFetchedAtMs = Date.now() - CATALOG_TTL_MS + CATALOG_RETRY_MS;
-      scheduleModelRetries();
+      scheduleModelRetries(runtime);
     }
   }
   if (runtime.stopped) return false;
@@ -2778,7 +2987,11 @@ function probesStale() {
       || core.pool.isDisabled(account.id)
       || !regionEnabled("workbuddy", regionOf(account.credential.domain))) continue;
     const cached = probeCache.get(account.id);
-    if (cached === undefined || now - cached.atMs >= PROBE_TTL_MS) return true;
+    if (cached === undefined) return true;
+    // A failed read carries no balance, so it is retried sooner than a good
+    // one: otherwise the readout sits on "—" until the full cache window ends.
+    const ttl = cached.value.creditsError !== undefined ? PROBE_RETRY_MS : PROBE_TTL_MS;
+    if (now - cached.atMs >= ttl) return true;
     // A cooling account gets a check-in-only entry. Once its cooldown ends that
     // entry is still inside the TTL, so without this the scheduler treated it
     // as current and the card could keep an old balance or none until a manual
@@ -2833,10 +3046,25 @@ function scheduleRefresh(reason) {
   // A stopped service owns no gateways: the timer would fire, run a pass that
   // returns at its own guard, and hold the loop for nothing.
   if (serviceStopped) return;
-  if (refreshTimer !== null || refreshInflight !== null) return;
+  if (refreshTimer !== null || refreshInflight !== null) {
+    // The panel polls `xd.state` while a pass is in flight and asks for a
+    // refresh on every poll. That is not a new request: the pass it is watching
+    // is the answer. Pending it here made one panel open run pass after pass,
+    // and each pass re-probed every Trae and Qoder account.
+    if (reason !== "panel") refreshPending = true;
+    return;
+  }
   refreshTimer = setTimeout(() => {
     refreshTimer = null;
-    refreshAll(reason, false).catch((error) => log("warn", "background refresh failed: " + safeMessage(error)));
+    refreshAll(reason, false)
+      .catch((error) => log("warn", "background refresh failed: " + safeMessage(error)))
+      .finally(() => {
+        if (!refreshPending || serviceStopped) return;
+        refreshPending = false;
+        // The follow-up runs on the same deferred clock as any other background
+        // pass, so the slot this one just released is seen as free.
+        scheduleRefresh("pending");
+      });
   }, 0);
   if (typeof refreshTimer.unref === "function") refreshTimer.unref();
 }
@@ -2977,7 +3205,7 @@ async function refreshAll(reason, force) {
     // The Trae and Qoder strips list their own local sign-ins, which no pool
     // cache holds; read them here so the panel can show who is found. A failed
     // read leaves the previous list rather than claiming "no sign-in".
-    await settleWithin(refreshSourceAccounts(), left());
+    await settleWithin(refreshSourceAccounts(generation), left());
     if (!stillLoaded(generation)) return stalePass();
     // A gateway whose directory never answered - it failed, or the read that
     // runs behind init is still in flight - is asked again here, so a cold or
@@ -3014,6 +3242,13 @@ async function refreshAll(reason, force) {
       // third caller start a pass while the background one was still running.
       if (previous !== null) await previous;
       if (refreshInflight === entry) refreshInflight = null;
+      // A direct pass can receive a settings change after it read them too. The
+      // follow-up runs once the slot is free, on the same terms as a background
+      // one.
+      if (refreshPending && !serviceStopped && stillLoaded(generation)) {
+        refreshPending = false;
+        scheduleRefresh("pending");
+      }
     }
   })();
   refreshInflight = entry;
@@ -3027,16 +3262,29 @@ async function refreshAll(reason, force) {
  */
 let traeAccountRows = [];
 let qoderAccountRows = [];
+/** Disambiguated labels by `region + "\n" + user id`, so a gateway that only has
+ *  a credential names the same row the panel does. Reset on every activation. */
+let traeLabelOverrides = new Map();
+let qoderLabelOverrides = new Map();
 
 /**
- * The name one Trae account is listed and claimed under.
+ * The name one Trae account is listed under before duplicates are resolved.
  *
  * A Trae-generated `username` can read as a stranger (`zhang san xyz`), so the
- * email is what the panel shows next to it; the label itself stays the app's
- * own name so it matches what the desktop app displays.
+ * email is what the panel shows next to it; the base label stays the app's own
+ * name so it matches what the desktop app displays.
  */
-function traeRowLabel(credential) {
+function traeBaseLabel(credential) {
   return credential.accountName ?? credential.email ?? credential.userId;
+}
+
+function traeLabelKey(credential) {
+  return traeRegionOfCredential(credential) + "\n" +
+    (credential.userId || credential.accountName || credential.email || "");
+}
+
+function traeRowLabel(credential) {
+  return traeLabelOverrides.get(traeLabelKey(credential)) ?? traeBaseLabel(credential);
 }
 
 /**
@@ -3052,9 +3300,17 @@ function traeAppLabelOf(credential) {
   return traeWindowsAppNames(credential.edition)[0];
 }
 
-/** The name one Qoder account is listed and claimed under. */
-function qoderRowLabel(credential) {
+/** The name one Qoder account is listed under before duplicates are resolved. */
+function qoderBaseLabel(credential) {
   return credential.name === "" ? credential.userID : credential.name;
+}
+
+function qoderLabelKey(credential, region) {
+  return (region ?? credential.region) + "\n" + (credential.userID || credential.name || "");
+}
+
+function qoderRowLabel(credential, region) {
+  return qoderLabelOverrides.get(qoderLabelKey(credential, region)) ?? qoderBaseLabel(credential);
 }
 
 /**
@@ -3232,18 +3488,31 @@ async function qoderRowProbe(credential, previous) {
   }
 }
 
-async function refreshSourceAccounts() {
+async function refreshSourceAccounts(generation = loadGeneration) {
   const now = Date.now();
   try {
     const regions = activeTraeRegions();
     if (regions.length > 0) {
       const found = await discoverTraeCredentials();
+      if (!stillLoaded(generation)) return;
+      // Labels are assigned over every discovered sign-in, before the region
+      // filter. Computing them over the enabled rows alone renamed the surviving
+      // account whenever another region was switched off: a suffix appeared or
+      // vanished with a setting that says nothing about this account, and the
+      // panel's holds, pack expiry and row state were keyed by that name.
+      const allLabels = uniqueSourceLabels(found.credentials, traeBaseLabel, (credential) => credential.userId);
+      const overrides = new Map();
+      found.credentials.forEach((credential, index) => {
+        overrides.set(traeLabelKey(credential), allLabels[index]);
+      });
       // These probes are independent, and none of them paces the upstream, so
       // they read at once rather than adding one bound per account: a machine
       // with several Trae sign-ins would otherwise spend the whole panel budget
       // here. `Promise.all` keeps the discovery order.
-      const rows = await Promise.all(found.credentials.filter((credential) => regions.includes(traeRegionOfCredential(credential))).map(async (credential) => {
-        const label = traeRowLabel(credential);
+      const wanted = found.credentials
+        .map((credential, index) => ({ credential, label: allLabels[index] }))
+        .filter(({ credential }) => regions.includes(traeRegionOfCredential(credential)));
+      const rows = await Promise.all(wanted.map(async ({ credential, label }) => {
         const region = traeRegionOfCredential(credential);
         const previous = traeAccountRows.find((row) => row.label === label && row.region === region);
         const probe = await traeRowProbe(credential, previous);
@@ -3259,8 +3528,11 @@ async function refreshSourceAccounts() {
           ...(probe?.usage ? { usage: probe.usage } : {}),
         };
       }));
+      if (!stillLoaded(generation)) return;
+      traeLabelOverrides = overrides;
       traeAccountRows = rows.filter((row) => regionEnabled("trae", row.region));
     } else {
+      if (!stillLoaded(generation)) return;
       traeAccountRows = [];
     }
   } catch (error) {
@@ -3270,6 +3542,17 @@ async function refreshSourceAccounts() {
     const regions = activeQoderRegions();
     if (regions.length > 0) {
       const found = await discoverQoderCredentials();
+      if (!stillLoaded(generation)) return;
+      // Same rule as Trae: the label belongs to the account, not to the set of
+      // regions that happen to be switched on right now.
+      const allLabels = uniqueSourceLabels(found.credentials, qoderBaseLabel, (credential) => credential.userID);
+      const overrides = new Map();
+      found.credentials.forEach((credential, index) => {
+        overrides.set(qoderLabelKey(credential), allLabels[index]);
+      });
+      const wanted = found.credentials
+        .map((credential, index) => ({ credential, label: allLabels[index] }))
+        .filter(({ credential }) => regions.includes(credential.region));
       const rows = [];
       // Qoder's probes are paced on purpose, so this one cannot read at once the
       // way Trae's does; it is bounded instead. Past the deadline a row keeps
@@ -3278,11 +3561,10 @@ async function refreshSourceAccounts() {
       // Counted, not flagged: an account whose region is switched off must not
       // decide whether the next one waits.
       let seen = 0;
-      for (const credential of found.credentials) {
-        if (!regions.includes(credential.region)) continue;
+      for (const { credential, label } of wanted) {
+        if (!stillLoaded(generation)) return;
         if (seen > 0) await delay(QODER_ACCOUNT_DELAY_MS);
         seen += 1;
-        const label = qoderRowLabel(credential);
         const previous = qoderAccountRows.find((row) => row.label === label && row.region === credential.region);
         const probe = Date.now() < deadline ? await qoderRowProbe(credential, previous) : previous;
         noteSourceExpiry("qoder", credential.region, label, probe?.usage?.credits?.packages);
@@ -3295,14 +3577,17 @@ async function refreshSourceAccounts() {
           ...(probe?.usage ? { usage: probe.usage } : {}),
         });
       }
+      if (!stillLoaded(generation)) return;
+      qoderLabelOverrides = overrides;
       qoderAccountRows = rows.filter((row) => regionEnabled("qoder", row.region));
     } else {
+      if (!stillLoaded(generation)) return;
       qoderAccountRows = [];
     }
   } catch (error) {
     log("warn", "listing Qoder sign-ins failed: " + safeMessage(error));
   }
-  pruneSourceState();
+  if (stillLoaded(generation)) pruneSourceState();
 }
 
 /**
@@ -3471,7 +3756,8 @@ async function accountProbe(account, allowNetwork, checkinOnly = false) {
   // A check-in-only read (a cooling account) writes a value without credits.
   // Treating that entry as fresh for the full read that follows kept the balance
   // blank until the next TTL, and `probesStale` stopped asking for it.
-  const cachedFresh = cached !== undefined && Date.now() - cached.atMs < PROBE_TTL_MS;
+  const cachedFresh = cached !== undefined
+    && Date.now() - cached.atMs < (cached.value.creditsError !== undefined ? PROBE_RETRY_MS : PROBE_TTL_MS);
   const cachedHasCredits = cached !== undefined
     && (cached.value.credits !== undefined || cached.value.creditsError !== undefined);
   if (cachedFresh && (checkinOnly
@@ -3653,10 +3939,6 @@ async function statusDocument(options) {
     ? Math.min(PROBE_BATCH_BUDGET_MS, Math.max(0, options.budgetMs))
     : PROBE_BATCH_BUDGET_MS;
   const now = Date.now();
-  // The reserve floors are read once for the whole document: the dictionary is
-  // rebuilt from settings on every call, and one row per account asked for it
-  // twice.
-  const reserves = creditReserves();
   // Promotions are announced on the campaign clock, so every model row in this
   // document is judged against one reading of it rather than a per-row clock
   // that could straddle an hour boundary mid-render.
@@ -3676,8 +3958,9 @@ async function statusDocument(options) {
     // Report the selection actually in force, not the raw stored one: if the
     // stored ids no longer exist upstream, the panel would otherwise open with
     // every model shown as disabled while the plugin is really serving all of
-    // them.
-    preferredAccountIds[region] = preferredAccountId(region) || "";
+    // them. A 1.2.3 key is translated here for the same reason: the pool serves
+    // its current id, so that is the row the document has to mark.
+    preferredAccountIds[region] = core.pool.resolvedPreferredId(region) || "";
     selectionByRegion[region] = effectiveSelectionFor(region, runtimes.get(region)?.catalog);
     if (selectionStale(region, runtimes.get(region)?.catalog)) staleSelectionRegions.push(region);
     // Without a target model, only account-wide cooldowns can be previewed.
@@ -3686,13 +3969,15 @@ async function statusDocument(options) {
     // rule in this file once marked a switched-off account as next up.
     const available = core.pool.available(now, undefined, region);
     const preferred = available.find((account) => account.id === preferredAccountIds[region]);
-    // Priority and expiry name the account the next request will use. The
-    // rotating modes do not, so they mark nothing rather than point at a guess.
-      const nextUp = preferred ?? core.pool.preview(available);
+    // Priority, expiry and round-robin name the account the next request will
+    // use. Sticky has no single next account, so it marks nothing rather than
+    // point at a guess; the composer readout names the last one instead.
+    const nextUp = preferred ?? core.pool.preview(available);
     runtimeNextUpId.set(region, nextUp === undefined ? undefined : nextUp.id);
 
     for (const account of core.pool.list(region)) {
       const cooling = account.cooldownUntilMs > now;
+      const creditReserve = core.pool.creditReserve(account.id);
       const modelCooldowns = Object.entries(account.modelCooldowns)
         .filter(([, until]) => until > now)
         .sort((a, b) => a[1] - b[1])
@@ -3715,7 +4000,8 @@ async function statusDocument(options) {
         // already reads as cooling, and a balance read releases it.
         ...activeHoldOf(account.id, now),
         active: runtimeNextUpId.get(region) === account.id,
-        preferred: preferredAccountIds[region] === account.id,
+        preferred: preferredAccountIds[region] === account.id
+          || core.pool.storedIds(account.id).includes(preferredAccountIds[region]),
         disabled: core.pool.isDisabled(account.id),
         // Kept only in the pool's archive: its sign-in was overwritten when the
         // app switched accounts, so the row stays visible but is never picked.
@@ -3724,9 +4010,8 @@ async function statusDocument(options) {
         // A desktop app's own sign-in is never offered that: deleting it would
         // sign the user out of the app.
         ...core.pool.ownsSignIn(account.id) ? { own: true } : {},
-        // Hoisted out of the row: the reserves dictionary was rebuilt for every
-        // account in the pool, twice per row.
-        ...reserves[account.id] === undefined ? {} : { creditReserve: reserves[account.id] },
+        // The floor in force, including one stored under the 1.2.3 key.
+        ...creditReserve === undefined ? {} : { creditReserve },
       };
       // Credits and check-in are read behind the row, not inside it: the batch
       // runs after every row is built, so one account's read cannot hold up the
@@ -4101,7 +4386,7 @@ function samePublishedAddress(a, b) {
  *
  * That state is exactly `net::ERR_CONNECTION_REFUSED`: the host caches the
  * published address per provider row and only re-reads the manifest on
- * startup, on enable/disable, or on an uninstall (ADR 0259 §9). Detecting it
+ * startup, on enable/disable, or on an uninstall. Detecting it
  * lets the panel name the fix - restarting PI-Desktop - instead of leaving the
  * user with a silent connection failure.
  *
@@ -4343,7 +4628,7 @@ async function doctorReport() {
 
   // A provider row is written from the manifest the host read at enable time.
   // The host keeps using that address until it next re-reads the manifest -
-  // startup, enable/disable, or an uninstall (ADR 0259 §9) - which is exactly
+  // startup, enable/disable, or an uninstall - which is exactly
   // what makes requests fail with ERR_CONNECTION_REFUSED when the address the
   // manifest names is not the one this run bound. Comparing the two turns that
   // silent failure into a named finding with the one action that clears it.
@@ -4759,6 +5044,8 @@ async function onPanelInvoke(channel, payload) {
      * gateway's roster is refetched even inside its refresh window.
      */
     case "xd.rescan": {
+      // A re-read that outlives this activation must not write its rows back.
+      const generation = loadGeneration;
       // One deadline for the whole re-read, because it is the widest pass the
       // panel can ask for: a scan, both strips' sign-ins, every roster and the
       // document. Each part keeps its own bound; this one keeps their sum
@@ -4782,7 +5069,7 @@ async function onPanelInvoke(channel, payload) {
       await settleWithin(startRuntimes(), left());
       // Trae/Qoder sign-ins live in their own app files, so a deliberate scan
       // re-reads them to pick up logins made while the panel was open.
-      await settleWithin(refreshSourceAccounts(), left());
+      await settleWithin(refreshSourceAccounts(generation), left());
       // A sign-in picked up by the re-read has to reach its gateway and its
       // model row now, not on the next timed refresh: a first login made while
       // the panel was open otherwise left the strip populated while its
@@ -4934,7 +5221,11 @@ async function onPanelInvoke(channel, payload) {
         throw panelError("region, accountId and a known state are required", "INVALID");
       }
       const account = core.pool.list(region).find((item) => item.id === accountId);
-      const stored = removedAccounts().find((entry) => entry.id === accountId);
+      // A restore or a delete can name a row whose stored state still carries
+      // the 1.2.3 key: the account list and the settings file disagree on the
+      // spelling of the same account, and both spellings are this account's.
+      const ids = core.pool.storedIds(accountId);
+      const stored = removedAccounts().find((entry) => ids.includes(entry.id));
       if (state !== "restored" && account === undefined && stored === undefined) {
         throw panelError("account does not belong to this gateway", "NOT_FOUND");
       }
@@ -4951,7 +5242,9 @@ async function onPanelInvoke(channel, payload) {
         if (deleted !== true) {
           throw panelError("the sign-in file could not be removed", "DELETE_FAILED");
         }
-        await settleWithin(core.pool.scan(), POOL_SCAN_BUDGET_MS);
+        // The probe cache is keyed by the account that just left this pool.
+        probeCache.delete(accountId);
+        await settleWithin(core.pool.rescan(), POOL_SCAN_BUDGET_MS);
         // The account id is a hash of its identity, so signing the same account in
         // again produces the same id. Anything still recorded against it would come
         // back with the new sign-in: a deleted-then-re-added account arrived already
@@ -4959,13 +5252,13 @@ async function onPanelInvoke(channel, payload) {
         // no reason for either.
         const forgotten = await mutateSettings("disabledAccountIds", (current) => {
           const known = Array.isArray(current) ? current.filter((id) => typeof id === "string") : [];
-          return known.filter((id) => id !== accountId);
+          return known.filter((id) => !ids.includes(id));
         });
         if (forgotten !== true) log("warn", "could not clear the disabled state for " + accountId);
         const reserveCleared = await mutateSettings("creditReserves", (current) => {
           const known = current && typeof current === "object" && !Array.isArray(current) ? current : {};
           const next = { ...known };
-          delete next[accountId];
+          for (const id of ids) delete next[id];
           return next;
         });
         if (reserveCleared !== true) log("warn", "could not clear the credit reserve for " + accountId);
@@ -4977,7 +5270,7 @@ async function onPanelInvoke(channel, payload) {
         // below, so the same cleanup has to run on this path too: a removed id
         // left in `preferredAccountIds` kept the panel rendering an "unavailable"
         // choice as the selected account until the user picked Automatic.
-        if (preferredAccountId(region) === accountId) {
+        if (ids.includes(preferredAccountId(region))) {
           const cleared = await mutateSettings("preferredAccountIds", (current) => {
             const next = { ...(current && typeof current === "object" && !Array.isArray(current) ? current : {}) };
             delete next[region];
@@ -4992,7 +5285,7 @@ async function onPanelInvoke(channel, payload) {
 
       const written = await mutateSettings("disabledAccountIds", (current) => {
         const known = Array.isArray(current) ? current.filter((id) => typeof id === "string") : [];
-        const next = known.filter((id) => id !== accountId);
+        const next = known.filter((id) => !ids.includes(id));
         if (state === "disabled") next.push(accountId);
         return next;
       });
@@ -5001,7 +5294,7 @@ async function onPanelInvoke(channel, payload) {
         const known = Array.isArray(current)
           ? current.filter((entry) => entry !== null && typeof entry === "object" && !Array.isArray(entry))
           : [];
-        const next = known.filter((entry) => entry.id !== accountId);
+        const next = known.filter((entry) => !ids.includes(entry.id));
         if (state === "removed") {
           next.push({
             id: accountId,
@@ -5018,7 +5311,7 @@ async function onPanelInvoke(channel, payload) {
       core.pool.applyRemoved(removed.map((entry) => entry.id));
       // An account that is switched off or gone must not stay the preferred
       // one: the pool would keep asking for an id it cannot hand out.
-      if (accountId !== "" && preferredAccountId(region) === accountId && state !== "enabled" && state !== "restored") {
+      if (accountId !== "" && ids.includes(preferredAccountId(region)) && state !== "enabled" && state !== "restored") {
         // Inside the write queue, like the two writes above: this dictionary is
         // read and written whole, and a whole-dictionary write computed from a
         // snapshot taken before the queue used to drop a choice another action
@@ -5054,8 +5347,10 @@ async function onPanelInvoke(channel, payload) {
       }
       const written = await mutateSettings("creditReserves", (current) => {
         const next = { ...(current && typeof current === "object" && !Array.isArray(current) ? current : {}) };
-        if (reserve === 0) delete next[accountId];
-        else next[accountId] = Math.floor(reserve);
+        // The 1.2.3 key still names this account; clearing only the current one
+        // let the old floor come back the next time settings were applied.
+        for (const id of core.pool.storedIds(accountId)) delete next[id];
+        if (reserve !== 0) next[accountId] = Math.floor(reserve);
         return next;
       });
       if (written !== true) throw panelError("the reserve could not be saved", "SAVE_FAILED");
@@ -5355,7 +5650,7 @@ async function onPanelInvoke(channel, payload) {
       await writeOwnSignIn(directory, answer.signIn);
       // A new account is not in a read taken before it landed.
       dropGrowthRead();
-      await settleWithin(core.pool.scan(), POOL_SCAN_BUDGET_MS);
+      await settleWithin(core.pool.rescan(), POOL_SCAN_BUDGET_MS);
       await refreshAll("panel-login", false);
       // The fresh document rides the answer. The panel adopts whatever a
       // channel hands back, and a login that answered with a name and nothing
@@ -6688,11 +6983,26 @@ async function publishDeclarationEarly() {
   const generation = loadGeneration;
   await adoptHostSettings();
   if (!stillLoaded(generation)) return;
+  // The external provider names decide which of this plugin's labels need a
+  // pool tag. Read them before the declaration below is built; a host that
+  // cannot answer leaves the empty set and the previous behaviour.
+  await settleWithin(refreshExternalModels(), 1500);
+  if (!stillLoaded(generation)) return;
   // Published while disabled too: a manifest still carrying provider rows would
   // have the host offer a gateway this run never starts, until something else
   // rewrote it. `syncDeclaration` clears the rows when every source is off,
   // which is what `enabled: false` means here.
   if (settings.enabled === false) {
+    // A reload can leave the previous activation's Trae/Qoder gateways bound:
+    // they are deliberately not closed by `onLoad`, and this branch returns
+    // before the reconcilers. Closing them here keeps a disabled plugin from
+    // serving through a loopback endpoint the panel says is off.
+    const deadline = Date.now() + LOAD_BOOTSTRAP_BUDGET_MS;
+    const left = () => Math.max(0, deadline - Date.now());
+    await settleWithin(reconcileTraeGateways(), left());
+    if (!stillLoaded(generation)) return;
+    await settleWithin(reconcileQoderGateways(), left());
+    if (!stillLoaded(generation)) return;
     const cleared = syncDeclaration();
     if (cleared.ok !== true) log("warn", "declaration not cleared: " + String(cleared.error));
     return;
@@ -6722,7 +7032,7 @@ async function publishDeclarationEarly() {
   // finishes behind the answer and the refresh after `service.start` repeats it.
   await settleWithin(Promise.all(Array.from(runtimes.values()).map(async (runtime) => {
     try {
-      await connect(runtime, true);
+      await refreshRuntime(runtime, "load", true);
     } catch (error) {
       runtime.lastError = safeMessage(error);
       log("warn", runtime.region + " failed to start during load: " + runtime.lastError);
@@ -6755,7 +7065,14 @@ async function onServiceStart() {
   if (!stillLoaded(generation)) return;
   if (settings.enabled === false) {
     // Published anyway: a manifest left carrying provider rows would keep the
-    // host offering a gateway this run will never start.
+    // host offering a gateway this run will never start. The previous
+    // activation's Trae/Qoder gateways are closed for the same reason.
+    const deadline = Date.now() + SERVICE_BOOTSTRAP_BUDGET_MS;
+    const left = () => Math.max(0, deadline - Date.now());
+    await settleWithin(reconcileTraeGateways(), left());
+    if (!stillLoaded(generation)) return;
+    await settleWithin(reconcileQoderGateways(), left());
+    if (!stillLoaded(generation)) return;
     syncDeclaration();
     log("info", "plugin disabled in settings; the provider host stays down");
     return;
@@ -6787,7 +7104,7 @@ async function onServiceStart() {
   await settleWithin(Promise.all(Array.from(runtimes.values()).map(async (runtime) => {
     try {
       // Skip the fetch when onLoad already seeded a fresh roster.
-      await connect(runtime, !catalogFresh(runtime));
+      await refreshRuntime(runtime, "service", !catalogFresh(runtime));
     } catch (error) {
       runtime.lastError = safeMessage(error);
       log("warn", runtime.region + " failed to start: " + runtime.lastError);
@@ -6814,6 +7131,7 @@ async function onServiceStop() {
     clearTimeout(refreshTimer);
     refreshTimer = null;
   }
+  refreshPending = false;
   // The slot is released here as well as by the pass that holds it: a pass
   // suspended in a network await keeps it for up to the remainder of its budget,
   // and the freshly loaded plugin's first background pass was dropped for that
@@ -6842,11 +7160,52 @@ async function onServiceStop() {
   await Promise.all(closing);
 }
 
+/**
+ * Register the command that opens the panel.
+ *
+ * The command is optional plumbing for older hosts: a host without the command
+ * API still opens the panel through its own UI, so a failure here is logged and
+ * otherwise ignored.
+ */
+async function registerPanelCommand() {
+  if (!pi.commands || typeof pi.commands.register !== "function") return;
+  try {
+    await pi.commands.register({
+      id: OPEN_PANEL_COMMAND,
+      title: "WTQ Pool: Open panel",
+      category: "WTQ Pool",
+      keywords: ["wtq", "workbuddy", "trae", "qoder", "账号池", "积分", "签到", "面板"],
+      run: async () => {
+        if (!pi.ui || typeof pi.ui.openPanel !== "function") throw new Error("this host has no plugin panel");
+        await pi.ui.openPanel({ title: "WTQ Pool" });
+      },
+    });
+  } catch (error) {
+    log("warn", "panel command registration failed: " + safeMessage(error));
+  }
+}
+
 async function onLoad() {
   // Cleared here, not only in `onServiceStart`: `publishDeclarationEarly` below
   // starts the gateways, and every creator refuses to run while this is set.
   serviceStopped = false;
   const generation = ++loadGeneration;
+  // The host's model list and the manifest copy are per-activation views: a
+  // reload can follow a change to either, and a set kept from the previous
+  // activation answered with labels the host no longer loaded.
+  externalModels = { texts: new Set(), ids: new Set(), at: 0, known: false, available: true };
+  externalModelsInFlight = null;
+  manifestCache = undefined;
+  traeLabelOverrides = new Map();
+  qoderLabelOverrides = new Map();
+  traeAccountRows = [];
+  qoderAccountRows = [];
+  // Per-load state, cleared here as well as on unload: a reload can replace
+  // this activation without its unload finishing, and a new activation must
+  // not inherit holds keyed to sign-ins it never read.
+  resetSourceActivationState();
+  probeCache.clear();
+  deviceLogins.clear();
   core.pool?.clear();
   // A reload can arrive without the previous unload. Abort the pass it still
   // has and stop its timers. The Trae and Qoder gateways are left alone:
@@ -6863,6 +7222,7 @@ async function onLoad() {
     clearTimeout(refreshTimer);
     refreshTimer = null;
   }
+  refreshPending = false;
   refreshInflight = null;
   checkinAbort = new AbortController();
   // A reload is this plugin's restart, so the check-in bookkeeping starts clean:
@@ -6881,6 +7241,7 @@ async function onLoad() {
   // the reload is still in flight, and its `finally` clears the flag it took.
   growthPassRunning = false;
   growthLast = null;
+  dropGrowthRead();
   qoderRetryAt = 0;
   // Built before the first await, so a panel invoke that lands while this load
   // is between its awaits never meets a half-loaded engine: the host dispatches
@@ -6961,6 +7322,9 @@ async function onLoad() {
   if (adoptedPreviousData) await adoptHostSettings();
   if (!stillLoaded(generation)) return;
   pi.services.register({ id: SERVICE_ID, start: onServiceStart, stop: onServiceStop });
+  // The command is a convenience; the provider declaration must not wait on a
+  // host command service that is slow to answer.
+  await settleWithin(registerPanelCommand(), 1000);
   // The host pushes a settings document whenever the user edits this plugin in
   // its own settings UI. Without this listener those edits only took effect
   // after a full plugin reload.
@@ -6989,17 +7353,18 @@ async function onUnload() {
   // The module-level state a load builds is per-load state: a hold, an expiry
   // note or a rotation cursor left behind outlives the sign-ins it was keyed
   // by, and the next load inherits accounts that are not there any more.
-  sourceFailureHold.clear();
-  sourceCreditExpiry.clear();
-  sourceRotation.clear();
-  travelAdoptTried.clear();
-  traeIdentityBlockers.clear();
+  resetSourceActivationState();
+  dropGrowthRead();
   gatewayStartFailures.clear();
   sourceStartFailures.clear();
   // A sign-in the panel started is process state: a poll arriving after the
   // reload would otherwise be answered with a state this activation never issued.
   deviceLogins.clear();
   unsubscribeFromHostSettings();
+  // Everything above is synchronous on purpose: a reload can begin before this
+  // teardown returns, and state detached after an await would belong to the new
+  // activation by then. The host removes this plugin's commands itself once the
+  // unload hook returns, so no RPC is awaited here.
   await stopped;
 }
 
@@ -7026,11 +7391,19 @@ function composerPointsEnabled() {
  */
 function composerModels() {
   const rows = [];
-  // The chip carries a label the host read from the manifest, so the manifest
-  // is where the label is resolved back to the gateway that published it. The
-  // names there are already disambiguated; matching the live rosters instead
-  // would miss exactly the models two gateways both serve.
-  for (const provider of manifestProviders()) {
+  // The chip carries a label the host read from the manifest, so the host's own
+  // copied declaration is where that text is resolved - not the file this
+  // process rewrites after startup. The host re-reads the manifest only on its
+  // next load, so its copy is one generation behind whenever a label changed;
+  // resolving against the file then matches nothing the chip can print.
+  //
+  // Rows the host has not seen yet are added from the file: a provider installed
+  // while the app runs is not selectable until the next load, but a selected
+  // model from the previous generation still has to resolve.
+  const host = hostManifestProviders();
+  const hostIds = new Set(host.map((provider) => provider.id));
+  const declared = [...host, ...manifestProviders().filter((provider) => !hostIds.has(provider.id))];
+  for (const provider of declared) {
     const route = routeOfProviderId(provider.id);
     if (route === undefined) continue;
     for (const model of provider.models || []) {
@@ -7050,6 +7423,23 @@ function composerModels() {
     seen.set(key, (seen.get(key) ?? 0) + 1);
   }
   return rows.filter((row) => seen.get(composerChipText(row)) === 1);
+}
+
+/**
+ * The declaration the host actually loaded.
+ *
+ * `getManifest` is the host's copy, read before this process started. It is what
+ * the model picker and the composer chip are built from, so it is the only
+ * answer that can resolve their text after a label changed.
+ */
+function hostManifestProviders() {
+  try {
+    if (typeof pi === "undefined" || !pi.plugin || typeof pi.plugin.getManifest !== "function") return [];
+    const providers = pi.plugin.getManifest()?.contributes?.providers;
+    return Array.isArray(providers) ? providers : [];
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -7097,7 +7487,10 @@ function composerChipTexts() {
   const models = composerModels();
   for (const row of models) {
     texts.add(composerChipText(row));
-    const untagged = row.label.replace(/\s+\([^()]*\)$/, "").trim();
+    // Only this row's own tag is removable. Stripping any trailing parenthesis
+    // turned a natural name such as `Claude 3.5 (latest)` into a second text
+    // and let an external model with that name read as this plugin's.
+    const untagged = stripModelTag(row.label, modelTag(row.source, row.region));
     if (untagged !== "" && untagged !== row.label) texts.add(untagged.toLowerCase());
   }
   // The host prints `alias || id`, so a chip can carry a model id until the alias
@@ -7132,6 +7525,12 @@ function composerChipTexts() {
 function matchComposerModel(chip) {
   const wanted = composerChipTextOf(chip);
   if (wanted === "") return undefined;
+  if (!externalModelsReady()) return undefined;
+  // The host's chip text alone cannot say which provider the picker selected. A
+  // text another provider also prints is therefore not evidence for this
+  // plugin's route, even when it happens to match one of its labels or ids;
+  // answering it would show an account balance against someone else's model.
+  if (externalModels.texts.has(wanted) || externalModels.ids.has(wanted)) return undefined;
   const models = composerModels();
   const byLabel = models.find((model) => composerChipText(model) === wanted);
   if (byLabel !== undefined) return byLabel;
@@ -7174,9 +7573,9 @@ function workbuddyComposerAccounts(region, modelId) {
   const now = Date.now();
   const list = core.pool.list(region);
   const available = core.pool.available(now, modelId, region);
-  const preferredId = preferredAccountId(region);
+  const preferredId = core.pool.resolvedPreferredId(region);
   const preferred = available.find((account) => account.id === preferredId);
-  const next = preferred ?? core.pool.preview(available);
+  const next = preferred ?? core.pool.readoutPreview(available);
   return list.map((account) => {
     const cached = probeCache.get(account.id)?.value?.credits;
     return {
@@ -7237,9 +7636,17 @@ function sourceComposerAccounts(source, region) {
  */
 function composerPoints(args) {
   if (!composerPointsEnabled()) return { show: false, ours: false, enabled: false };
+  // Keep the collision set current without making a poll wait for it: the
+  // answer below reads the cache, and the next poll sees the refreshed list.
+  if (Date.now() - externalModels.at >= EXTERNAL_MODELS_TTL_MS) {
+    void refreshExternalModels().catch(() => {});
+  }
   const hit = matchComposerModel(args?.chip);
   if (hit === undefined) {
-    return { show: false, ours: composerChipTexts().has(composerChipTextOf(args?.chip)), enabled: true };
+    // An unread external list is a wait, not a stop: answering `ours:false`
+    // made the readout drop to its five-minute poll before the list arrived.
+    const ours = composerChipTexts().has(composerChipTextOf(args?.chip));
+    return { show: false, ours, enabled: true };
   }
   if (hit.source === "workbuddy" && probesStale()) scheduleRefresh("composer");
   const accounts = hit.source === "workbuddy"

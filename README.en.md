@@ -31,7 +31,7 @@
   <a href="https://github.com/chengzhi-c/pi-desktop-wtq-pool/stargazers"><img src="https://img.shields.io/github/stars/chengzhi-c/pi-desktop-wtq-pool?style=flat-square" alt="GitHub stars"></a>
 </p>
 
-> Unofficial clients may trigger account restrictions. Review the risks and the relevant service terms before use.
+> This project is for learning use only. Unofficial clients may trigger account restrictions. Review the risks and the relevant service terms before use.
 
 WorkBuddy fails over when an account is rate-limited or out of quota. Trae and Qoder select an account per request and move on to the next sign-in on an authentication failure, a rate limit or exhausted quota, while a problem with a Trae or Qoder request itself, such as an unknown model or a malformed body, is answered locally with 404 or 400. Each source has its own switch, with domestic and international accounts grouped separately. When the domestic host's channel check (11128) refuses a prompt, the plugin retries once: the system messages fold into the first user message, a `developer` role folds into `system`, the client name in assistant history becomes `DeepSeek`, and the request keeps one neutral system message; an accepted prompt is cached per region.
 
@@ -67,17 +67,17 @@ To run the preview locally, clone the repository, run `node docs/serve.cjs`, and
 
 - Reuse local sign-ins from the three desktop apps. WorkBuddy also supports Add account in the panel, which uses its official login page and saves the sign-in in the plugin's own directory.
 - Register model groups by region: each region of each vendor becomes its own provider, and several can be on at once; a region with no account is not registered. A domestic model runs only on domestic accounts, and an international model only on international ones.
-- Account distribution: WorkBuddy supports priority, round-robin, expiring credits first and conversation-sticky accounts, and fails over on a rate limit or exhausted quota. Trae and Qoder support priority, round-robin and expiring credits first, and move on to the next sign-in on an authentication failure, a rate limit or exhausted quota.
+- Account distribution: WorkBuddy supports priority, round-robin, expiring credits first and conversation-sticky accounts, and fails over on a rate limit, exhausted quota or upstream 5xx. Trae and Qoder support priority, round-robin and expiring credits first, and move on to the next sign-in on an authentication failure, a rate limit or exhausted quota.
 - Gateway responses are SSE streams of `chat.completion.chunk`; the `stream` field in the request body does not change the format.
 - Credit automation: automatic check-in is off by default. When enabled, scheduled runs perform check-ins and WorkBuddy growth claims. A make-up card is spent only when yesterday is missing and a card is available. After streak tiers are claimed, available lottery draws are used. Cat travel is available only for domestic accounts.
 - Token keep-alive: on demand, on a card of its own. A snapshot the desktop client left behind is adopted into the plugin's own sign-in directory when the pool scans, and the plugin renews it from then on; the desktop app renews the sign-in it is using. "Refresh now" works on the plugin's own copies and judges by issue time: anything signed more than six hours ago is refreshed, and a token within five minutes of expiry takes the same path. The answer is written back into the sign-in file the plugin owns, so a sign-in the upstream refused is found the same day. When one account has sign-ins in several places, the newest issue time wins. Disabled accounts, disabled regions and accounts whose sign-in the upstream refused stay out.
-- Composer credits: with `showComposerPoints` on, the composer toolbar shows the balance of the account behind the current model; click it to switch accounts. Switching the feature off hides the popover and slows the poll to once every five minutes, so switching it back on recovers without a model change. The two WorkBuddy regions publish the same catalogue, so a model name both of them serve carries a gateway suffix (`… (Global)`); the readout uses it to tell the two account groups apart.
+- Composer credits: with `showComposerPoints` on, the composer toolbar shows the balance of the account behind the current model; click it to switch accounts. Switching the feature off hides the popover and slows the poll to once every five minutes, so switching it back on recovers without a model change. The two WorkBuddy regions publish the same catalogue, so a model name both of them serve carries a gateway suffix (`… (Global)`); a name another provider also publishes carries the same suffix, and the readout follows this plugin's models only. In round-robin and conversation-sticky modes the readout names the account that serves next or served last.
 - Panel: account and pool state, model selection, the connection check and the growth centre all live in the plugin panel. The model catalogue loads at startup and refreshes on demand once its cache expires. Disabled accounts and accounts whose sign-in the upstream refused are never probed.
 - Connection check: every finding carries a verdict. A gateway that is not listening, a catalogue that could not be read, a registered address that differs from the one actually bound, and a provider the host did not accept all count as failures and say what to change. A gateway whose start failed is reported with the reason, and the panel surfaces address drift as a restart hint. A check that fails on its own becomes a finding, and the rest of the report still appears.
 
 ## Install
 
-PI-Desktop → Plugins → Install local plugin, then select the `.piplug` file. You can also download the matching release from [Releases](https://github.com/chengzhi-c/pi-desktop-wtq-pool/releases).
+PI-Desktop → Extensions → Install package, then select the `.piplug` file. You can also download the matching release from [Releases](https://github.com/chengzhi-c/pi-desktop-wtq-pool/releases).
 
 Requires PI-Desktop 0.15.0 or later; see `engines.piDesktop` in `manifest.json`.
 
@@ -85,9 +85,11 @@ Requires PI-Desktop 0.15.0 or later; see `engines.piDesktop` in `manifest.json`.
 
 ## Usage
 
+> From PI-Desktop 0.22 the panel is no longer opened from a button on its card in the Extensions page. Press `Alt+Space` for the global launcher, or type `WTQ Pool` or `WTQ Pool: Open panel` in the command palette (the command id is `wtqpool.open`).
+
 Sign in inside each vendor's desktop app, then click "Detect accounts again" in the panel. WorkBuddy reads several saved sign-ins; for more than one account, sign in one after another in the app. A `$wbEncrypted` sign-in from 5.6 on is read by asking the locally installed WorkBuddy for the key. The domestic Trae build has two sign-in slots, Trae CN and TRAE SOLO CN. Qoder keeps one sign-in per install, so signing in again in the app overwrites the previous one. The international WorkBuddy client keeps a single sign-in file, so switching accounts overwrites the previous one. The plugin archives a sign-in as it is overwritten, and that account keeps serving until its token expires; signing it in again in the app renews it.
 
-On Windows, decrypting sign-ins requires a WorkBuddy executable on a fixed local drive with a valid signature and a supported signing key. The plugin does not decrypt these sign-ins when the host runs elevated on Windows or as root on macOS or Linux. If WorkBuddy changes its signing key, update the plugin before decrypting them.
+On Windows, decrypting sign-ins requires a WorkBuddy executable on a fixed local drive with a valid signature and a supported signing key. The plugin does not decrypt these sign-ins when the host runs elevated on Windows or as root on macOS or Linux. If WorkBuddy changes its signing key, update the plugin before decrypting them. On macOS the plugin runs the locally installed WorkBuddy executable to read the key without verifying its signature; only run installations you trust.
 
 An account can also be added without the desktop app: "Add account" in the panel's WorkBuddy header opens the vendor's login page in a browser, and the account joins the pool once that page completes. The credential is written under `signins/` in the plugin's own data directory and takes part in distribution on the same terms as a desktop sign-in. Such an account also carries a "Delete" action, which confirms on a second press; see the Data section for what it removes. An account the desktop app is signed into right now has no Delete: that session belongs to the app. The account is added to the region currently selected, so the domestic region signs in a domestic account and the international region an international one.
 
@@ -101,7 +103,7 @@ To back them up, copy the `signins/` directory. Those files hold live tokens who
 
 If the model groups do not appear, restart PI-Desktop as the note at the top of the panel says.
 
-- **Account pool**: each account's label, remaining credits, quota expiry, cooldown state and check-in status. An account can be disabled on its own or removed, and a region can be pinned to one preferred account. An account whose sign-in the upstream refused shows a "re-login needed" badge, the reason and a "held until" time; credits and check-in stay blank while held. An account the upstream restricted instead shows a "restricted" badge and a "restricted by the upstream until" stamp, is retried every six hours, and needs an appeal in the WorkBuddy console.
+- **Account pool**: each account's label, remaining credits, quota expiry, cooldown state and check-in status. An account can be disabled on its own or removed, and a region can be pinned to one preferred account. An account whose sign-in the upstream refused shows a "re-login needed" badge, the reason and a "held until" time; credits and check-in stay blank while held. An account the upstream restricted instead shows a "restricted" badge and a "restricted by the upstream until" stamp, is retried every six hours, and needs an appeal in the WorkBuddy console. When two Trae or Qoder accounts share a display name, each label carries a `#` and the last eight characters of the user id.
 - **Models**: select which models this region exposes; anything unselected stays out of the model picker. The display name, context window, output limit, thinking levels and image support are editable. A model group publishes at most 64 models; any beyond that are marked "not published" while the gateway still serves them.
 - **Connection check**: reports line by line whether each gateway is listening, how many models its catalogue returned, whether the registered address matches the one actually bound, and whether the host accepted each provider, and can copy the whole report.
 - **Growth centre**: applies to WorkBuddy only. It lists one row per account, and expanding a row shows that account's streak tiers. "Read state" reads the current tiers and what is due; "Run now" claims them and runs the growth stage, reporting every step: the make-up card, the gift and compensation, the activity report, and the streak tiers with their draws. An account whose sign-in the upstream refused is skipped in that round.
@@ -114,7 +116,7 @@ A read stays in the plugin process: reloading the panel still paints the last fi
 
 ## Settings
 
-Editable from the host's settings page; `distribution` and the composer readout are also editable from the plugin page:
+Editable from the host's settings page; `distribution` and the composer readout are also editable from the extensions page:
 
 | Key | Default (effective) | Meaning |
 | --- | --- | --- |
@@ -159,13 +161,13 @@ The DeepSeek Harness edition uses a separate port range starting at 42831. Both 
 
 ## Data
 
-The plugin reads the vendors' local sign-in files. Tokens are held by the plugin and go only to the relevant vendor endpoints. Gateways listen on `127.0.0.1`, so other local processes can call them and spend account quota. The host persists plugin settings; the plugin writes its model groups into its own manifest.
+The plugin reads the vendors' local sign-in files. Tokens are held by the plugin and go only to the relevant vendor endpoints. Gateways listen on `127.0.0.1`, so other local processes can call them and spend account quota. The plugin is designed for a single-user desktop and does not separate other OS users on the same machine; use separate OS accounts on a shared machine. The host persists plugin settings; the plugin writes its model groups into its own manifest.
 
-The plugin's own data directory (the one `pi.plugin.getDataPath()` names) holds five data files. Lock recovery can leave temporary files behind; a later successful acquisition of the same file lock retries their cleanup. `settings.json` is the plugin settings the host persists (a former plugin id's copy is carried over once on first load). `checkin-slots.json` records the check-in slots already collected and the pending Qoder retry time; slots are kept for three days. `doctor.txt` is the most recent connection report, item by item, and lists no account label. `credentials-archive.json` keeps the sign-ins a later account switch overwrote: access and refresh tokens, account identifiers (nickname, uin/uid, enterprise id) and the local sign-in path. Entries are kept by token expiry, dropping each 30 days after it; an entry with no stated expiry is kept until the account is deleted. `deleted-signins.json` records deleted sign-ins as a token digest, the sign-in's issue time and a delete time, so a scan cannot take the same superseded snapshot back over from the desktop app; the entry lapses once that account signs in again. These files carry no additional encryption; access is bounded by the operating system's file ACLs.
+The plugin's own data directory (the one `pi.plugin.getDataPath()` names) holds five data files. An interrupted archive, delete-record or sign-in write can leave temporary files behind: writing the same file again clears leftovers older than ten minutes, and a scan does the same for sign-in temps in the plugin's own directory; deleting an account removes its sign-in temps with it. `settings.json` is the plugin settings the host persists (a former plugin id's copy is carried over once on first load). `checkin-slots.json` records the check-in slots already collected and the pending Qoder retry time; slots are kept for three days. `doctor.txt` is the most recent connection report, item by item, and lists no account label. `credentials-archive.json` keeps the sign-ins a later account switch overwrote: access and refresh tokens, account identifiers (nickname, uin/uid, enterprise id) and the local sign-in path. Entries are kept by token expiry, dropping each 30 days after it; an entry with no stated expiry is kept until the account is deleted. `deleted-signins.json` records deleted sign-ins as a token digest, the sign-in's issue time, a delete time and a random record id, so a scan cannot take the same superseded snapshot back over from the desktop app; a scan clears the entry after the account signs in again with a different token and a newer issue time; deletes for one account that cannot be ordered by issue time are kept together, so a stale one cannot replace a newer one; a record written by 1.2.3 matches only by token digest and is not cleared automatically. These files carry no additional encryption; access is bounded by the operating system's file ACLs.
 
 Every sign-in the plugin writes lives in `signins/` beside it: ones added from the panel, snapshots adopted from the desktop app, and renewed copies. Each file is named after the account's billing identity and read on the same terms as a desktop sign-in. These files are not additionally encrypted either; access is bounded by the operating system's file ACLs. "Delete" in the panel removes that file together with its archive entry, and the snapshot the desktop app left behind stops being adopted; signing the account in again brings it back. "Remove" only disables the account, and "Removed accounts" restores it.
 
-The plugin sends requests only to the vendor endpoints; panel links open only when clicked.
+The plugin sends requests only to the vendor endpoints; panel links open only when clicked. A login page URL is accepted only on the vendor's own hosts.
 
 ## Permissions
 
@@ -175,6 +177,7 @@ The plugin sends requests only to the vendor endpoints; panel links open only wh
 | `background.service` | Keep the gateways and the scan running |
 | `provider.register` | Publish the three sources as model providers in this plugin's manifest |
 | `renderer.extension` | Show credits in the composer toolbar |
+| `models.list` | Read the host's loaded model list to recognise a same-named model from another provider |
 | `shell.openExternal` | Open external links from the panel footer, and the "Add account" login link |
 | `clipboard.write` | Copy the report from the connection-check page |
 

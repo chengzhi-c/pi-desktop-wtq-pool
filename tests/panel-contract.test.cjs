@@ -75,7 +75,7 @@ function loadEntry(t, settings) {
   const handlers = new Map()
   const ownRequire = createRequire(path.join(root, 'main.js'))
   const login = {
-    startDeviceLogin: async () => ({ state: 'fixture-login', authUrl: 'https://example.invalid/login' }),
+    startDeviceLogin: async () => ({ state: 'fixture-login', authUrl: 'https://copilot.tencent.com/login' }),
     pollDeviceLogin: async () => ({ status: 'pending' }),
   }
   const context = vm.createContext({
