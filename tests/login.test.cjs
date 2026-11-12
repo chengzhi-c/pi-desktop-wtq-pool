@@ -509,10 +509,12 @@ test('only the current login writes credentials and returns the panel document',
   const loginPath = require.resolve('../lib/login')
   let starts = 0
   let finishOld
+  let failStart = false
   const loginStub = {
-    startDeviceLogin: async (realm) => ({
-      state: 'st-' + ++starts, authUrl: 'https://copilot.tencent.com/login',
-    }),
+    startDeviceLogin: async (realm) => {
+      if (failStart) throw new Error('upstream refused the sign-in')
+      return { state: 'st-' + ++starts, authUrl: 'https://copilot.tencent.com/login' }
+    },
     pollDeviceLogin: async (_realm, state) => ({
       status: 'ok',
       signIn: {
@@ -580,6 +582,14 @@ test('only the current login writes credentials and returns the panel document',
     const state = await plugin.onPanelInvoke('xd.state')
     assert.equal(state.accounts.length, answer.state.accounts.length,
       'the answer and the next read agree, which is what makes the adoption visible')
+    await plugin.onPanelInvoke('xd.startLogin', { realm: 'cn' })
+    failStart = true
+    const failed = await plugin.onPanelInvoke('xd.startLogin', { realm: 'cn' })
+    assert.equal(failed.realm, 'cn')
+    assert.equal(failed.authUrl, '',
+      'a start failure reaches the panel as an empty link, so it shows the localized message')
+    await assert.rejects(plugin.onPanelInvoke('xd.pollLogin', { realm: 'cn' }),
+      (error) => error.code === 'NO_LOGIN', 'a failed start leaves no pending login behind')
   } finally {
     await context.module.exports.onUnload()
     delete require.cache[loginPath]

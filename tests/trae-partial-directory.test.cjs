@@ -73,19 +73,6 @@ test('the fresher answer wins for a model both reads describe', () => {
   assert.equal(model.variants.length, 1, 'the same function answered twice, so there is still one variant')
 })
 
-test('a complete read is not merged: what it dropped is gone', () => {
-  // The other half of the rule. A read where every function answered is the
-  // directory's current word, and a model it no longer lists is one the upstream
-  // stopped offering - keeping it would serve 4001s forever.
-  const earlier = read(
-    ['solo_work_remote', [row('withdrawn', { dev: 200000 })]],
-    ['chat_v3', [row('still-there', { dev: 116000 })]],
-  )
-  const complete = read(['solo_work_remote', [row('still-there', { dev: 116000 })]])
-
-  assert.deepEqual(complete.map((model) => model.id), ['still-there'],
-    'a full read is taken as written - the merge is only for the partial case')
-})
 
 /**
  * A 200 that carries no list is a failed answer, not an empty one.

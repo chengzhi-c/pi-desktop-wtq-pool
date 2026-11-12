@@ -954,6 +954,43 @@ test('a Trae model that states a credit rate carries it to the panel', () => {
 })
 
 /**
+ * A default thinking level saved for a Trae or Qoder model has to be published.
+ *
+ * The panel stores it per model, and the host applies a declaration's
+ * `defaultThinkingLevel` to requests that name no effort. The source
+ * declarations never carried the field, so picking one of those models fell
+ * back to the catalog's own default while the saved setting read as accepted.
+ */
+test('a saved source default thinking level reaches the declaration', () => {
+  const entry = loadEntry()
+  try {
+    entry.read('settings = ' + JSON.stringify({
+      modelSelection: {
+        'trae:cn': { overrides: { 'kimi-k3': { defaultThinkingLevel: 'high' } } },
+        'qoder:cn': { overrides: { gmodel: { defaultThinkingLevel: 'max' } } },
+      },
+    }))
+    entry.read('traeGateways.set("cn", { gateway: { models: () => ['
+      + '{ id: "kimi-k3", name: "Kimi K3", contextWindow: 256000, maxTokens: 32000,'
+      + ' reasoning: { supported: ["off", "low", "high"], defaultEffort: "low" } }'
+      + '] } })')
+    const trae = entry.read('traeDeclarationModels("cn")')
+    assert.equal(trae[0].defaultThinkingLevel, 'high',
+      'the Trae default the panel saved must be the one the host applies')
+
+    entry.read('qoderGateways.set("cn", { gateway: { models: () => ['
+      + '{ id: "gmodel", name: "GLM-5.3", contextWindow: 1000000, maxInputTokens: 180000,'
+      + ' supportsImages: true, effortLevels: ["low", "high", "max"], defaultEffort: "high", alwaysThinking: true }'
+      + '] } })')
+    const qoder = entry.read('qoderDeclarationModels("cn")')
+    assert.equal(qoder[0].defaultThinkingLevel, 'max',
+      'and the Qoder default must reach its declaration too')
+  } finally {
+    entry.cleanup()
+  }
+})
+
+/**
  * Trae lists its own helper slots in the same directory as the models, and it
  * suffixes some of them over time (`fast_apply_new`). A name-equality filter let
  * the suffixed ones through, so the picker offered a row that answers nothing.

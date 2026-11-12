@@ -20,7 +20,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { createHash } = require('node:crypto')
-const { root, transpile } = require('./ts-loader.cjs')
+require('./ts-loader.cjs')
 
 const {
   WorkBuddyAccountPool, legacyWorkBuddyAccountId, ownSignInDir, parseWorkBuddyAuth, renewOwnSignInFile,
@@ -939,7 +939,7 @@ test('the international live sign-in is left where the client keeps it', async (
 })
 
 test('a re-login without an issue time ends the tombstone', async () => {
-  const { pool, dataDir, signins } = machine('tombstone-undated', { snapshots: [['90000002061', 'Undated']] })
+  const { pool, dataDir } = machine('tombstone-undated', { snapshots: [['90000002061', 'Undated']] })
   const [account] = await pool.scan()
   try {
     assert.equal(await pool.removeOwnSignIn(account.id), true)
@@ -1605,7 +1605,7 @@ test('an unreadable desktop directory blocks deletion on a cold scan', async () 
 })
 
 test('a delete keeps a live sign-in that replaced the pool copy during a scan', async () => {
-  const { pool, dataDir, desktop, signins } = machine('delete-live-race', {
+  const { pool, dataDir, desktop } = machine('delete-live-race', {
     snapshots: [['90000006006', 'Racing']],
   })
   const [account] = await pool.scan()

@@ -13,12 +13,12 @@
  * stands. Every upstream is a stub and every auth directory a scratch one.
  */
 const assert = require('node:assert/strict')
-const { test, mock } = require('node:test')
+const { test } = require('node:test')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { createRequire } = require('node:module')
-const { root, transpile } = require('./ts-loader.cjs')
+const { root } = require('./ts-loader.cjs')
 
 const { WorkBuddyAccountPool } = require('../lib/accounts')
 const { upstreamErrorKind } = require('../lib/upstream')
