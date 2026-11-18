@@ -1410,7 +1410,8 @@ test('a composer answer carries at most eight packages', async () => {
  * unwrap is the stubbed seam (the one that would need the installed app), so
  * the decipher and the cache are the real code.
  */
-test('a second Qoder read in one process still opens the sealed session', async () => {
+test('a second Qoder read in one process still opens the sealed session', async (t) => {
+  if (process.platform !== 'win32') return t.skip('the DPAPI unwrap this case stubs only exists on Windows; macOS reads the Keychain instead (qoder-macos.test.cjs)')
   const { EventEmitter } = require('node:events')
   const { createCipheriv } = require('node:crypto')
   const { readQoderCredential, resetQoderCredentialCache } = require('../lib/qoder-credentials')
