@@ -10,7 +10,7 @@
 
 <p align="center"><sub>PI-Desktop 版 · <a href="https://github.com/chengzhi-c/dsh-wtq-pool">DeepSeek Harness 版</a></sub></p>
 
-<p align="center"><b>把本机已登录的 WorkBuddy、Trae、Qoder 账号接入 PI-Desktop，限流或额度用尽时自动换号。</b></p>
+<p align="center"><b>在 PI-Desktop 中使用本机 WorkBuddy、Trae 和 Qoder 账号，按账号状态自动换号。</b></p>
 
 <p align="center">
   <a href="README.en.md">English</a> | <b>简体中文</b>
@@ -18,8 +18,8 @@
 
 <p align="center">
   <a href="#安装">安装</a> ·
-  <a href="#功能">功能</a> ·
   <a href="#使用">使用</a> ·
+  <a href="#功能">功能</a> ·
   <a href="#设置">设置</a> ·
   <a href="CHANGELOG.md">更新日志</a> ·
   <a href="https://github.com/chengzhi-c/pi-desktop-wtq-pool/issues">问题反馈</a>
@@ -28,213 +28,137 @@
 <p align="center">
   <a href="https://github.com/chengzhi-c/pi-desktop-wtq-pool/releases"><img src="https://img.shields.io/github/v/release/chengzhi-c/pi-desktop-wtq-pool?style=flat-square&amp;label=release" alt="release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/chengzhi-c/pi-desktop-wtq-pool?style=flat-square" alt="MIT license"></a>
-  <a href="https://github.com/chengzhi-c/pi-desktop-wtq-pool/stargazers"><img src="https://img.shields.io/github/stars/chengzhi-c/pi-desktop-wtq-pool?style=flat-square" alt="GitHub stars"></a>
 </p>
 
-> 本项目仅供学习使用。使用非官方客户端可能触发厂商的账号风控或限制。请评估相关风险，并遵守对应服务的使用条款。
+> 本项目仅供学习使用。非官方客户端可能触发厂商的账号限制。使用前请评估风险并遵守相关服务条款。
 
-把本机 WorkBuddy、Trae、Qoder 的桌面登录接入 PI-Desktop。WorkBuddy 在账号被限流或额度用尽时自动换号；Trae、Qoder 按请求选择账号，认证失败、限流或余额耗尽时改用下一个登录重试，模型不在目录里、请求体不是合法 JSON 或缺 model 这类请求自身的问题，网关在本地直接返回 404 或 400，不占用账号。三个来源各自开关，国内与国际账号分别成组。
-
-Trae 的登录失效有时不带错误码、只给一句说明。插件按已知的英文措辞识别这种帧并换号；其余措辞按上游故障返回 502。
-
-限流按上游给出的等待时间冷却，上游未给出时按配置的窗口。上游 5xx 改用下一个登录。额度用尽与登录失效不会自行恢复，账号退出轮换：额度用尽的挂起在重新读到有余额后释放，登录失效的挂起在刷新成功、重新登录或手动重置冷却后释放，两者都以六小时为上限（WorkBuddy 侧）。积分、签到状态、模型目录与手动签到这些非流式请求遇到登录失效，会先强制刷新令牌并重试一次：刷新令牌还有效的账号当场恢复，不退出轮换；刷新令牌同样失效的才挂起。Trae、Qoder 的失败挂起另计：只按冷却窗口（默认 60 秒，最长可配到 24 小时）或上游给出的等待时间降权，池中只剩它一个时仍会使用。上游主机不可达时跳过该账号并尝试下一个；连续两个账号都不可达后，只要还有登录属于尚未失败的网关就继续尝试，所有网关都失败才结束本轮并报告网络错误。上游判定账号套餐不含某模型（11158）时，该账号的这个模型停用 24 小时，其他模型照常服务；全部账号都不含该模型时按 400 返回。
-
-## 预览
-
-面板界面如下，默认亮色：
-
-![账号池](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-pool.png)
-
-面板订阅宿主的 `appearance:changed`，配色与语言随宿主设置确定。两套主题：
-
-![暗色主题](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-dark.png)
-
-模型页编辑每个模型的显示与发布参数。Trae 目录给出的默认窗口因模型而异（116k 至 400k）；未声明更大档位的模型，按 1M 发布上限。Trae 目录给出费率的模型带 `x0.79` 形式的费率标签；目录未给出费率的模型以及全部 Qoder 模型均不标注：
-
-![模型设置](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-models.png)
-
-成长中心：
-
-![成长中心](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-growth.png)
-
-在线预览：<https://chengzhi-c.github.io/pi-desktop-wtq-pool/>。
-
-`docs/index.html` 以虚构演示数据加载实际面板代码，支持来源切换、模型设置与主题预览。
-
-![预览页](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-page.png)
-
-本地预览需先克隆仓库，运行 `node docs/serve.cjs`，再打开它输出的地址。该页面不能用 `file://` 打开，因为浏览器不允许它读取同目录下的面板文件。
-
-## 功能
-
-- 复用本机登录：读取三家桌面 App 已保存的登录文件。WorkBuddy 另支持在面板「添加账号」，通过官方登录页授权后将登录保存到插件自管目录。
-- 按 region 注册模型分组：三家厂商各自的 region 各注册为一个 provider，可同时启用；没有账号的 region 不注册。国内模型只走国内账号，国际版模型只走国际账号。
-- 账号分发：WorkBuddy 支持先用一个账号、轮流使用、临期积分优先和同一对话固定一个账号，并在限流、额度用尽或上游 5xx 时自动换号；Trae、Qoder 支持优先使用、轮流使用与临期积分优先，认证失败、限流或余额耗尽时改用下一个登录重试。
-- 网关以 SSE 返回 `chat.completion.chunk`；请求体里的 `stream` 字段不改变响应格式。
-- 积分自动化：自动签到默认关闭。开启后的定时任务与「立即运行」执行同一轮，包含三家签到、WorkBuddy 的连登奖励和猫猫旅行。连登天数由上游按对话推进，该轮在每个账号读取连登档位前先补发一次对话活动上报，因此档位到点即可解锁领取。连登环节还会在昨日漏签且持有补签卡时自动补签以保住连续天数，领取一次性的新手礼包与活动补偿，并在兑换解锁的档位后把由此获得的抽奖次数抽完。这些成长步骤国内版与国际版都执行；猫猫旅行仅用于国内账号。
-- 登录令牌保活：独立卡片，按需执行。桌面端留下的登录快照在扫描时并入插件自己的登录目录，由插件接管续期；桌面端正在使用的登录由桌面端续期。「立即刷新」处理插件自管的副本，按签发时间判断：签发满 6 小时的刷新，距到期不足 5 分钟的同样刷新。刷新结果写回插件自己的登录文件，登录被上游拒绝时当天即可发现。同一账号在多处留有登录时按签发时间取最新的一份。停用账号、已停用的 region 与登录已被上游拒绝的账号不参与。
-- 输入框积分：开启 `showComposerPoints` 后，输入框工具栏显示当前模型所用账号的余额，点开可换号。国内版与国际版各自发布所在网关的模型目录；两个网关出现同名模型时带上网关后缀（如 `… (Global)`），与其他提供商的模型重名时同样带后缀，积分浮层只跟随本插件的模型。轮流使用与同一对话固定账号时，浮层显示下一个或最近一次服务该模型的账号。功能关闭后浮层隐藏，读数降为每 5 分钟一次，重新开启后无需切换模型即可恢复。
-- 面板：账号与池状态、模型勾选、连接检查、成长中心都在插件面板内。模型目录在启动时加载，缓存过期后按需刷新。停用的账号与登录已被上游拒绝的账号不参与探测。
-- 连接检查：每条发现都带判定。网关没有监听、模型目录读取失败、登记的地址与实际绑定的不一致、provider 未被宿主接受，都算失败并给出需要修改的内容。网关启动失败时给出原因，面板按地址漂移提示重启。检查自身出错也记一条发现，报告照常给出其余结果。
+按来源和区域注册模型组。账号限流、额度耗尽或登录失效时，插件按来源规则切换账号。
 
 ## 安装
 
-PI-Desktop → 扩展 → 安装插件包，选择 `.piplug` 文件。也可以从 [Releases](https://github.com/chengzhi-c/pi-desktop-wtq-pool/releases) 下载对应版本后安装。
+1. 从 [Releases](https://github.com/chengzhi-c/pi-desktop-wtq-pool/releases) 下载 `io.github.chengzhi-c.pi-desktop-wtq-pool-<版本>.piplug`。
+2. 在 PI-Desktop「扩展」页打开右上角更多菜单，选择「安装插件包」，选中下载的文件。
+3. 重新加载 WTQ Pool；仍显示旧版本时重启 PI-Desktop。
 
-需要 PI-Desktop 0.15.0 或更高版本，见 `manifest.json` 的 `engines.piDesktop`。
-
-> 从 1.1.x 升级到 1.2.0 后，模型提供商 ID 改为 `wtqpool-*`，请在模型选择里重新选一次。
+需要 PI-Desktop 0.15.0 或更高版本。从 1.1.x 升级到 1.2.0 后，提供商 ID 改为 `wtqpool-*`，请重新选择模型。
 
 ## 使用
 
-> PI-Desktop 0.22 起，插件面板不再放在「扩展」页的卡片上。按 `Alt+Space` 打开全局启动器，或在命令面板输入 `WTQ Pool` 或 `WTQ Pool: Open panel`（命令 ID 为 `wtqpool.open`）。
+PI-Desktop 0.22 起可按 `Alt+Space` 打开启动器，或从命令面板运行 `WTQ Pool: Open panel`（命令 ID：`wtqpool.open`）。
 
-在各家桌面 App 中登录，再点面板的「重新检测账号」。WorkBuddy 支持读取多个已保存的登录，需要多个账号就在 App 里逐个登录；5.6 起的 `$wbEncrypted` 登录由插件向本机已安装的 WorkBuddy 索取密钥后读取。Trae 国内版有 Trae CN 与 TRAE SOLO CN 两个登录位；Qoder 每个安装只保存一个登录，在 App 里重新登录会覆盖前一个。WorkBuddy 国际版只有一个登录文件，切换账号会直接覆盖上一个。插件在扫描时为被覆盖的登录留档，该账号照常参与分发，直到它的令牌到期；在 App 里重新登录即可续期。
+先在 WorkBuddy、Trae 或 Qoder 桌面应用登录，再在面板选择「重新检测账号」。WorkBuddy 支持多个登录；国内 Trae 分别读取 Trae CN 和 TRAE SOLO CN。每个 Qoder 安装及 WorkBuddy 国际版各保留一个登录，切换账号会替换原登录。
 
-Windows 下解密登录时，插件只使用固定本地磁盘上签名有效且签名公钥受支持的 WorkBuddy。宿主以管理员权限运行时，以及 macOS 或 Linux 下以 root 运行时，不解密这类登录。若 WorkBuddy 更换签名公钥，需更新插件后才能解密。macOS 下插件直接执行本机安装的 WorkBuddy 应用进程读取密钥，不校验其签名；只应执行你信任的安装。
+WorkBuddy 5.6 起的 `$wbEncrypted` 登录需要本机应用的解密密钥。Windows 只使用签名有效且公钥受支持的本地安装，管理员进程跳过解密；macOS 会运行本机应用读取密钥，不校验签名，root 进程跳过解密。请使用可信的 WorkBuddy 安装。
 
-没有桌面 App 也可以添加账号：面板 WorkBuddy 标题栏的「添加账号」在浏览器中打开官方登录页，登录完成后该账号即加入账号池。凭证写在插件自管目录的 `signins/` 下，与桌面登录同等参与分发。这类账号在面板上另有「删除」，按两次确认；删除范围见「数据」一节。桌面端正在登录的账号不给删除，那份会话属于桌面端。添加的账号属于当前选中的 region，国内版登国内号，国际版登国际号。
+面板提供账号池、模型、连接检查和成长中心。模型组最多发布 64 个模型。自动签到默认关闭，默认北京时间 09:00，可在面板调整；签到和「立即执行」可能消耗补签卡或抽奖次数。「立即刷新」只续期签发满六小时或五分钟内到期的插件自管登录，桌面应用登录由应用续期。
 
-迁移其他工具留下的账号，直接向该目录写入文件即可：`signins/` 本身就是导入导出格式，放入一份以 `.info` 结尾的 `{auth, account}` 登录文件，下次扫描即作为一个普通账号。仓库中的 `tools/import-signins.cjs` 读取其他工具留下的账号文件（`--from` 接受文件或目录），按本插件识别的形状写入 `signins/`，默认跳过本插件数据目录里已有的账号，`--dry-run` 先查看，`--force` 才覆盖：
+### 添加账号
 
+在面板通过官方登录页添加，或导入含 `{auth, account}` 的 `.info` 文件。从源码仓库运行：
+
+```powershell
+$storageFile = Join-Path $env:APPDATA "PI-Desktop\storage-location.json"
+$piData = if (Test-Path $storageFile) { (Get-Content $storageFile -Raw | ConvertFrom-Json).roots.data } else { Join-Path $HOME ".pi-desktop" }
+$pluginData = Join-Path $piData "plugins\data\io.github.chengzhi-c.pi-desktop-wtq-pool"
+$accountFile = Read-Host "账号文件路径"
+node .\tools\import-signins.cjs --data $pluginData --from $accountFile
 ```
-node tools/import-signins.cjs --data <插件数据目录> --from <账号文件或目录> [--region cn|global|all] [--dry-run] [--force]
-```
 
-备份即复制 `signins/` 目录；这些文件持有完整可用的令牌，其权能与账号本身相同。
+可选参数：`--region cn|global|all`、`--dry-run`、`--force`。
 
-模型分组未出现时，按面板顶部的提示重启 PI-Desktop。
+`signins/` 含可用的访问令牌和刷新令牌，应按账号密码保护。面板添加的登录可二次确认后删除；桌面应用当前使用的登录不能从面板删除。
 
-- **账号池**：每个账号的标签、剩余积分、额度到期时间、冷却状态与签到状态。可单独停用某个账号、将其移除，或指定某个 region 优先使用哪个账号。登录被上游拒绝的账号另显示「需重新登录」徽标、拒绝原因与「暂停至」时间，挂起期间积分与签到留空。被上游判定异常使用的账号另显示「已限制」徽标与「被上游限制，直至」时间，六小时重试一次，需要到官方后台申诉。Trae、Qoder 两个账号重名时，名称后带 `#` 与用户 ID 后 8 位，用于区分。
-- **模型**：勾选该 region 要暴露的模型，未勾选的模型不进入模型选择器。可修改显示名、上下文窗口、输出上限、思考等级与贴图支持。一个模型组最多发布 64 个模型，超出部分标记为「未发布」，网关仍会服务它们。
-- **连接检查**：逐条报告网关是否监听、模型目录读到几个、登记的地址与实际绑定的是否一致、每个 provider 是否被宿主接受，并可复制整份报告。
-- **成长中心**：仅对 WorkBuddy 生效。页面按账号逐行列出，展开一行可见该账号的连登档位。「读取状态」读取当前档位与可领取项；「立即执行」产生领取并执行成长环节，按步骤报告结果。登录被上游拒绝的账号在该轮被跳过。
+## 功能
 
-签到可对单个账号执行，也可在标题栏一次领完该来源。自动签到默认关闭，开启后默认于 09:00（北京时间）执行；当天错过的时段在当天内的下一次启动仍会补领，跨天则不补。Trae 的每日签到每台设备限领一次；Qoder 的活动开放时间以活动列表返回的 `startAt` 为准，常见为每天 10:00（北京时间）。是否显示签到取决于上游对该账号返回的活动状态。登录被上游拒绝的账号在该轮被跳过。
+- 分发：优先、轮流、临期积分优先；WorkBuddy 另支持同一对话固定账号。
+- 输入框积分：显示当前账号积分，点击读数切换账号；关闭时每五分钟读取一次。
+- 模型目录：启动时加载，过期后按需刷新；停用或登录失效的账号不参与探测。
+- 网关：始终以 SSE 返回 `chat.completion.chunk`。
 
-WorkBuddy 国内版上游会检查 system 与助手轮次里的措辞，命中属于它不服务的客户端的措辞时返回 11128（渠道校验未通过）。插件收到这条拒绝后重试一次：系统消息并入首条用户消息，`developer` 角色并入 system，助手历史里的客户端名称替换为 `DeepSeek`，请求仍保留一条中性系统消息。通过的提示按 region 缓存，同一段提示之后不再重复这次往返。签到、成长中心与保活走各自的接口。
+### 换号与恢复
 
-「立即刷新」的结果按刷新、已是最新、失败、无刷新令牌分项报告。
+| 情况 | 处理方式 |
+| --- | --- |
+| 请求无效，或 Trae、Qoder 模型不在目录 | 返回 400 或 404，不发送对话 |
+| WorkBuddy 限流、5xx 或主机不可达 | 尝试下一个账号；限流按上游等待时间或冷却处理 |
+| WorkBuddy 额度耗尽 | 最长暂停六小时；读到正余额或手动清除冷却后恢复 |
+| WorkBuddy 登录失效 | 最长暂停六小时；成功刷新令牌、重新登录或手动清除冷却后恢复 |
+| WorkBuddy 套餐不支持模型（11158） | 该账号对此模型暂停 24 小时；全部账号均不支持时返回 400 |
+| Trae、Qoder 认证失败、限流、额度耗尽或空响应 | 尝试下一个账号，并按冷却降低该账号优先级；仅剩一个账号时仍会使用 |
+| Trae、Qoder 上游 5xx | 返回上游错误 |
 
-读取结果留在插件进程内：重新载入面板仍显示上次的数字，应用重启后则回到「尚未读取」，并在进入页签时自动重读一次。读数超过两分钟、之后又跑过一轮，或某个 region 被停用时，进入页签会重读。
+Trae、Qoder 冷却默认 60 秒，最长 24 小时。WorkBuddy 登录失效时刷新令牌并重试一次；国内 WorkBuddy 返回 11128 时调整对话格式后重试一次。
 
 ## 设置
 
-以下键在宿主设置页修改；`distribution` 与输入框积分在扩展页也可修改：
+宿主设置页提供以下选项，定义与默认值见 [`manifest.json`](manifest.json)。
 
-| 键 | 默认（生效值） | 说明 |
+| 设置 | 默认值 | 用途 |
 | --- | --- | --- |
-| `enabled` | `true` | 关闭后网关不启动 |
-| `sourceWorkbuddy` / `sourceTrae` / `sourceQoder` | `true` | 关闭后该来源不扫描、不发布、不请求 |
-| `distribution` | `priority` | WorkBuddy 池的发放方式：`priority` 先用一个账号，`round-robin` 均摊，`expiry` 优先消耗临期积分，`sticky` 同一对话固定 |
-| `cooldownSeconds` | `60` | 限流冷却时长。上游报出重置时间时以它为准；没有重置时间时，连续限流会让它逐次翻倍，封顶 15 分钟（窗口本身超过 15 分钟时不再翻倍）。上游给出的重置时间最长按 2 小时计；余额耗尽或登录被上游拒绝另按 6 小时停用，额度耗尽的挂起在读到有余额时提前解除 |
-| `authFile` | `""` | WorkBuddy 登录文件路径；扫描其所在目录的全部 `.info` 登录，留空则自动发现 |
-| `showComposerPoints` | `false` | 在输入框工具栏显示当前账号积分 |
+| `enabled` | `true` | 启用网关 |
+| `sourceWorkbuddy` / `sourceTrae` / `sourceQoder` | `true` | 启用对应来源 |
+| `distribution` | `priority` | WorkBuddy 分发：`priority`、`round-robin`、`expiry` 或 `sticky` |
+| `cooldownSeconds` | `60` | 限流冷却时间 |
+| `authFile` | `""` | WorkBuddy 登录文件；留空时自动发现 |
+| `showComposerPoints` | `false` | 在输入框显示当前账号积分 |
 
-面板自管的项在面板中修改，存储走宿主的设置接口：
-
-| 键 | 默认（生效值） | 说明 |
-| --- | --- | --- |
-| `sourceDistributions` | `{}` | Trae、Qoder 的分发方式：`priority` / `round-robin` / `expiry`；未设时按 `priority` |
-| `creditReserves` | `{}` | 按账号 id 设定的积分保底，余额不高于它的账号不参与分发 |
-| `autoCheckin` | `{"enabled":false,"hours":[9]}` | 自动签到的开关与时点；`hours` 为北京时间整点，留空用 09:00 |
-| `disabledAccountIds` | `[]` | 面板中停用的账号 id |
-| `disabledRegions` | `[]` | 单独停用的 region，形如 `source:region` |
-| `modelSelection` | `{}` | 每个网关勾选哪些模型，以及显示名、上下文窗口等覆写 |
-| `preferredAccountIds` | `{}` | WorkBuddy 每个 region 的首选账号 |
-| `preferredSourceAccounts` | `{}` | Trae、Qoder 每个 region 的首选账号，键为 `source:region` |
-| `removedAccounts` | `[]` | 从池中移除的账号，标签与 region 一并保留，面板可据此提供恢复 |
-
-两张表的默认列均为生效值：`autoCheckin.hours` 存为空数组，运行时归一为 `[9]`；`authFile` 留空即自动发现。
-
-模型勾选与首选账号由面板保存。
+面板也可修改分发方式、来源开关、区域首选、积分保底、模型发布和自动签到。
 
 ## 端口
 
-```
-WorkBuddy  41831 / 41841
-Trae       41851 / 41861
-Qoder      41871 / 41881
-```
+| 来源 | 国内 | 国际 |
+| --- | ---: | ---: |
+| WorkBuddy | `41831` | `41841` |
+| Trae | `41851` | `41861` |
+| Qoder | `41871` | `41881` |
 
-以上为首选端口。插件先按这些端口绑定，清单中始终登记首选端口。端口被占用时该会话改用系统分配的临时端口；面板与连接检查显示本次实际绑定的地址，并在地址漂移时提示重启 PI-Desktop。出现地址漂移时，应先确认占用端口的是哪个进程，不要连接来源不明的服务。
+端口被占用时网关改用临时端口，连接检查会显示实际地址。DeepSeek Harness 版使用 `42831` 起始的独立端口范围；两版设置和凭证分开，共用 WorkBuddy 登录时刷新令牌轮换可能使另一版失效。
 
-端口在预留与监听之间被其他进程占用时，该网关本次启动失败：其模型组被摘掉，连接检查报出失败原因，面板提示重启 PI-Desktop。宿主只在启动、停用启用与卸载时重读清单，因此重启后请求才会落到新地址。
+## 隐私与出网
 
-DeepSeek Harness 版使用 42831 开头的独立端口，两版可以同时安装，设置和凭证分别保存，不会自动同步。若两版使用同一份 WorkBuddy 登录，上游轮换刷新令牌时可能使另一版的登录失效。出现「需重新登录」时，在对应版本重新添加账号，不要复制旧的 `signins/` 文件覆盖；两版显示的令牌到期时间可能不同。
+会话内容会发送给所选厂商，不保存为本地历史。请求同时携带所选厂商的账号与设备标识（账号 UID、机器码、设备 ID），与厂商桌面客户端一致。
 
-## 数据
+登录文件和归档含可用令牌，未额外加密，依赖操作系统权限保护。归档在访问令牌或刷新令牌中较晚的到期时间后保留 30 天；未记录到期时间的归档在删除账号时清除。macOS 读取 Qoder 登录时会访问登录钥匙串，系统可能请求授权。
 
-读取三家 App 的本机登录文件。令牌由插件保管，只发往对应厂商的接口。网关监听 `127.0.0.1`，同机其他进程可调用并消耗账号额度。插件按单用户桌面环境设计，不区分本机其他系统用户；多人共用的机器应使用独立系统账户隔离。插件设置由宿主持久化，模型分组写入插件清单。
+PI-Desktop 不提供系统级沙箱。网关只监听 `127.0.0.1`，同机进程仍可调用并消耗账号额度；Windows 下请确保插件数据目录 ACL 仅允许当前用户访问。
 
-插件自管数据目录（即 `pi.plugin.getDataPath()` 指向的目录）包含五个数据文件。写入归档、删除记录或登录文件中断时可能留下临时文件：再次写入同一文件时会清理超过十分钟的残留，登录临时文件由扫描按同一时限清理；删除账号会连同该账号的临时文件一并清除。`settings.json` 是宿主持久化的插件设置；首次加载会从上一个插件 id 的同名文件复制一次。`checkin-slots.json` 记录已领取的签到时段和待重试的 Qoder 时点，时段只保留三天。`doctor.txt` 是最近一次连接检查的报告，逐项记录通过与否，不列账号标签。`credentials-archive.json` 留存被切号覆盖的登录，含访问令牌、刷新令牌、账号标识（昵称、uin/uid、企业 ID）与本机登录文件路径；按令牌到期时间保留，到期后再过 30 天清除，没有到期时间的记录保留到该账号被删除。`deleted-signins.json` 记录已删除的登录，只存令牌摘要、该登录的签发时间、删除时间与一个随机记录标识，用来阻止扫描把桌面端遗留的同一份快照重新接管回来；桌面端重新登录该账号后（令牌不同且签发时间更新），下一次扫描会清除该记录；同一账号的多条删除记录若无法按签发时间排序，会一并保留，避免较早的删除覆盖较新的记录；1.2.3 写入的旧记录只按令牌摘要匹配，不会自动清除。上述文件未额外加密，访问权限由操作系统文件 ACL 决定；在 Windows 上数据目录会继承父目录的权限，父目录若对其他本地用户可写，他们就能读取其中的令牌。
-
-插件写入的登录都在同目录的 `signins/`：面板添加的、接管桌面端快照的、续期后的副本。文件名带账号的计费身份，与桌面登录同等参与分发。这些文件同样未额外加密，访问权限由操作系统文件 ACL 决定。在面板中「删除」该账号会连同 `credentials-archive.json` 里的留档一起清除，桌面端遗留的同一份快照随之失效；重新登录该账号即解除。「移除」只是停用，可在「已移除的账号」中恢复。
-
-插件只向三家厂商的接口发起请求；面板外链仅在用户点击时打开。登录页地址只接受厂商自己的域名。
-
-## 权限
-
-| 权限 | 用途 |
-| --- | --- |
-| `ui.panel` | 打开设置面板 |
-| `background.service` | 常驻运行网关与扫描 |
-| `provider.register` | 把三个来源作为模型提供商写进本插件清单 |
-| `renderer.extension` | 在输入框工具栏显示积分 |
-| `models.list` | 读取宿主已加载的模型列表，识别其他提供商的同名模型 |
-| `shell.openExternal` | 面板页脚打开外部链接，以及「添加账号」的登录链接 |
-| `clipboard.write` | 连接检查页复制报告 |
-
-出网请求由插件进程直接以 `fetch` 发送。宿主尚未对插件入口进程施加操作系统级沙箱，因此 `manifest.net.domains` 只约束 `pi.net.fetch` 通道；本插件不申请该权限，也没有声明该字段，实际出网范围仅由代码中的目标决定。下列主机即全部出网目标。
-
-令牌只会发往以下主机，与 `manifest.json` 的 `safetyNotes` 一致：
+令牌仅发送至以下主机：
 
 - WorkBuddy：`copilot.tencent.com`、`www.codebuddy.cn`、`www.codebuddy.ai`、`www.workbuddy.ai`
 - Trae：`api.trae.cn`、`solo.trae.cn`、`trae-api-cn.mchost.guru`、`coresg-normal.trae.ai`、`growsg-normal.trae.ai`
 - Qoder：`gateway.qoder.com.cn`、`openapi.qoder.com.cn`、`api3.qoder.sh`、`openapi.qoder.sh`
 
+## 预览
+
+![账号池](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-pool.png)
+
+[在线预览](https://chengzhi-c.github.io/pi-desktop-wtq-pool/) 使用实际面板代码和演示数据。应用内面板跟随 PI-Desktop 的主题和语言。
+
 ## 开发
 
 ```sh
 npm ci
-npm run typecheck   # tsc --noEmit
-npm run build       # src/*.ts 编译成 lib/*.js
-npm test            # Node 自带测试，离线回归
+npm run typecheck
+npm run build
+npm test
 ```
 
-修改 `src/` 后须重建 `lib/`。
-
-打包用 PI-Desktop 的插件开发工具：把运行时文件复制到暂存目录后执行 `pack <暂存目录>`，校验执行 `check <目录>`，不要使用通用 ZIP 工具。暂存目录只放运行时文件：`manifest.json`、`main.js`、`package.json`、`lib/`、`renderer/`、`tools/import-signins.cjs`、`LICENSE`、`README.md`、`README.en.md` 与 `CHANGELOG.md`；`src/`、`tests/`、`docs/`、构建脚本与登录数据都不进产物。`manifest.json` 的 `contributes.providers` 留空，由插件在运行时写入。
-
-`main.js` 是插件进程入口，账号扫描、网关、面板 RPC 与 `contributes.providers` 声明都在这里；`src/*.ts` 是与宿主无关的核心（账号池、模型目录、上游客户端、网关），由 `build.mjs` 用 esbuild 编译成 `lib/*.js`；`renderer/` 是面板与输入框积分扩展，原生 JS，无构建步骤；`tests/` 是离线回归。
-
-与宿主无关的核心模块：
-
-| 模块 | 职责 |
-| --- | --- |
-| `loopback.ts` | 回环端点的安全模型（Host 与 Origin 校验）、响应写入、流式中继与报错脱敏 |
-| `accounts.ts` | WorkBuddy 登录文件解析、账号池与冷却 |
-| `upstream.ts` | WorkBuddy 上游客户端、错误分类、限流重置解析 |
-| `catalog.ts` | 模型目录与静态兜底列表 |
-| `shim.ts` | WorkBuddy 网关的 OpenAI 兼容端点 |
-| `at-rest.ts` | 5.6+ 密封登录字段的解封 |
-| `promo.ts` | 促销窗口判定 |
-| `trae-*.ts` / `qoder-*.ts` | 两家的登录发现、协议客户端、SSE 解码与网关 |
+测试需要 Node 22.15 或更高版本。修改 `src/` 后运行 `npm run build` 更新 `lib/`。打包暂存目录需包含 `THIRD-PARTY-NOTICES.md`；从 PI-Desktop 源码仓库根目录使用 `pnpm pi-plugin check <目录>` 和 `pnpm pi-plugin pack <目录>` 检查并打包，详见 [插件开发文档](https://github.com/vastsa/PI-Desktop/blob/HEAD/docs/plugin-development.md)。
 
 ## 致谢
 
-本插件的若干模块移植或参考自下列 MIT 项目：
+| 项目 | 内容 |
+| --- | --- |
+| [eric8bit/pi-desktop-workbuddy](https://github.com/eric8bit/pi-desktop-workbuddy) | PI-Desktop WorkBuddy 移植来源 |
+| [XDTrees/dsh-workbuddy-xdpool](https://github.com/XDTrees/dsh-workbuddy-xdpool) | WorkBuddy 账号池基础实现 |
+| [corrinehu/dsh-workbuddy-connect](https://github.com/corrinehu/dsh-workbuddy-connect) | 回环端点安全模型 |
+| [dingminhua/dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy) | WorkBuddy 接口与错误分类参考 |
+| [dingminhua/dsh-connect-trae](https://github.com/dingminhua/dsh-connect-trae) | Trae 协议参考 |
+| [eghrhegpe/dsh-connect-qoder](https://github.com/eghrhegpe/dsh-connect-qoder) | Qoder 协议参考 |
+| [ardeyouxipianyi/workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub) | 成长中心与凭证留存参考 |
 
-| 项目 | 版权 | 用于 |
-| --- | --- | --- |
-| [XDTrees/dsh-workbuddy-xdpool](https://github.com/XDTrees/dsh-workbuddy-xdpool) | (c) 2026 XDTrees | WorkBuddy 账号池与整体移植来源 |
-| [corrinehu/dsh-workbuddy-connect](https://github.com/corrinehu/dsh-workbuddy-connect) | (c) 2026 Corrine Hu | 回环端点的安全模型 |
-| [dingminhua/dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy) | (c) 2026 LaoDing | 上游接口与错误分类 |
-| [dingminhua/dsh-connect-trae](https://github.com/dingminhua/dsh-connect-trae) | (c) 2026 dingminhua | Trae 协议参考 |
-| [eghrhegpe/dsh-connect-qoder](https://github.com/eghrhegpe/dsh-connect-qoder) | (c) 2026 eghrhegpe | Qoder 协议参考 |
-| [eric8bit/pi-desktop-workbuddy](https://github.com/eric8bit/pi-desktop-workbuddy) | (c) 2026 eric8bit | 同一上游的 PI-Desktop 移植版，本插件的前身 |
-| [ardeyouxipianyi/workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub) | (c) 2026 ardeyouxipianyi | 成长中心与连登闭环（补签卡、礼包、补偿、抽奖）、多账号凭证留存、国际版活跃上报 |
+随包移植代码的版权声明与 MIT 许可见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
 ## 许可
 
-MIT，见 [LICENSE](./LICENSE)。
+本项目采用 MIT 许可，见 [LICENSE](./LICENSE)。第三方代码许可见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。

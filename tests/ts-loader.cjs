@@ -4,6 +4,10 @@ const { registerHooks } = require('node:module')
 const { fileURLToPath } = require('node:url')
 const ts = require('typescript')
 
+if (typeof registerHooks !== 'function') {
+  throw new Error('The test suite needs node:module.registerHooks; run it on Node 22.15 or newer.')
+}
+
 const root = path.resolve(__dirname, '..')
 const transpile = (source) => ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023, esModuleInterop: true },

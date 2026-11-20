@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.chengzhi-c.pi-desktop-wtq-pool",
   "name": "WTQ Pool",
-  "version": "1.3.2",
+  "version": "1.3.6",
   "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接入 PI-Desktop。限流或额度用尽时自动换号，三家各有开关。",
   "author": "chengzhi-c (PI-Desktop port of XDTrees/dsh-workbuddy-xdpool)",
   "license": "MIT",
@@ -37,15 +37,15 @@
     "en": {
       "name": "WTQ Pool",
       "description": "Bring this machine's WorkBuddy, Trae and Qoder desktop sign-ins into PI-Desktop. An account that is rate-limited or out of credits fails over to the next one, and each source has its own switch.",
-      "safetyNotes": "Reads the WorkBuddy, Trae and Qoder sign-ins already saved on this machine. It also reads the host's loaded provider and model names, never conversation content, to tell a same-named model apart from another provider's model. An account can also be signed in from the panel; that credential is stored only under the plugin's own data directory, and the panel can delete such an account again, removing the sign-in file and its archived copy together; a desktop snapshot of that account is no longer taken over, and signing in again with a new token brings it back. When an installation is not in its default location, only its uninstall registry entry is read to locate it. Keys for encrypted fields stay in memory. Tokens are sent only to each vendor's own hosts: copilot.tencent.com / www.codebuddy.cn / www.codebuddy.ai / www.workbuddy.ai, api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai, gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh. Chat is served from an endpoint on 127.0.0.1; other local processes can call it and spend account quota."
+      "safetyNotes": "Uses local WorkBuddy, Trae and Qoder sign-ins and reads provider and model names to match the composer readout. Chat content is forwarded to the selected vendor; requests also carry that vendor's account and device identifiers (account uid, machine id, device id). The composer readout uses only model and account state. WorkBuddy sign-ins added in the panel are stored in plugin data and can be deleted with their archives. On Windows the plugin can read uninstall registry entries to locate WorkBuddy. On macOS it reads Qoder's login Keychain for the decryption key, which may prompt for access. Decryption keys stay in memory. Tokens go only to: copilot.tencent.com / www.codebuddy.cn / www.codebuddy.ai / www.workbuddy.ai, api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai, gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh. Other processes on this machine can call the gateway at 127.0.0.1 and spend account quota."
     },
     "zh-CN": {
       "name": "WTQ Pool",
       "description": "把本机 WorkBuddy、Trae、Qoder 的桌面登录接入 PI-Desktop。限流或额度用尽时自动换号，三家各有开关。",
-      "safetyNotes": "只读本机 WorkBuddy、Trae、Qoder 已保存的登录。同时读取宿主已加载的提供商与模型名称（不含会话内容），用于区分其他提供商的同名模型。也可以从面板登录账号，该凭证只写在插件自管数据目录内；面板可将这类账号连同登录文件与留档一并删除，桌面端遗留的同一份快照不再被接管，重新登录该账号（新令牌）即可回来。安装目录不在默认位置时，仅读取卸载项来定位。加密字段的密钥只保留在内存中。令牌只发往各家自己的接口：copilot.tencent.com / www.codebuddy.cn / www.codebuddy.ai / www.workbuddy.ai、api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai、gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh。对话由本机 127.0.0.1 上的端点转发；同机其他进程也可调用并消耗账号额度。"
+      "safetyNotes": "读取本机 WorkBuddy、Trae、Qoder 的登录信息，通过提供商和模型名称识别输入框积分。对话内容转发给所选厂商，请求同时携带该厂商的账号与设备标识（账号 UID、机器码、设备 ID），积分读数只使用模型与账号状态。面板添加的 WorkBuddy 登录保存在插件数据目录，可连同归档删除。Windows 下可读取卸载注册表项定位 WorkBuddy。macOS 下读取 Qoder 登录钥匙串中的解密密钥，系统可能会请求授权；解密密钥只保留在内存。令牌仅发往：copilot.tencent.com / www.codebuddy.cn / www.codebuddy.ai / www.workbuddy.ai、api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai、gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh。同机其他进程可调用 127.0.0.1 上的网关并消耗账号额度。"
     }
   },
-  "safetyNotes": "Reads the WorkBuddy, Trae and Qoder sign-ins already saved on this machine. It also reads the host's loaded provider and model names, never conversation content, to tell a same-named model apart from another provider's model. An account can also be signed in from the panel; that credential is stored only under the plugin's own data directory, and the panel can delete such an account again, removing the sign-in file and its archived copy together; a desktop snapshot of that account is no longer taken over, and signing in again with a new token brings it back. When an installation is not in its default location, only its uninstall registry entry is read to locate it. Keys for encrypted fields stay in memory. Tokens are sent only to each vendor's own hosts: copilot.tencent.com / www.codebuddy.cn / www.codebuddy.ai / www.workbuddy.ai, api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai, gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh. Chat is served from an endpoint on 127.0.0.1; other local processes can call it and spend account quota.",
+  "safetyNotes": "Uses local WorkBuddy, Trae and Qoder sign-ins and reads provider and model names to match the composer readout. Chat content is forwarded to the selected vendor; requests also carry that vendor's account and device identifiers (account uid, machine id, device id). The composer readout uses only model and account state. WorkBuddy sign-ins added in the panel are stored in plugin data and can be deleted with their archives. On Windows the plugin can read uninstall registry entries to locate WorkBuddy. On macOS it reads Qoder's login Keychain for the decryption key, which may prompt for access. Decryption keys stay in memory. Tokens go only to: copilot.tencent.com / www.codebuddy.cn / www.codebuddy.ai / www.workbuddy.ai, api.trae.cn / solo.trae.cn / trae-api-cn.mchost.guru / coresg-normal.trae.ai / growsg-normal.trae.ai, gateway.qoder.com.cn / openapi.qoder.com.cn / api3.qoder.sh / openapi.qoder.sh. Other processes on this machine can call the gateway at 127.0.0.1 and spend account quota.",
   "ui": {
     "panel": "renderer/index.html",
     "title": {
@@ -160,5 +160,5 @@
     ],
     "providers": []
   },
-  "changelog": "1.3.2 修复 macOS 上无法识别 Qoder 国内版桌面登录的问题。1.2.0 起提供商 ID 为 wtqpool-*，从 1.1.x 升级后需重新选择模型。"
+  "changelog": "1.3.6 安全：数据目录与签到记录使用更严格的权限；连接检查无法读取宿主清单时报告失败；补充请求携带的账号与设备标识说明；成长中心执行超过宿主等待时间后按钮恢复可用；自动签到进行中时按钮保持不可点，结束后恢复。1.3.5 收到 WorkBuddy、Trae、Qoder 的拒绝响应后及时关闭上游连接；WorkBuddy 清除超过保留期的过期凭证归档，并发删除时保留新登录；宿主模型目录读取失败时暂缓显示归属未确认的模型积分，切换账号成功后清除旧错误；修正 macOS Qoder 无效登录提示，改进面板选择器和键盘导航。1.3.4 修复宿主采集响应流时上游拒绝请求卡住的问题；取消请求时同步关闭上游连接。1.2.0 起提供商 ID 为 wtqpool-*，从 1.1.x 升级后需重新选择模型。"
 }

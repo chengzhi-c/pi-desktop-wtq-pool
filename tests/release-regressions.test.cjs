@@ -574,18 +574,31 @@ test('PI composer retries unread credits quickly and slows down after a balance 
   }
 })
 
-test('PI account selection restarts credit polling after a successful preference save', async () => {
+test('PI successful account selection clears an earlier notice and restarts credit polling', async () => {
   const renderer = fs.readFileSync(path.join(root, 'renderer/composer.mjs'), 'utf8')
   const prefer = renderer.slice(renderer.indexOf('method: "xd.composerPrefer"'))
   const body = prefer.match(/\}\)\.then\(\(next\) => \{([^]*?)\n          \}\)\.catch/)[1]
-  let restarted = 0
-  const context = vm.createContext({
-    next: { saved: true, show: true, total: null }, chipRef: { current: 'fixture' }, requestedChip: 'fixture',
-    account: { id: 'fixture' }, W: {}, setData() {}, setError() {}, setErrorFor() {}, setOpen() {},
-    restartPollRef: { current: () => { restarted++ } },
-  })
-  await vm.runInContext('(async () => {' + body + '\n})()', context)
-  assert.equal(restarted, 1, 'a preference save must not leave unread credits on the old five-minute timer')
+  const caught = prefer.match(/\}\)\.catch\(\(failure\) => \{([^]*?)\n          \}\);/)[1]
+  for (const earlier of [new Error('save failed'), { saved: false }, { saved: true, show: false }, { saved: true, show: true, unavailable: true }]) {
+    let restarted = 0, error = '', errorFor = ''
+    const context = vm.createContext({
+      next: earlier, rejected: earlier instanceof Error, chipRef: { current: 'fixture' }, requestedChip: 'fixture',
+      account: { id: 'earlier' }, W: { refused: 'refused', saved: 'saved', unavailable: 'unavailable' },
+      setData() {}, setOpen() {}, setError(value) { error = value }, setErrorFor(value) { errorFor = value },
+      restartPollRef: { current: () => { restarted++ } },
+    })
+    const answer = () => vm.runInContext('(rejected ? Promise.reject(next) : Promise.resolve(next))'
+      + '.then(next => {' + body + '\n}).catch(failure => {' + caught + '\n})', context)
+    await answer()
+    assert.notEqual(error, '', 'the earlier reply must display its notice')
+    restarted = 0
+    context.next = { saved: true, show: true, total: null }
+    context.rejected = false
+    await answer()
+    assert.equal(error, '', 'a later successful selection must clear the earlier reply\'s notice')
+    assert.equal(errorFor, '')
+    assert.equal(restarted, 1, 'a preference save must restart unread credit polling')
+  }
 })
 
 test('PI manual credit refresh restarts polling from the fresh answer', async () => {

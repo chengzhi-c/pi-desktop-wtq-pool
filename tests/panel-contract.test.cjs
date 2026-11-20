@@ -14,12 +14,10 @@
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
 const vm = require('node:vm')
 const { createRequire } = require('node:module')
-const { withoutComments } = require('../docs/capture-shape.cjs')
 
 const root = path.join(__dirname, '..')
 
@@ -261,6 +259,7 @@ test('every channel the page calls answers as the switch, not as its default', a
 test('every string the panel asks for exists in both languages', () => {
   const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
   const page = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
+  assert.doesNotMatch(page, /data-foot="market"|data-foot-label="market"|plugins\.aiuo\.net/i)
   const tables = ['EN', 'ZH'].map((dictionary) => {
     const from = source.indexOf(`var ${dictionary} = {`)
     assert.notEqual(from, -1, `the ${dictionary} table has to be in the panel`)
@@ -320,6 +319,97 @@ test('every view tab names the panel it controls, and that panel names it back',
     assert.ok(panel.includes('role="tabpanel"'), `${controls} has to be a tabpanel`)
     assert.ok(panel.includes(`aria-labelledby="${id}"`), `${controls} has to name ${id} back`)
   }
+})
+
+test('source and region selectors expose pressed buttons instead of unrelated tabs', () => {
+  const page = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
+  const panel = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
+  const sourceGroup = /<(?:div|nav)[^>]*id="sourceTabs"[^>]*>/.exec(page)?.[0]
+  assert.ok(sourceGroup?.includes('role="group"'), 'source selectors do not control a tabpanel')
+  assert.match(sourceGroup, /aria-label=/, 'the source button group has a name')
+  for (const source of ['workbuddy', 'trae', 'qoder']) {
+    const button = [...page.matchAll(/<button[^>]*>/g)].map(match => match[0])
+      .find(tag => tag.includes(`data-source="${source}"`))
+    assert.ok(button?.includes('aria-pressed='), `${source} exposes its selected state`)
+    assert.ok(!button.includes('role="tab"'), `${source} does not claim an unrelated tab panel`)
+  }
+  assert.match(page, /id="regionTabs" role="group" aria-label=/)
+  assert.match(page, /id="modelRegionTabs" role="group" aria-label=/)
+
+  const sourceTabs = /function renderSourceTabs\(\) \{([\s\S]*?)\n\}/.exec(panel)?.[1]
+  assert.match(sourceTabs, /setAttribute\("aria-pressed", on \? "true" : "false"\)/)
+  const regionStart = panel.indexOf('function fillRegionNav(')
+  let depth = 0
+  let regionEnd = panel.indexOf('{', regionStart)
+  for (; regionEnd < panel.length; regionEnd += 1) {
+    if (panel[regionEnd] === '{') depth += 1
+    else if (panel[regionEnd] === '}' && --depth === 0) break
+  }
+  const context = vm.createContext({
+    busy: null,
+    clear: node => { node.children = [] },
+    el: (_tag, className, text) => ({
+      className,
+      textContent: text || '',
+      attributes: {},
+      children: [],
+      setAttribute(name, value) { this.attributes[name] = value },
+      appendChild(child) { this.children.push(child) },
+      addEventListener() {},
+    }),
+    regionParked: () => false,
+    render() {},
+    setActiveRegion() {},
+    sourceRegionLabel: region => region === 'cn' ? 'China' : 'Global',
+    t: key => key === 'tabs.regions' ? 'Account region' : key,
+  })
+  vm.runInContext(panel.slice(regionStart, regionEnd + 1), context)
+  const nav = { children: [], setAttribute(name, value) { this[name] = value }, appendChild(child) { this.children.push(child) } }
+  context.nav = nav
+  vm.runInContext('fillRegionNav(nav, "qoder", ["cn", "global"], [{region:"cn"}], "cn")', context)
+  assert.equal(nav.role, 'group', 'generated region controls are exposed as a group')
+  assert.equal(nav['aria-label'], 'Account region')
+  assert.deepEqual(nav.children.map(button => button.attributes['aria-pressed']), ['true', 'false'])
+})
+
+test('view tabs move focus with arrow and edge keys without activating another view', () => {
+  const panel = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
+  const start = panel.indexOf('function moveTabFocus(')
+  assert.notEqual(start, -1, 'the panel has a view-tab keyboard handler')
+  let depth = 0
+  let end = panel.indexOf('{', start)
+  for (; end < panel.length; end += 1) {
+    if (panel[end] === '{') depth += 1
+    else if (panel[end] === '}' && --depth === 0) break
+  }
+  const context = vm.createContext({})
+  vm.runInContext(panel.slice(start, end + 1), context)
+  const focused = []
+  const tab = (hidden, disabled, selected) => ({
+    hidden,
+    disabled,
+    tabIndex: selected ? 0 : -1,
+    attributes: { 'aria-selected': selected ? 'true' : 'false' },
+    getAttribute(name) { return this.attributes[name] },
+    setAttribute(name, value) { this.attributes[name] = value },
+    focus() { focused.push(this) },
+  })
+  const tabs = [tab(false, false, true), tab(true, false, false), tab(false, true, false), tab(false, false, false)]
+  context.list = { querySelectorAll: () => tabs }
+  context.tabs = tabs
+
+  assert.equal(vm.runInContext('moveTabFocus(list, tabs[0], "ArrowRight")', context), true)
+  assert.equal(focused.at(-1), tabs[3], 'right arrow skips hidden and disabled tabs')
+  assert.deepEqual(tabs.map(item => item.tabIndex), [-1, -1, -1, 0])
+  assert.deepEqual(tabs.map(item => item.getAttribute('aria-selected')), ['true', 'false', 'false', 'false'])
+  assert.equal(vm.runInContext('moveTabFocus(list, tabs[3], "ArrowRight")', context), true)
+  assert.equal(focused.at(-1), tabs[0], 'right arrow wraps to the first tab')
+  assert.equal(vm.runInContext('moveTabFocus(list, tabs[0], "ArrowLeft")', context), true)
+  assert.equal(focused.at(-1), tabs[3], 'left arrow wraps to the last tab')
+  assert.equal(vm.runInContext('moveTabFocus(list, tabs[3], "Home")', context), true)
+  assert.equal(focused.at(-1), tabs[0])
+  assert.equal(vm.runInContext('moveTabFocus(list, tabs[0], "End")', context), true)
+  assert.equal(focused.at(-1), tabs[3])
 })
 
 /**
@@ -427,9 +517,17 @@ test('the ban-risk note reaches the panel line', () => {
     assert.ok(expected.trim() !== '', `${name} risk.note must say something`)
 
     const node = { textContent: '' }
+    const groups = {
+      sourceTabs: { setAttribute(name, value) { this[name] = value } },
+      viewTabs: { setAttribute(name, value) { this[name] = value } },
+    }
     const context = vm.createContext({
       document: { querySelectorAll: () => [], documentElement: { lang: name === 'ZH' ? 'zh-CN' : 'en' } },
-      $: (id) => { assert.equal(id, 'riskNote'); return node },
+      $: (id) => {
+        if (id === 'riskNote') return node
+        assert.ok(groups[id], `labelTabs reads known element ${id}`)
+        return groups[id]
+      },
       TABLE: table,
       EN,
       activeSource: 'workbuddy',
@@ -438,7 +536,92 @@ test('the ban-risk note reaches the panel line', () => {
     vm.runInContext(note, context)
     vm.runInContext('labelTabs()', context)
     assert.equal(node.textContent, expected, `${name} note has to reach the page verbatim`)
+    assert.equal(groups.sourceTabs['aria-label'], table['tabs.sources'])
+    assert.equal(groups.viewTabs['aria-label'], table['tabs.views'])
   }
+})
+
+/**
+ * The check-in button stays out of the way while a pass is already running.
+ *
+ * A finished pass leaves the host with `autoCheckin.last.pending` set, and the
+ * growth flag stays up until the pass returns. A button painted as ready in
+ * that window accepts a click, asks for a second pass, and is repainted by the
+ * host's "already running" answer — it flashes and does nothing. The button has
+ * to report the pass instead, and come back when the state says it ended.
+ */
+test('the check-in button waits for a running pass', () => {
+  const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
+  const start = source.indexOf('function renderAutoCheckin(')
+  assert.notEqual(start, -1, 'renderAutoCheckin has to be in the panel')
+  let depth = 0
+  let end = source.indexOf('{', start)
+  for (; end < source.length; end += 1) {
+    if (source[end] === '{') depth += 1
+    else if (source[end] === '}') { depth -= 1; if (depth === 0) break }
+  }
+
+  const nodes = {}
+  const node = () => ({
+    childElementCount: 0,
+    children: [],
+    textContent: '',
+    title: '',
+    disabled: false,
+    value: '',
+    placeholder: '',
+    attrs: {},
+    setAttribute(name, value) { this.attrs[name] = String(value) },
+    getAttribute(name) { return this.attrs[name] ?? null },
+    addEventListener() {},
+    appendChild(child) { this.children.push(child); this.childElementCount = this.children.length },
+  })
+  const get = (id) => nodes[id] || (nodes[id] = node())
+  const control = get('autoControl')
+  control.childElementCount = 2
+  control.children = ['true', 'false'].map((value) => {
+    const button = node()
+    button.setAttribute('data-auto', value)
+    return button
+  })
+
+  const paint = (state) => {
+    const context = vm.createContext({
+      state,
+      busy: null,
+      checkinBusy: null,
+      autoHoursDraft: null,
+      $: get,
+      t: (key) => key,
+      document: { activeElement: null },
+      paintAutoNote() {},
+      paintKeepAliveNote() {},
+    })
+    vm.runInContext(source.slice(start, end + 1), context)
+    vm.runInContext('renderAutoCheckin()', context)
+    return get('autoRunNow')
+  }
+
+  const idle = paint({
+    autoCheckin: { enabled: true, hours: [9], last: { pending: false } },
+    growth: { running: false },
+  })
+  assert.equal(idle.disabled, false, 'an idle panel leaves the button ready')
+  assert.equal(idle.textContent, 'auto.runNow')
+
+  const pending = paint({
+    autoCheckin: { enabled: true, hours: [9], last: { pending: true } },
+    growth: { running: false },
+  })
+  assert.equal(pending.disabled, true, 'a pass answered as pending owns the button')
+  assert.equal(pending.textContent, 'auto.running')
+
+  const inPass = paint({
+    autoCheckin: { enabled: true, hours: [9], last: { pending: false } },
+    growth: { running: true },
+  })
+  assert.equal(inPass.disabled, true, 'the same pass still shows in the growth flag')
+  assert.equal(inPass.textContent, 'auto.running')
 })
 
 /**
@@ -454,52 +637,4 @@ test('the panel page does not pin a locale', () => {
   const page = fs.readFileSync(path.join(root, 'renderer', 'index.html'), 'utf8')
   assert.doesNotMatch(page, /<html[^>]*\blang\s*=/i,
     'the panel document must not declare a language before the host appearance is known')
-})
-
-/**
- * The README screenshots show the panel the repository ships now.
- *
- * `docs/preview-panel.html` mounts `renderer/index.html`, `panel.js` and
- * `panel.css` at runtime, so a capture taken from it cannot disagree with what
- * ships. What it can do is go stale: the pictures in docs/ are committed files,
- * and the panel changed under them while the README kept showing the old one.
- *
- * "Newer than" is a content question, not a file-system one: git does not carry
- * modification times, so a stamp compared against them passes on the machine that
- * took the picture and fails on a fresh clone, in either direction. The capture
- * writes the hashes of the files it mounted into `docs/preview-capture.json`,
- * and this compares against those.
- */
-test('the README screenshots show the panel the repository ships', () => {
-  const shots = ['preview-pool.png', 'preview-dark.png', 'preview-models.png', 'preview-growth.png', 'preview-page.png']
-  const rendered = ['renderer/index.html', 'renderer/panel.js', 'renderer/panel.css',
-    'docs/preview-panel.html', 'docs/preview-data.js']
-  const stampAt = path.join(root, 'docs', 'preview-capture.json')
-  assert.ok(fs.existsSync(stampAt), 'docs/preview-capture.json has to exist: the capture writes it')
-  const stamp = JSON.parse(fs.readFileSync(stampAt, 'utf8'))
-  const digest = (file) => crypto.createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex')
-  // Comments and blank lines never reach a pixel, so the capture records each
-  // file with them gone: an edit to either never made a picture stale, and
-  // comparing whole files forced a re-stamp on every one of them. The
-  // screenshots keep their own whole-file hashes below, because those bytes are
-  // the picture.
-  const shape = (file) => crypto.createHash('sha256')
-    .update(withoutComments(fs.readFileSync(path.join(root, file), 'utf8'), file))
-    .digest('hex')
-
-  assert.deepEqual(Object.keys(stamp.rendered).sort(), [...rendered].sort(),
-    'the capture has to name every source that decides what the screenshots show')
-  for (const file of rendered) {
-    assert.equal(stamp.rendered[file], shape(file),
-      `${file} changed since the screenshots were taken: re-capture, then run node docs/stamp.cjs`)
-  }
-  assert.deepEqual(Object.keys(stamp.shots).sort(), [...shots].sort(),
-    'the capture has to list the shots the README embeds')
-
-  for (const shot of shots) {
-    const at = path.join(root, 'docs', shot)
-    assert.ok(fs.existsSync(at), `docs/${shot} has to exist: the README embeds it`)
-    assert.equal(stamp.shots[shot], digest('docs/' + shot),
-      `docs/${shot} changed without the stamp that records what it was captured against: run node docs/stamp.cjs after re-capturing`)
-  }
 })

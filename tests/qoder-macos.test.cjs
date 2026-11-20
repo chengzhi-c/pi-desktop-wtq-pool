@@ -16,7 +16,6 @@
  */
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { EventEmitter } = require('node:events')
 const { createCipheriv, pbkdf2Sync } = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -26,7 +25,7 @@ const { readQoderCredential, resetQoderCredentialCache } = require('../lib/qoder
 const { decryptQoderOscryptMac, qoderStorageCandidates } = require('../lib/qoder-discovery')
 
 function scratch(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
+  return fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), prefix))
 }
 
 function sealMacBlob(plaintext, key) {
@@ -36,8 +35,8 @@ function sealMacBlob(plaintext, key) {
 
 test('decryptQoderOscryptMac opens a macOS blob and rejects the rest', () => {
   const key = pbkdf2Sync('fixture-password', 'saltysalt', 1003, 16, 'sha1')
-  const blob = sealMacBlob('x'.repeat(48), key)
-  assert.equal(decryptQoderOscryptMac(blob, key), 'x'.repeat(48), 'the sealed payload round-trips')
+  const blob = sealMacBlob('fixture', key)
+  assert.equal(decryptQoderOscryptMac(blob, key), 'fixture', 'the sealed payload round-trips')
   assert.equal(decryptQoderOscryptMac(blob, pbkdf2Sync('other', 'saltysalt', 1003, 16, 'sha1')), undefined,
     'a wrong key fails the padding check rather than returning noise')
   assert.equal(decryptQoderOscryptMac(Buffer.concat([Buffer.from('v11'), blob.subarray(3)]), key), undefined,
@@ -47,28 +46,16 @@ test('decryptQoderOscryptMac opens a macOS blob and rejects the rest', () => {
 test('a macOS sign-in is read through the pinned Keychain helper', async () => {
   const temporary = scratch('wtq-qoder-macos-')
   const childProcess = require('node:child_process')
-  const realSpawn = childProcess.spawn
+  const realExecFile = childProcess.execFile
   const password = 'keychain-password-fixture'
   const key = pbkdf2Sync(password, 'saltysalt', 1003, 16, 'sha1')
   const blob = sealMacBlob(JSON.stringify({ token: 'qoder-mac-token', user: { id: 'mac-user-1' } }), key)
-  let spawnFile
-  let spawnArguments
-  childProcess.spawn = (file, args) => {
-    spawnFile = file
-    spawnArguments = args
-    const fake = new EventEmitter()
-    fake.stdout = new EventEmitter()
-    fake.stdout.setEncoding = () => {}
-    fake.stderr = new EventEmitter()
-    fake.stderr.setEncoding = () => {}
-    fake.kill = () => {}
-    fake.stdin = { on: () => {}, end: () => {} }
-    // The reader attaches its stdout listener before this tick runs.
-    process.nextTick(() => {
-      fake.stdout.emit('data', `${password}\n`)
-      fake.emit('close', 0)
-    })
-    return fake
+  let helperFile
+  let helperArgs
+  childProcess.execFile = (file, args, options, callback) => {
+    helperFile = file
+    helperArgs = args
+    process.nextTick(callback, null, password + '\n', '')
   }
   try {
     // A named home keeps the case off the machine it runs on; `platform` is
@@ -84,12 +71,12 @@ test('a macOS sign-in is read through the pinned Keychain helper', async () => {
     assert.equal(result.credential?.token, 'qoder-mac-token', 'the macOS reader must open the session')
     assert.equal(result.credential?.userID, 'mac-user-1')
     assert.equal(result.credential?.machineID, 'mac-machine-id')
-    assert.equal(spawnFile, '/usr/bin/security', 'the Keychain helper must be pinned, not PATH-resolved')
-    assert.equal(spawnArguments.includes('Qoder CN App Safe Storage'), true,
+    assert.equal(helperFile, '/usr/bin/security', 'the Keychain helper must be pinned, not PATH-resolved')
+    assert.equal(helperArgs.includes('Qoder CN App Safe Storage'), true,
       'the CN service name is asked first')
-    assert.equal(spawnArguments.includes('-w'), true, 'the password is requested, not the item metadata')
+    assert.equal(helperArgs.includes('-w'), true, 'the password is requested, not the item metadata')
   } finally {
-    childProcess.spawn = realSpawn
+    childProcess.execFile = realExecFile
     resetQoderCredentialCache()
     fs.rmSync(temporary, { recursive: true, force: true })
   }
@@ -98,19 +85,9 @@ test('a macOS sign-in is read through the pinned Keychain helper', async () => {
 test('a denied Keychain answers no-key instead of failing the scan', async () => {
   const temporary = scratch('wtq-qoder-macos-denied-')
   const childProcess = require('node:child_process')
-  const realSpawn = childProcess.spawn
-  childProcess.spawn = () => {
-    const fake = new EventEmitter()
-    fake.stdout = new EventEmitter()
-    fake.stdout.setEncoding = () => {}
-    fake.stderr = new EventEmitter()
-    fake.stderr.setEncoding = () => {}
-    fake.kill = () => {}
-    fake.stdin = { on: () => {}, end: () => {} }
-    // `security` exits non-zero when the user denies the prompt or the item is
-    // missing; either way there is no password to derive from.
-    process.nextTick(() => fake.emit('close', 51))
-    return fake
+  const realExecFile = childProcess.execFile
+  childProcess.execFile = (file, args, options, callback) => {
+    process.nextTick(callback, new Error('Keychain access denied'), '', '')
   }
   try {
     const candidates = qoderStorageCandidates('darwin', temporary)
@@ -124,7 +101,33 @@ test('a denied Keychain answers no-key instead of failing the scan', async () =>
     assert.equal(result.failure?.message.includes('Keychain'), true,
       'the message points the user at the Keychain, not at a stack trace')
   } finally {
-    childProcess.spawn = realSpawn
+    childProcess.execFile = realExecFile
+    resetQoderCredentialCache()
+    fs.rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('a decrypted session without an account id is reported as invalid', async () => {
+  const temporary = scratch('wtq-qoder-macos-invalid-')
+  const childProcess = require('node:child_process')
+  const realExecFile = childProcess.execFile
+  const password = 'keychain-password-fixture'
+  const key = pbkdf2Sync(password, 'saltysalt', 1003, 16, 'sha1')
+  const blob = sealMacBlob(JSON.stringify({ token: 'qoder-mac-token', user: {} }), key)
+  childProcess.execFile = (_file, _args, _options, callback) => {
+    process.nextTick(callback, null, password + '\n', '')
+  }
+  try {
+    const candidates = qoderStorageCandidates('darwin', temporary)
+    const auth = candidates.find(candidate => candidate.kind === 'auth-v1' && candidate.region === 'cn')
+    fs.mkdirSync(path.dirname(auth.path), { recursive: true })
+    fs.writeFileSync(auth.path, blob)
+    resetQoderCredentialCache()
+    const group = candidates.filter(candidate => candidate.appDir === auth.appDir)
+    const result = await readQoderCredential(group, { platform: 'darwin' })
+    assert.equal(result.failure?.reason, 'invalid', 'decryption succeeded, so the session shape is the failing part')
+  } finally {
+    childProcess.execFile = realExecFile
     resetQoderCredentialCache()
     fs.rmSync(temporary, { recursive: true, force: true })
   }

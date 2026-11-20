@@ -5,7 +5,7 @@
  * whether it is signed in, and hands the token to the caller in memory only.
  * Nothing writes to the Qoder apps' files.
  */
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { pbkdf2Sync } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -137,19 +137,19 @@ export async function unwrapQoderOscryptKey(
     } catch { /* an unstatable file is treated as stale */ }
     const cached = oscryptKeyCache.get(localStatePath)
     if (cached !== undefined && cached.mtimeMs === mtimeMs) return Buffer.from(cached.key)
-    const exe = trustedWindowsPowerShell(env)
+    const exe = trustedWindowsPowerShell()
     if (exe === undefined) throw new QoderKeyError('unavailable', 'SystemRoot is not set, cannot locate PowerShell')
     // `spawn` rather than `execFile`, because the blob has to go in on stdin and
     // only the key comes back on stdout.
     const stdout = await new Promise<string>((resolve, reject) => {
       const child = spawn(exe, ['-NoProfile', '-NonInteractive', '-Command', DPAPI_SCRIPT], {
-        env: trustedWindowsChildEnv(env, { inheritTemp: true, includeSystemDrive: true }),
+        env: trustedWindowsChildEnv(env),
         // A writable current directory on the DLL search path is how a planted
         // library reaches an elevated PowerShell. The trusted root is the one
         // that located the executable, not the inherited variable the caller
         // can point anywhere.
         cwd: (() => {
-          const root = trustedSystemRootOf(env)
+          const root = trustedSystemRootOf()
           return root === undefined ? undefined : join(root, 'System32')
         })(),
         windowsHide: true,
@@ -260,14 +260,7 @@ async function firstAuthBlob(paths: readonly string[]): Promise<Buffer | undefin
   return undefined
 }
 
-/**
- * Login-Keychain service names the Qoder desktop app stores its OSCrypt
- * password under, newest branding first. Verified against the CN Electron app
- * (`Qoder CN App Safe Storage`); the remaining spellings cover the JetBrains
- * build and older branding, and the international list follows the same
- * pattern. A machine holds at most one of them, so the reader tries each in
- * order and keeps whichever decrypts.
- */
+/** Keychain service names for the current and older Qoder builds. */
 const QODER_KEYCHAIN_SERVICES: Record<QoderRegion, readonly string[]> = {
   cn: ['Qoder CN App Safe Storage', 'Qoder CN Safe Storage', 'QoderWork CN Safe Storage'],
   global: ['Qoder App Safe Storage', 'Qoder Safe Storage', 'QoderWork Safe Storage'],
@@ -283,42 +276,12 @@ const MAC_OSCRYPT_ITERATIONS = 1003
 /** Derived macOS keys, keyed on the Keychain service they came from. */
 const darwinKeyCache = new Map<string, Buffer>()
 
-/**
- * Read the OSCrypt password one Qoder app keeps in the login Keychain.
- *
- * `/usr/bin/security` is pinned rather than resolved from `PATH`: the host
- * spawns plugins with a trimmed environment where PATH lookup is not
- * trustworthy, and a planted `security` earlier on PATH would be handed the
- * password. The service name is the only argument (it is not secret); the
- * password itself only travels on the helper's stdout. A denied, absent or
- * timing-out item resolves to `undefined` — the reader just moves on to the
- * next spelling.
- */
-function darwinKeychainPassword(
-  service: string,
-  options: { timeoutMs?: number } = {},
-): Promise<string | undefined> {
+/** Pin the system helper and bound the wait for a Keychain prompt. */
+function darwinKeychainPassword(service: string): Promise<string | undefined> {
   return new Promise(resolve => {
-    const child = spawn('/usr/bin/security', ['find-generic-password', '-s', service, '-w'], {
-      stdio: ['ignore', 'pipe', 'pipe'],
+    execFile('/usr/bin/security', ['find-generic-password', '-s', service, '-w'], { timeout: 8_000 }, (error, stdout) => {
+      resolve(error ? undefined : stdout.trim() || undefined)
     })
-    let out = ''
-    let settled = false
-    const finish = (value: string | undefined) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve(value)
-    }
-    const timer = setTimeout(() => {
-      // A Keychain prompt the user never answers must not wedge a scan.
-      child.kill()
-      finish(undefined)
-    }, options.timeoutMs ?? 8_000)
-    child.stdout.setEncoding('utf8')
-    child.stdout.on('data', chunk => { out += chunk })
-    child.on('error', () => finish(undefined))
-    child.on('close', code => finish(code === 0 ? out.trim() : undefined))
   })
 }
 
@@ -329,18 +292,18 @@ async function readQoderCredentialMac(
   appDir: string,
 ): Promise<{ credential?: QoderCredential; failure?: QoderCredentialFailure }> {
   const base = { region }
+  let decrypted = false
   for (const service of QODER_KEYCHAIN_SERVICES[region]) {
     let key = darwinKeyCache.get(service)
     if (key === undefined) {
       const password = await darwinKeychainPassword(service)
-      // An empty item would derive a key that opens nothing; skip it like a
-      // missing one instead of paying a doomed decrypt on every read.
-      if (password === undefined || password === '') continue
+      if (password === undefined) continue
       key = pbkdf2Sync(password, MAC_OSCRYPT_SALT, MAC_OSCRYPT_ITERATIONS, 16, 'sha1')
       darwinKeyCache.set(service, key)
     }
     const plain = decryptQoderOscryptMac(authBlob, key)
     if (plain === undefined) continue
+    decrypted = true
     const session = parseQoderAuthSession(plain)
     if (session === undefined) continue
     const machineID = await machineIdOf(appDir)
@@ -355,9 +318,11 @@ async function readQoderCredentialMac(
   return {
     failure: {
       ...base,
-      reason: 'no-key',
-      message:
-        'no macOS Keychain key opened the sign-in (sign in to the Qoder app, then allow the Keychain prompt and rescan)',
+      reason: decrypted ? 'invalid' : 'no-key',
+      ...decrypted ? {} : {
+        message:
+          'no macOS Keychain key opened the sign-in (sign in to the Qoder app, then allow the Keychain prompt and rescan)',
+      },
     },
   }
 }

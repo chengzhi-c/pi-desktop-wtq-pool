@@ -664,7 +664,7 @@ async function adoptPreviousDataDir() {
     .find((candidate) => fs.existsSync(candidate));
   if (source === undefined) return false;
   try {
-    fs.mkdirSync(dataPath, { recursive: true });
+    fs.mkdirSync(dataPath, { recursive: true, mode: 0o700 });
     fs.copyFileSync(source, own);
     log("info", "carried settings over from the previous plugin id");
     return true;
@@ -1032,11 +1032,11 @@ function saveCheckinSlots() {
     // The host normally creates this directory; the one case it does not is a
     // data path taken over from a previous plugin id, whose copy is made by
     // `adoptPreviousDataDir`. Without this the slots would silently never persist.
-    fs.mkdirSync(dataPath, { recursive: true });
+    fs.mkdirSync(dataPath, { recursive: true, mode: 0o700 });
     // Written beside its target and renamed, like the declaration: a process
     // killed mid-write leaves the previous file whole rather than a truncated
     // one that reads as a day with no entries.
-    fs.writeFileSync(staging, JSON.stringify(byDay, null, 2) + "\n", "utf8");
+    fs.writeFileSync(staging, JSON.stringify(byDay, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
     fs.renameSync(staging, target);
   } catch (error) {
     // A write that failed halfway leaves the staging file behind, and nothing
@@ -1780,12 +1780,9 @@ function refreshExternalModels() {
     } catch (error) {
       log("warn", "could not read the host model list: " + safeMessage(error));
       if (generation !== loadGeneration) return externalModels;
-      // A failed read keeps a set that was already known, so a transient error
-      // cannot re-enable a collision. A host that never answered is treated as
-      // having no list at all: hiding every readout until a read happens to
-      // succeed is worse than the older best-effort answer.
-      const known = externalModels.known === true;
-      externalModels = { ...externalModels, at: Date.now(), known, available: known };
+      // A failed read keeps known collisions and leaves an unread list unknown;
+      // only an absent API can establish that the host cannot provide a list.
+      externalModels = { ...externalModels, at: Date.now(), available: true };
     }
     return externalModels;
   })();
@@ -4144,6 +4141,32 @@ async function statusDocument(options) {
     }
   }
 
+  // Both sources report on the same shape: their own region pair, accounts,
+  // account pick and published roster. The panel reads either row the same way.
+  const accountRowsBySource = { trae: traeAccountRows, qoder: qoderAccountRows };
+  const sourceDocument = (source) => {
+    const spec = SOURCE_SPECS[source];
+    return {
+      regions: spec.activeRegions(),
+      distribution: sourceDistribution(source),
+      accounts: accountRowsBySource[source],
+      preferred: sourcePreferredMap(source),
+      gateways: Array.from(spec.gateways.values()).map((entry) => ({
+        region: entry.region,
+        port: entry.gateway.port(),
+        models: spec.declarationModels(entry.region).length,
+        portFallback: entry.portFallback,
+        preferredPort: entry.preferredPort,
+        lastError: entry.lastError,
+        // Roster and selection come from one pass, and the selection is the one
+        // the gateway really publishes rather than the raw stored value: after a
+        // catalog rename the two used to disagree, so the panel showed every
+        // model unticked while the gateway served all of them.
+        ...sourcePublishedModels(source + ":" + entry.region, entry.gateway.models(), spec.nativeOf),
+      })),
+    };
+  };
+
   // Only active gateways are offered: a source switched off removes its tabs
   // instead of showing an empty tab that can never fill.
   return {
@@ -4152,50 +4175,10 @@ async function statusDocument(options) {
     // Which regions the user parked, so the panel can still show them (and let
     // them be switched back on) after they leave `regions` above.
     disabledRegions: disabledRegionKeys(),
-    // Trae's gateways report separately: its regions are a different pair, and
-    // its accounts are not part of the WorkBuddy pool the tabs above drive.
-    trae: {
-      regions: activeTraeRegions(),
-      distribution: sourceDistribution("trae"),
-      accounts: traeAccountRows,
-      // One map per source, keyed by region: the panel's "which account serves
-      // this region" picker reads it straight back, so a pick survives the next
-      // document instead of snapping back to automatic.
-      preferred: sourcePreferredMap("trae"),
-      gateways: Array.from(traeGateways.values()).map((entry) => ({
-        region: entry.region,
-        port: entry.gateway.port(),
-        models: traeDeclarationModels(entry.region).length,
-        portFallback: entry.portFallback,
-        preferredPort: entry.preferredPort,
-        lastError: entry.lastError,
-        // Roster and selection come from one pass, and the selection is the one
-        // the gateway really publishes rather than the raw stored value: after a
-        // catalog rename the two used to disagree, so the panel showed every
-        // model unticked while the gateway served all of them.
-        ...sourcePublishedModels("trae:" + entry.region, entry.gateway.models(), traeNativeOf),
-      })),
-    },
-    // Qoder's gateways report beside Trae's on the same terms: its regions are
-    // the WorkBuddy pair, and its accounts are not part of the pool either.
-    qoder: {
-      regions: activeQoderRegions(),
-      distribution: sourceDistribution("qoder"),
-      accounts: qoderAccountRows,
-      preferred: sourcePreferredMap("qoder"),
-      gateways: Array.from(qoderGateways.values()).map((entry) => ({
-        region: entry.region,
-        port: entry.gateway.port(),
-        models: qoderDeclarationModels(entry.region).length,
-        portFallback: entry.portFallback,
-        preferredPort: entry.preferredPort,
-        // The panel reads this for Qoder exactly as it does for Trae, so an
-        // unreachable directory has to reach the card here too, not only on the
-        // other source.
-        lastError: entry.lastError,
-        ...sourcePublishedModels("qoder:" + entry.region, entry.gateway.models(), qoderNativeOf),
-      })),
-    },
+    // Each source reports beside the WorkBuddy tabs: its own regions, accounts
+    // and published roster, never an empty tab that can never fill.
+    trae: sourceDocument("trae"),
+    qoder: sourceDocument("qoder"),
     enabled: settings.enabled !== false,
     // Declared but not yet registered by the host: the panel says how to make
     // the model groups appear instead of letting them be silently missing.
@@ -4367,7 +4350,8 @@ function declaredSourceBaseUrl(region, idByRegion) {
  * the host just has not been told. Naming the delta turns that into the one
  * action that clears it - turn the plugin off and on, or restart the app.
  *
- * An empty result is also the answer when the host does not expose its copy.
+ * `null` means the host's copy could not be read: that is an unknown result,
+ * not an empty one, and the check reports it as such instead of passing.
  */
 function unpublishedDeclarations() {
   let hostIds;
@@ -4375,7 +4359,7 @@ function unpublishedDeclarations() {
     const own = pi.plugin.getManifest();
     hostIds = new Set(((own?.contributes?.providers) || []).map((provider) => provider?.id));
   } catch {
-    return [];
+    return null;
   }
   return manifestProviders()
     .filter((provider) => !hostIds.has(provider.id))
@@ -4497,36 +4481,41 @@ function addressDrift() {
 }
 
 
-/** Trae discovery for the doctor: count only, never token material. */
-async function traeDoctorDetail() {
-  if (!sourceEnabled("trae")) return { ok: true, detail: "switched off in plugin settings (deliberate; not a failure)" };
+/**
+ * Discovery detail shared by Trae and Qoder.
+ *
+ * Counts and served-model figures only: the report is copyable out of the panel,
+ * so no token material or filesystem path reaches it.
+ */
+async function sourceDoctorDetail(spec) {
+  if (!sourceEnabled(spec.source)) return { ok: true, detail: "switched off in plugin settings (deliberate; not a failure)" };
   try {
-    const found = await discoverTraeCredentials();
+    const found = await spec.discover();
+    const failures = found.failures.length > 0 ? `; ${found.failures.length} ${spec.unreadable}` : "";
     if (found.credentials.length === 0) {
-      return { ok: false, detail: "on; no Trae sign-in found (sign in to Trae CN / TRAE SOLO CN, then run the check again)" };
+      return { ok: false, detail: `on; no ${spec.label} sign-in found (${spec.hint})${failures}` };
     }
     const byRegion = {};
     for (const credential of found.credentials) {
-      const region = traeRegionOfCredential(credential);
+      const region = spec.regionOf(credential);
       byRegion[region] = (byRegion[region] || 0) + 1;
     }
     const parts = Object.entries(byRegion).map(([region, count]) => `${region} x${count}`).join(", ");
-    const failures = found.failures.length > 0 ? `; ${found.failures.length} unreadable file(s)` : "";
-    // What the provider actually publishes, after the user's tick filter:
-    // the doctor has to say serving or not, never a stale "not served yet".
-    const servedRegions = activeTraeRegions();
+    // What the provider actually publishes, after the user's tick filter: the
+    // doctor has to say serving or not, never a stale "not served yet".
+    const servedRegions = spec.activeRegions();
     const served = servedRegions
-      .map((region) => `${region}: ${traeDeclarationModels(region).length} model(s)`)
+      .map((region) => `${region}: ${spec.declarationModels(region).length} model(s)`)
       .join(", ");
     const stillReading = [];
     const problems = [];
     for (const region of servedRegions) {
-      const entry = traeGateways.get(region);
+      const entry = spec.gateways.get(region);
       if (entry === undefined && !byRegion[region]) {
         problems.push(`${region}: no sign-in for this region`);
       } else if (entry === undefined || entry.warmSettled !== true) {
         stillReading.push(region);
-      } else if (traeDeclarationModels(region).length === 0) {
+      } else if (spec.declarationModels(region).length === 0) {
         problems.push(entry.lastError !== ""
           ? `${region}: ${entry.lastError}`
           : `${region}: no models selected`);
@@ -4545,6 +4534,36 @@ async function traeDoctorDetail() {
   }
 }
 
+/** Trae discovery for the doctor. */
+function traeDoctorDetail() {
+  return sourceDoctorDetail({
+    source: "trae",
+    label: "Trae",
+    hint: "sign in to Trae CN / TRAE SOLO CN, then run the check again",
+    unreadable: "unreadable file(s)",
+    discover: discoverTraeCredentials,
+    regionOf: traeRegionOfCredential,
+    activeRegions: activeTraeRegions,
+    declarationModels: traeDeclarationModels,
+    gateways: traeGateways,
+  });
+}
+
+/** Qoder discovery for the doctor. */
+function qoderDoctorDetail() {
+  return sourceDoctorDetail({
+    source: "qoder",
+    label: "Qoder",
+    hint: "sign in to Qoder, then run the check again",
+    unreadable: "unreadable app dir(s)",
+    discover: discoverQoderCredentials,
+    regionOf: (credential) => credential.region,
+    activeRegions: activeQoderRegions,
+    declarationModels: qoderDeclarationModels,
+    gateways: qoderGateways,
+  });
+}
+
 /**
  * Why the at-rest keys could not be fetched, or "" when they are fine.
  *
@@ -4557,51 +4576,6 @@ function atRestKeyReason() {
     return safeMessage(atRestKeyFailure() || "").slice(0, 500);
   } catch (error) {
     return "the at-rest key state could not be read (" + safeMessage(error) + ")";
-  }
-}
-
-/** Qoder credentials for the doctor: count only, never token material. */
-async function qoderDoctorDetail() {
-  if (!sourceEnabled("qoder")) return { ok: true, detail: "switched off in plugin settings (deliberate; not a failure)" };
-  try {
-    const found = await discoverQoderCredentials();
-    if (found.credentials.length === 0) {
-      const failures = found.failures.length > 0 ? `; ${found.failures.length} unreadable app dir(s)` : "";
-      return { ok: false, detail: `on; no Qoder sign-in found (sign in to Qoder, then run the check again)${failures}` };
-    }
-    const byRegion = {};
-    for (const credential of found.credentials) {
-      byRegion[credential.region] = (byRegion[credential.region] || 0) + 1;
-    }
-    const parts = Object.entries(byRegion).map(([region, count]) => `${region} x${count}`).join(", ");
-    const failures = found.failures.length > 0 ? `; ${found.failures.length} unreadable app dir(s)` : "";
-    // Same contract as Trae's: report what is actually served now, not a bare count.
-    const servedRegions = activeQoderRegions();
-    const served = servedRegions
-      .map((region) => `${region}: ${qoderDeclarationModels(region).length} model(s)`)
-      .join(", ");
-    const stillReading = [];
-    const problems = [];
-    for (const region of servedRegions) {
-      const entry = qoderGateways.get(region);
-      if (entry === undefined && !byRegion[region]) {
-        problems.push(`${region}: no sign-in for this region`);
-      } else if (entry === undefined || entry.warmSettled !== true) {
-        stillReading.push(region);
-      } else if (qoderDeclarationModels(region).length === 0) {
-        problems.push(entry.lastError !== ""
-          ? `${region}: ${entry.lastError}`
-          : `${region}: no models selected`);
-      }
-    }
-    return {
-      ok: problems.length === 0,
-      detail: `on; ${found.credentials.length} account(s) (${parts})${failures}; serving ${served}`
-        + (stillReading.length > 0 ? `; still reading models for ${stillReading.join(", ")}` : "")
-        + (problems.length > 0 ? `; ${problems.join("; ")}` : ""),
-    };
-  } catch (error) {
-    return { ok: false, detail: `on; discovery failed (${errorCodeOf(error)})` };
   }
 }
 
@@ -4648,15 +4622,20 @@ async function doctorReport() {
   // The gateways can all be listening and the manifest can name them while the
   // host's own copy predates the declaration, which is what a missing model
   // group looks like from the outside.
-  const unpublished = status.unpublishedDeclarations || [];
-  push(
-    "host-registered-providers",
-    unpublished.length === 0,
-    unpublished.length === 0
-      ? "PI-Desktop lists every provider this plugin declares"
-      : unpublished.length + " provider(s) are in the manifest but not in PI-Desktop yet ("
-        + unpublished.join(", ") + ") - restart PI-Desktop so the host re-reads the manifest",
-  );
+  const unpublished = status.unpublishedDeclarations;
+  if (unpublished === null || unpublished === undefined) {
+    push("host-registered-providers", false,
+      "PI-Desktop's copy of the manifest could not be read; provider registration cannot be confirmed");
+  } else {
+    push(
+      "host-registered-providers",
+      unpublished.length === 0,
+      unpublished.length === 0
+        ? "PI-Desktop lists every provider this plugin declares"
+        : unpublished.length + " provider(s) are in the manifest but not in PI-Desktop yet ("
+          + unpublished.join(", ") + ") - restart PI-Desktop so the host re-reads the manifest",
+    );
+  }
 
   for (const region of activeRegions()) {
     const runtime = runtimes.get(region);

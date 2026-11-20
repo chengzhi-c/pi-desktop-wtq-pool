@@ -86,14 +86,7 @@ test('the composer refresh answers inside the host relay budget', async (t) => {
 
     const started = Date.now()
     const answered = await plugin.onRendererCall('xd.composerRefresh', { chip: model.name })
-    // The pass has a budget of its own, well inside the host relay's 2 s cap, and
-    // it is that constant the host enforces; awaiting the slow read instead would
-    // answer after it finished.
-    const entry = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
-    const budget = /COMPOSER_REFRESH_BUDGET_MS = (\d+)/u.exec(entry)
-    assert.ok(budget !== null && Number(budget[1]) <= 2000,
-      'the pass budget must stay inside the host relay cap')
-    assert.ok(Date.now() - started < 3000, 'and it answers before the slow read could finish')
+    assert.ok(Date.now() - started < 2000, 'the host gives a renderer call two seconds')
     assert.ok(creditsStarted, 'the refresh must still start the credentials read it was asked for')
     assert.equal(creditsDone, false,
       'the refresh must answer before the slow read finishes, not wait for it')

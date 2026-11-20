@@ -364,6 +364,8 @@ function ComposerPoints() {
               setErrorFor(account.id || "");
               return;
             }
+            setError("");
+            setErrorFor("");
             setData(next);
             restartPollRef.current();
             // `unavailable` means the preference was stored but the account

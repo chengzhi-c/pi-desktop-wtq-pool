@@ -138,29 +138,12 @@ export function decryptQoderOscrypt(blob: Buffer, key: Buffer): string | undefin
   }
 }
 
-/**
- * The fixed IV Chromium's macOS OSCrypt uses: sixteen `0x20` bytes. Not a
- * secret — Chromium itself ships it — so it lives here beside the cipher it
- * belongs to rather than with the Keychain password that keys it.
- */
+/** Chromium's macOS OSCrypt uses a fixed IV of sixteen ASCII spaces. */
 const MAC_OSCRYPT_IV = Buffer.alloc(16, 0x20)
 
-/**
- * Decrypt one Chromium OSCrypt blob the way Chromium does on macOS.
- *
- * Pure helper, the AES-128-CBC counterpart of `decryptQoderOscrypt`: `v10`
- * prefix, then the fixed 16-byte IV, then the PKCS#7-padded ciphertext. The
- * 16-byte key is not unwrapped from any file — on macOS Chromium derives it
- * from a login-Keychain password with PBKDF2-HMAC-SHA1 (salt `saltysalt`,
- * 1003 iterations); that derivation and the Keychain read stay with the
- * credential reader in `qoder-credentials.ts`, which knows the service names.
- *
- * @param blob - the raw stored bytes, including the `v10` prefix.
- * @param key - the 16-byte PBKDF2-derived AES key.
- * @returns the plaintext, or `undefined` when the padding check fails.
- */
+/** A macOS `v10` blob stores the prefix followed by AES-CBC ciphertext. */
 export function decryptQoderOscryptMac(blob: Buffer, key: Buffer): string | undefined {
-  if (blob.length < 3 + 16 + 16) return undefined
+  if (blob.length < 3 + 16) return undefined
   if (blob.subarray(0, 3).toString('latin1') !== 'v10') return undefined
   try {
     const decipher = createDecipheriv('aes-128-cbc', key, MAC_OSCRYPT_IV)

@@ -41,7 +41,7 @@ function loadComposer(providers, external, hostProviders) {
   }
   const wanted = ['composerModels', 'composerChipText', 'composerChipTextOf', 'composerChipTexts',
     'matchComposerModel', 'composerPointsEnabled', 'composerPoints', 'routeOfProviderId',
-    'modelTag', 'stripModelTag', 'externalModelsReady']
+    'modelTag', 'stripModelTag', 'externalModelsReady', 'refreshExternalModels']
   const bodies = wanted.map((name) => {
     if (!names.includes(name)) throw new Error(`main.js no longer defines ${name}`)
     const start = source.search(new RegExp(`^function ${name}\\(`, 'm'))
@@ -57,6 +57,8 @@ function loadComposer(providers, external, hostProviders) {
     // The names providers outside this plugin publish. Empty unless a case
     // exercises the collision between one of their models and one of ours.
     externalModels: external ?? { texts: new Set(), ids: new Set(), at: Date.now() },
+    EXTERNAL_MODELS_TTL_MS: 60000, externalModelsInFlight: null, loadGeneration: 1,
+    log() {}, safeMessage: error => String(error), isOwnProviderId: () => false,
     PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn', global: 'wtqpool-global' },
     TRAE_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-trae-cn', ai: 'wtqpool-trae-ai' },
     QODER_PROVIDER_ID_BY_REGION: { cn: 'wtqpool-qoder-cn', global: 'wtqpool-qoder-global' },
@@ -169,6 +171,28 @@ test('an unread host model list cannot resolve a chip text', () => {
   })
   assert.equal(unsupported.matchComposerModel('DeepSeek-V4.1-Flash')?.region, 'ai',
     'a host without the API keeps the earlier best-effort answer')
+})
+
+test('a failed host model-list read keeps ambiguous chip texts unresolved until a successful read', async () => {
+  const provider = {
+    id: 'wtqpool-trae-ai',
+    models: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash' }],
+  }
+  for (const known of [false, true]) {
+    const context = loadComposer([provider], {
+      texts: new Set(known ? ['deepseek-v4.1-flash'] : []), ids: new Set(),
+      at: 0, known, available: true,
+    })
+    context.pi = { models: { list: async () => { throw new Error('temporary host read failure') } } }
+    await context.refreshExternalModels()
+    assert.equal(context.matchComposerModel('DeepSeek-V4.1-Flash'), undefined,
+      known ? 'a failed refresh must retain a known collision' : 'a failed first read cannot prove the label belongs to this pool')
+    context.pi.models.list = async () => []
+    context.externalModels.at = 0
+    await context.refreshExternalModels()
+    assert.equal(context.matchComposerModel('DeepSeek-V4.1-Flash')?.region, 'ai',
+      'a successful empty list proves that no other provider publishes the label')
+  }
 })
 
 /**
