@@ -269,11 +269,16 @@ function ComposerPoints() {
       // is clamped the same way, so a narrow window shortens the box rather
       // than pushing it off the edge.
       const width = Math.max(0, Math.min(PANEL_MAX_WIDTH, window.innerWidth - right - PANEL_MARGIN));
+      const above = Math.max(0, rect.top - PANEL_MARGIN * 2);
+      const below = Math.max(0, window.innerHeight - rect.bottom - PANEL_MARGIN * 2);
+      const opensAbove = above >= below;
       setPlace({
         right,
-        top: Math.max(PANEL_MARGIN, rect.top - PANEL_MARGIN),
+        top: opensAbove ? rect.top - PANEL_MARGIN : rect.bottom + PANEL_MARGIN,
         minWidth: Math.min(PANEL_MIN_WIDTH, width),
         maxWidth: width,
+        maxHeight: Math.min(PANEL_MAX_HEIGHT, opensAbove ? above : below),
+        transform: opensAbove ? "translateY(-100%)" : undefined,
       });
     };
     placePanel();
@@ -306,7 +311,7 @@ function ComposerPoints() {
           ref: panelRef,
           role: "dialog",
           "aria-label": W.title,
-          style: { right: place.right + "px", top: place.top + "px", minWidth: place.minWidth + "px", maxWidth: place.maxWidth + "px", transform: "translateY(-100%)" },
+          style: place,
         },
         h("div", { className: "xd-points-bar" },
           h("span", null, W.title),

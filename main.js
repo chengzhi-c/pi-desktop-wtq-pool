@@ -5663,7 +5663,8 @@ async function onPanelInvoke(channel, payload) {
         throw panelError("this account is not available", "NO_ACCOUNT");
       }
       if (channel === "xd.growthDetails") {
-        return { details: await core.client.growthAccountDetails(account.credential) };
+        return { details: await core.pool.readAfterRefresh(account.id, (credential) =>
+          core.client.growthAccountDetails(credential)) };
       }
       if (serviceStopped || growthPassRunning || checkinPassRunning) {
         throw panelError("a check-in pass is already running or stopped", "BUSY");
@@ -5672,8 +5673,8 @@ async function onPanelInvoke(channel, payload) {
       const token = ++growthPassToken;
       const generation = loadGeneration;
       try {
-        const result = await core.client.growthAccountAction(
-          account.credential,
+        const result = await core.pool.readAfterRefresh(account.id, (credential) => core.client.growthAccountAction(
+          credential,
           payload.action,
           payload.value,
           () => {
@@ -5681,7 +5682,7 @@ async function onPanelInvoke(channel, payload) {
               throw panelError("this account is no longer active", "INACTIVE");
             }
           },
-        );
+        ));
         return { result };
       } finally {
         if (token === growthPassToken) {
@@ -6032,7 +6033,7 @@ async function redeemAccountStreak(account) {
   // the tiers this function is about to redeem. A card is only spent when one is
   // actually held, so a pool with none never pays for the two reads.
   try {
-    const cards = await core.client.makeupCards(account.credential);
+    const cards = await core.pool.readAfterRefresh(account.id, (credential) => core.client.makeupCards(credential));
     if (signal.aborted || !workbuddyAccountEnabled(account)) return result;
     if (cards > 0 && await core.client.missedYesterday(account.credential)) {
       if (signal.aborted || !workbuddyAccountEnabled(account)) return result;
@@ -6192,10 +6193,10 @@ async function readGrowthState() {
     try {
       let lotteryError;
       const lottery = regionOf(account.credential.domain) === "cn"
-        ? core.client.lotteryChances(account.credential).catch((error) => { lotteryError = safeMessage(error); })
+        ? core.pool.readAfterRefresh(account.id, (credential) => core.client.lotteryChances(credential)).catch((error) => { lotteryError = safeMessage(error); })
         : undefined;
       const [streak, chances] = await Promise.all([
-        core.client.growthStreakFull(account.credential),
+        core.pool.readAfterRefresh(account.id, (credential) => core.client.growthStreakFull(credential)),
         lottery,
       ]);
       return { account, streak, chances, lotteryError };
@@ -7746,20 +7747,17 @@ async function composerRefreshWork(hit) {
   const generation = loadGeneration;
   if (!stillLoaded(generation) || !rows.some((row) => row.region === hit.region)) return;
   const found = hit.source === "trae" ? await discoverTraeCredentials() : await discoverQoderCredentials();
-  const deadline = Date.now() + COMPOSER_REFRESH_BUDGET_MS;
-  for (const row of rows) {
-    if (row.region !== hit.region) continue;
-    if (Date.now() >= deadline) break;
+  await Promise.all(rows.filter((row) => row.region === hit.region).map(async (row) => {
     const current = () => stillLoaded(generation) && (hit.source === "trae" ? traeAccountRows : qoderAccountRows).includes(row);
-    if (!current()) continue;
+    if (!current()) return;
     const credential = found.credentials.find((item) => {
       const itemLabel = hit.source === "trae" ? traeRowLabel(item) : qoderRowLabel(item);
       const itemRegion = hit.source === "trae" ? traeRegionOfCredential(item) : item.region;
       return itemLabel === row.label && itemRegion === row.region;
     });
-    if (credential === undefined) continue;
+    if (credential === undefined) return;
     await refreshSourceRow(hit.source, credential, row, current);
-  }
+  }));
 }
 
 async function onRendererCall(method, args) {

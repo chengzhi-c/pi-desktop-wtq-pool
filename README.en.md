@@ -152,7 +152,7 @@ npm run build
 npm test
 ```
 
-The test suite requires Node 22.15 or newer. After editing `src/`, run `npm run build` to update `lib/`. Include `THIRD-PARTY-NOTICES.md` in the package staging directory. From the PI-Desktop source repository root, use `pnpm pi-plugin check <staging-dir>` and `pnpm pi-plugin pack <staging-dir>` to validate and package the plugin. See the [plugin development guide](https://github.com/vastsa/PI-Desktop/blob/HEAD/docs/plugin-development.md).
+The test suite requires Node 22.15 or newer. After editing `src/`, run `npm run build` to update `lib/`. Include only `main.js`, `manifest.json`, `lib/`, `renderer/`, `README.md`, `README.en.md`, `CHANGELOG.md`, `LICENSE` and `THIRD-PARTY-NOTICES.md` in the package staging directory. From the PI-Desktop source repository root, use `pnpm pi-plugin check <staging-dir>` and `pnpm pi-plugin pack <staging-dir>` to validate and package the plugin. See the [plugin development guide](https://github.com/vastsa/PI-Desktop/blob/HEAD/docs/plugin-development.md).
 
 ## Credits
 

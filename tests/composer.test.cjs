@@ -436,3 +436,41 @@ test('an untagged spelling of a shared name answers nothing', async (t) => {
     await plugin.onUnload()
   }
 })
+
+test('a slow source account does not skip the other balances in a composer refresh', async (t) => {
+  const entry = path.resolve(__dirname, '../main.js')
+  const baseRequire = createRequire(entry)
+  const qoder = baseRequire('./lib/qoder-client')
+  const credentials = ['first', 'second'].map(name => ({ name, userID: name, token: name, region: 'cn', email: '' }))
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  const fetchImpl = async (url, init) => {
+    if (String(url).includes('/campaigns')) return Response.json({ campaigns: [] })
+    assert.ok(String(url).includes('/me/usage'))
+    const first = init.headers.Authorization === 'Bearer first'
+    if (first) now += 60_000
+    return Response.json({ user_quota: { total: 100, remaining: first ? 10 : 20 } })
+  }
+  const context = vm.createContext({
+    require: id => {
+      if (id === './lib/qoder-credentials') return {
+        ...baseRequire(id), discoverQoderCredentials: async () => ({ credentials }),
+      }
+      if (id === './lib/qoder-client') return {
+        ...qoder,
+        QoderUpstreamClient: class extends qoder.QoderUpstreamClient {
+          constructor(options) { super({ ...options, fetchImpl }) }
+        },
+      }
+      return baseRequire(id)
+    },
+    module: { exports: {} }, __dirname: path.dirname(entry), Date,
+    console: { log() {} }, AbortController, AbortSignal, fetch,
+    setTimeout, clearTimeout, setInterval, clearInterval,
+    fixtureRows: credentials.map(({ name, region }) => ({ label: name, region })),
+  })
+  vm.runInContext(fs.readFileSync(entry, 'utf8'), context)
+  vm.runInContext('serviceStopped = false; qoderAccountRows = fixtureRows', context)
+  await context.composerRefreshWork({ source: 'qoder', region: 'cn' })
+  assert.deepEqual(context.fixtureRows.map(row => row.usage?.credits.total), [10, 20])
+})

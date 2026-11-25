@@ -152,7 +152,7 @@ npm run build
 npm test
 ```
 
-测试需要 Node 22.15 或更高版本。修改 `src/` 后运行 `npm run build` 更新 `lib/`。打包暂存目录需包含 `THIRD-PARTY-NOTICES.md`；从 PI-Desktop 源码仓库根目录使用 `pnpm pi-plugin check <目录>` 和 `pnpm pi-plugin pack <目录>` 检查并打包，详见 [插件开发文档](https://github.com/vastsa/PI-Desktop/blob/HEAD/docs/plugin-development.md)。
+测试需要 Node 22.15 或更高版本。修改 `src/` 后运行 `npm run build` 更新 `lib/`。打包暂存目录仅放入 `main.js`、`manifest.json`、`lib/`、`renderer/`、`README.md`、`README.en.md`、`CHANGELOG.md`、`LICENSE` 和 `THIRD-PARTY-NOTICES.md`；从 PI-Desktop 源码仓库根目录使用 `pnpm pi-plugin check <目录>` 和 `pnpm pi-plugin pack <目录>` 检查并打包，详见 [插件开发文档](https://github.com/vastsa/PI-Desktop/blob/HEAD/docs/plugin-development.md)。
 
 ## 致谢
 

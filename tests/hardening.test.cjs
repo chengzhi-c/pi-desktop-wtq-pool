@@ -11,7 +11,7 @@
  * desktop app.
  */
 const assert = require('node:assert/strict')
-const { test } = require('node:test')
+const { test, after } = require('node:test')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -33,7 +33,9 @@ function sourcePoolFor(cooldown) {
 
 /** A temp directory under the scratch root the suite is allowed to use. */
 function scratch(prefix) {
-  return fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), prefix))
+  const directory = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), prefix))
+  after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  return directory
 }
 
 /**
@@ -116,13 +118,11 @@ test('a refreshed token is not swapped back for the stale one on disk', async ()
     authDirs: [auth],
     client: { refreshToken: async () => ({ accessToken: 'refreshed', expiresInSec: 3600 }) },
   })
-  try {
-    const [account] = await pool.scan()
-    assert.equal(await pool.refreshAccount(account.id), true, 'the refresh must really have replaced the token')
-    assert.equal(account.credential.accessToken, 'refreshed')
-    assert.equal((await pool.scan())[0].credential.accessToken, 'refreshed',
-      'the next scan must keep the refreshed token, not re-read the file it replaced')
-  } finally { fs.rmSync(temporary, { recursive: true, force: true }) }
+  const [account] = await pool.scan()
+  assert.equal(await pool.refreshAccount(account.id), true, 'the refresh must really have replaced the token')
+  assert.equal(account.credential.accessToken, 'refreshed')
+  assert.equal((await pool.scan())[0].credential.accessToken, 'refreshed',
+    'the next scan must keep the refreshed token, not re-read the file it replaced')
 })
 
 /**
@@ -175,7 +175,6 @@ test('a sealed sign-in keeps its account until the at-rest key is available', as
     require.cache[atRestPath] = realAtRestEntry
     if (realAccountsEntry === undefined) delete require.cache[accountsPath]
     else require.cache[accountsPath] = realAccountsEntry
-    fs.rmSync(temporary, { recursive: true, force: true })
   }
 })
 
@@ -183,23 +182,17 @@ test('candidateAuthDirs uses the caller environment for default roots', () => {
   const { candidateAuthDirs } = require('../lib/accounts')
   const temporary = scratch('auth-roots')
   if (process.platform === 'win32') {
-    try {
-      const local = path.join(temporary, 'local')
-      const roaming = path.join(temporary, 'roaming')
-      assert.deepEqual(candidateAuthDirs({ LOCALAPPDATA: local, APPDATA: roaming }), [
-        path.join(local, 'CodeBuddyExtension', 'Data', 'Public', 'auth'),
-        path.join(roaming, 'CodeBuddyExtension', 'Data', 'Public', 'auth'),
-      ])
-    } finally { fs.rmSync(temporary, { recursive: true, force: true }) }
+    const local = path.join(temporary, 'local')
+    const roaming = path.join(temporary, 'roaming')
+    assert.deepEqual(candidateAuthDirs({ LOCALAPPDATA: local, APPDATA: roaming }), [
+      path.join(local, 'CodeBuddyExtension', 'Data', 'Public', 'auth'),
+      path.join(roaming, 'CodeBuddyExtension', 'Data', 'Public', 'auth'),
+    ])
   } else if (process.platform === 'linux') {
-    try {
-      const config = path.join(temporary, 'config')
-      assert.deepEqual(candidateAuthDirs({ XDG_CONFIG_HOME: config }), [
-        path.join(config, 'CodeBuddyExtension', 'Data', 'Public', 'auth'),
-      ])
-    } finally { fs.rmSync(temporary, { recursive: true, force: true }) }
-  } else {
-    fs.rmSync(temporary, { recursive: true, force: true })
+    const config = path.join(temporary, 'config')
+    assert.deepEqual(candidateAuthDirs({ XDG_CONFIG_HOME: config }), [
+      path.join(config, 'CodeBuddyExtension', 'Data', 'Public', 'auth'),
+    ])
   }
 })
 
@@ -251,17 +244,15 @@ test('a configured cooldown past the cap is honoured and a raw reset is clamped'
   writeSignIn(auth, 'cool-user-b', 'token-b', future)
   const { WorkBuddyAccountPool } = require('../lib/accounts')
   const pool = new WorkBuddyAccountPool({ authDirs: [auth], cooldownMs: 6 * 60 * 60 * 1000 })
-  try {
-    const [first, second] = await pool.scan()
-    const now = Date.now()
-    pool.penalize(first.id)
-    assert.ok(Math.abs(first.cooldownUntilMs - (now + 6 * 60 * 60 * 1000)) < 5000,
-      'the configured window is the user\'s own choice and must not be capped')
-    pool.penalize(second.id, now + 24 * 60 * 60 * 1000)
-    assert.ok(second.cooldownUntilMs > now, 'a raw reset must still cool the account')
-    assert.ok(second.cooldownUntilMs <= now + 2 * 60 * 60 * 1000 + 5000,
-      'a caller-supplied reset past the cap must be clamped to the cap')
-  } finally { fs.rmSync(temporary, { recursive: true, force: true }) }
+  const [first, second] = await pool.scan()
+  const now = Date.now()
+  pool.penalize(first.id)
+  assert.ok(Math.abs(first.cooldownUntilMs - (now + 6 * 60 * 60 * 1000)) < 5000,
+    'the configured window is the user\'s own choice and must not be capped')
+  pool.penalize(second.id, now + 24 * 60 * 60 * 1000)
+  assert.ok(second.cooldownUntilMs > now, 'a raw reset must still cool the account')
+  assert.ok(second.cooldownUntilMs <= now + 2 * 60 * 60 * 1000 + 5000,
+    'a caller-supplied reset past the cap must be clamped to the cap')
 })
 
 /**
@@ -278,25 +269,23 @@ test('per-model cooldowns lapse out and are capped in count', async () => {
   writeSignIn(auth, 'model-cool-user', 'token', Date.now() + 3600000)
   const { WorkBuddyAccountPool } = require('../lib/accounts')
   const pool = new WorkBuddyAccountPool({ authDirs: [auth] })
-  try {
-    const [account] = await pool.scan()
-    account.modelCooldowns['lapsed-model'] = Date.now() - 5000
-    pool.penalize(account.id, undefined, 'live-model')
-    assert.equal('lapsed-model' in account.modelCooldowns, false,
-      'a cooldown that has already lapsed must be dropped by the next penalize')
-    assert.ok(account.modelCooldowns['live-model'] > Date.now(), 'the live cooldown must be recorded')
+  const [account] = await pool.scan()
+  account.modelCooldowns['lapsed-model'] = Date.now() - 5000
+  pool.penalize(account.id, undefined, 'live-model')
+  assert.equal('lapsed-model' in account.modelCooldowns, false,
+    'a cooldown that has already lapsed must be dropped by the next penalize')
+  assert.ok(account.modelCooldowns['live-model'] > Date.now(), 'the live cooldown must be recorded')
 
-    for (let index = 0; index < 200; index += 1) pool.penalize(account.id, undefined, `sprayed-${index}`)
-    // The prune runs before the insert, so the map holds the cap plus the key
-    // the last call just added; what the case pins is that the spray cannot
-    // grow it without bound.
-    assert.ok(Object.keys(account.modelCooldowns).length <= 129,
-      '200 distinct model ids must not grow the cooldown map without bound')
-    await pool.scan()
-    assert.equal(Object.keys(account.modelCooldowns).length, 128, 'the live key count is capped')
-    assert.equal('sprayed-0' in account.modelCooldowns, false, 'the soonest cooldowns are the ones dropped')
-    assert.equal('sprayed-199' in account.modelCooldowns, true, 'the newest cooldowns are the ones kept')
-  } finally { fs.rmSync(temporary, { recursive: true, force: true }) }
+  for (let index = 0; index < 200; index += 1) pool.penalize(account.id, undefined, `sprayed-${index}`)
+  // The prune runs before the insert, so the map holds the cap plus the key
+  // the last call just added; what the case pins is that the spray cannot
+  // grow it without bound.
+  assert.ok(Object.keys(account.modelCooldowns).length <= 129,
+    '200 distinct model ids must not grow the cooldown map without bound')
+  await pool.scan()
+  assert.equal(Object.keys(account.modelCooldowns).length, 128, 'the live key count is capped')
+  assert.equal('sprayed-0' in account.modelCooldowns, false, 'the soonest cooldowns are the ones dropped')
+  assert.equal('sprayed-199' in account.modelCooldowns, true, 'the newest cooldowns are the ones kept')
 })
 
 /**
@@ -921,7 +910,6 @@ test('a credential discovery answer is cached inside its TTL and reset on demand
     else process.env.USERPROFILE = previous.USERPROFILE
     if (previous.HOME === undefined) delete process.env.HOME
     else process.env.HOME = previous.HOME
-    fs.rmSync(temporary, { recursive: true, force: true })
   }
 })
 
@@ -956,42 +944,40 @@ test('the collected check-in slots persist and are pruned to the retention windo
   ].join('\n'), context)
   const read = (expression) => vm.runInContext(expression, context)
   const slotsFile = read('CHECKIN_SLOTS_FILE')
-  try {
-    read(`dataPath = ${JSON.stringify(dataPath)}`)
-    const today = read('zonedDayHour(new Date())')
-    const todaySlot = read(`checkinSlotId(${JSON.stringify(today.day)}, ${today.hour})`)
-    const staleDay = read(`zonedDayHour(new Date(Date.now() - 5 * 86400000))`).day
-    read(`autoCheckinSlots.add(${JSON.stringify(todaySlot)})`)
-    read(`autoCheckinSlots.add(${JSON.stringify(staleDay + 'T09')})`)
-    read('saveCheckinSlots()')
+  read(`dataPath = ${JSON.stringify(dataPath)}`)
+  const today = read('zonedDayHour(new Date())')
+  const todaySlot = read(`checkinSlotId(${JSON.stringify(today.day)}, ${today.hour})`)
+  const staleDay = read(`zonedDayHour(new Date(Date.now() - 5 * 86400000))`).day
+  read(`autoCheckinSlots.add(${JSON.stringify(todaySlot)})`)
+  read(`autoCheckinSlots.add(${JSON.stringify(staleDay + 'T09')})`)
+  read('saveCheckinSlots()')
 
-    const stored = JSON.parse(fs.readFileSync(path.join(dataPath, slotsFile), 'utf8'))
-    assert.deepEqual(Object.keys(stored), [today.day],
-      'only the days inside the retention window may be written')
-    assert.deepEqual(stored[today.day], [todaySlot], 'the slot the pass recorded must be the one stored')
+  const stored = JSON.parse(fs.readFileSync(path.join(dataPath, slotsFile), 'utf8'))
+  assert.deepEqual(Object.keys(stored), [today.day],
+    'only the days inside the retention window may be written')
+  assert.deepEqual(stored[today.day], [todaySlot], 'the slot the pass recorded must be the one stored')
 
-    // A deferred Qoder round is bookkeeping beside the slots, and a reload has
-    // to find it again; without this the day's Qoder credits were lost across a
-    // restart between the morning pass and the 10:00 opening.
-    const retryAt = read('Date.now() + 60000')
-    read(`qoderRetryAt = ${retryAt}`)
-    read('saveCheckinSlots()')
-    const withRetry = JSON.parse(fs.readFileSync(path.join(dataPath, slotsFile), 'utf8'))
-    assert.equal(withRetry._qoderRetryAt, retryAt, 'the deferred time must be written beside the slots')
-    read('qoderRetryAt = 0')
-    read('loadCheckinSlots()')
-    assert.equal(read('qoderRetryAt'), retryAt, 'and restored on the next load')
+  // A deferred Qoder round is bookkeeping beside the slots, and a reload has
+  // to find it again; without this the day's Qoder credits were lost across a
+  // restart between the morning pass and the 10:00 opening.
+  const retryAt = read('Date.now() + 60000')
+  read(`qoderRetryAt = ${retryAt}`)
+  read('saveCheckinSlots()')
+  const withRetry = JSON.parse(fs.readFileSync(path.join(dataPath, slotsFile), 'utf8'))
+  assert.equal(withRetry._qoderRetryAt, retryAt, 'the deferred time must be written beside the slots')
+  read('qoderRetryAt = 0')
+  read('loadCheckinSlots()')
+  assert.equal(read('qoderRetryAt'), retryAt, 'and restored on the next load')
 
-    // The read side takes the same view: a day outside the window on disk is not
-    // read back as a day already spent, or a restart would skip today's pass.
-    fs.writeFileSync(path.join(dataPath, slotsFile), JSON.stringify({
-      [today.day]: [todaySlot], '2001-01-01': ['2001-01-01T09'],
-    }, null, 2))
-    read('autoCheckinSlots.clear()')
-    read('loadCheckinSlots()')
-    assert.deepEqual([...read('autoCheckinSlots')], [todaySlot],
-      'a day outside the retention window must not be read back as already collected')
-  } finally { fs.rmSync(dataPath, { recursive: true, force: true }) }
+  // The read side takes the same view: a day outside the window on disk is not
+  // read back as a day already spent, or a restart would skip today's pass.
+  fs.writeFileSync(path.join(dataPath, slotsFile), JSON.stringify({
+    [today.day]: [todaySlot], '2001-01-01': ['2001-01-01T09'],
+  }, null, 2))
+  read('autoCheckinSlots.clear()')
+  read('loadCheckinSlots()')
+  assert.deepEqual([...read('autoCheckinSlots')], [todaySlot],
+    'a day outside the retention window must not be read back as already collected')
 })
 
 /**
@@ -1350,7 +1336,6 @@ test('an at-rest key that is loaded is not reported as missing', async (t) => {
   } finally {
     if (previous === undefined) delete process.env.WORKBUDDY_APP_EXECUTABLE
     else process.env.WORKBUDDY_APP_EXECUTABLE = previous
-    fs.rmSync(temporary, { recursive: true, force: true })
   }
 })
 
@@ -1531,7 +1516,6 @@ test('Qoder reads keep cached keys intact and follow a rotated wrapper with the 
       if (restore[name] === undefined) delete process.env[name]
       else process.env[name] = restore[name]
     }
-    fs.rmSync(temporary, { recursive: true, force: true })
   }
 })
 
@@ -1817,23 +1801,19 @@ test('a Qoder claim that paid nothing carries no amount', () => {
 test('a Trae install with two sign-ins reports a fallback device id', async () => {
   const { readTraeIdentity } = require('../lib/trae-identity')
   const temporary = scratch('xdpool-trae-identity-')
-  try {
-    const storagePath = path.join(temporary, 'User', 'globalStorage', 'storage.json')
-    fs.mkdirSync(path.dirname(storagePath), { recursive: true })
-    fs.writeFileSync(storagePath, JSON.stringify({
-      'telemetry.machineId': 'fixture-machine',
-      'telemetry.devDeviceId': '11111111-2222-3333-4444-555555555555',
-      'iCubeAuthInfo://icube-dc:1000000000000001': '{}',
-      'iCubeAuthInfo://icube-dc:1000000000000002': '{}',
-    }))
-    const identity = await readTraeIdentity({ path: storagePath, edition: 'cn', source: 'desktop' })
-    assert.equal(identity.deviceIdIsFallback, true,
-      'two device-center ids leave no persisted device number, and the caller must be able to say so')
-    assert.notEqual(identity.deviceId, '1000000000000001',
-      'the id of one of the two accounts must not be sent as the machine\'s')
-  } finally {
-    fs.rmSync(temporary, { recursive: true, force: true })
-  }
+  const storagePath = path.join(temporary, 'User', 'globalStorage', 'storage.json')
+  fs.mkdirSync(path.dirname(storagePath), { recursive: true })
+  fs.writeFileSync(storagePath, JSON.stringify({
+    'telemetry.machineId': 'fixture-machine',
+    'telemetry.devDeviceId': '11111111-2222-3333-4444-555555555555',
+    'iCubeAuthInfo://icube-dc:1000000000000001': '{}',
+    'iCubeAuthInfo://icube-dc:1000000000000002': '{}',
+  }))
+  const identity = await readTraeIdentity({ path: storagePath, edition: 'cn', source: 'desktop' })
+  assert.equal(identity.deviceIdIsFallback, true,
+    'two device-center ids leave no persisted device number, and the caller must be able to say so')
+  assert.notEqual(identity.deviceId, '1000000000000001',
+    'the id of one of the two accounts must not be sent as the machine\'s')
 })
 
 /**
@@ -1846,15 +1826,11 @@ test('a Trae install with two sign-ins reports a fallback device id', async () =
 test('a Trae storage file that is not an object fails as unreadable', async () => {
   const { readTraeIdentity } = require('../lib/trae-identity')
   const temporary = scratch('xdpool-trae-storage-')
-  try {
-    const storagePath = path.join(temporary, 'User', 'globalStorage', 'storage.json')
-    fs.mkdirSync(path.dirname(storagePath), { recursive: true })
-    fs.writeFileSync(storagePath, 'null')
-    await assert.rejects(readTraeIdentity({ path: storagePath, edition: 'cn', source: 'desktop' }),
-      /not a JSON object/, 'a storage file holding null must be reported as unreadable')
-  } finally {
-    fs.rmSync(temporary, { recursive: true, force: true })
-  }
+  const storagePath = path.join(temporary, 'User', 'globalStorage', 'storage.json')
+  fs.mkdirSync(path.dirname(storagePath), { recursive: true })
+  fs.writeFileSync(storagePath, 'null')
+  await assert.rejects(readTraeIdentity({ path: storagePath, edition: 'cn', source: 'desktop' }),
+    /not a JSON object/, 'a storage file holding null must be reported as unreadable')
 })
 
 /**
@@ -1981,22 +1957,46 @@ test('a stream that ends releases its watchdog timer', async () => {
     'every timer the watchdog armed must be cleared, including the one the last chunk armed')
 })
 
-/**
- * A `Retry-After` is validated and bounded before it is sent.
- *
- * The upstream's wait time was forwarded as it arrived. An empty string, prose
- * or a number of years is enough to park a client - or a whole model pool - for
- * as long as it chooses to honour the header.
- */
-test('a retry-after is validated and bounded before it is sent', () => {
+const NOW = Date.UTC(2026, 10, 25, 0, 0, 0)
+const RETRY_AT = 'Wed, 25 Nov 2026 00:05:00 GMT'
+
+test('Retry-After accepts HTTP dates while keeping numeric waits bounded', (t) => {
   const { retryAfterHeader } = require('../lib/loopback')
-  assert.equal(retryAfterHeader('120'), '120', 'a plain wait is forwarded as it is')
-  assert.equal(retryAfterHeader(42), '42', 'and so is a numeric one')
-  assert.equal(retryAfterHeader('1e9'), '7200', 'a wait of thirty years is bounded to two hours')
-  assert.equal(retryAfterHeader(''), undefined, 'an empty value is dropped rather than sent')
-  assert.equal(retryAfterHeader('soon'), undefined, 'and so is prose')
-  assert.equal(retryAfterHeader('-5'), undefined, 'a negative wait is not a wait')
-  assert.equal(retryAfterHeader(undefined), undefined, 'and an absent one is simply absent')
+  t.mock.method(Date, 'now', () => NOW)
+  for (const [value, expected] of [
+    [RETRY_AT, '300'], ['120', '120'], [42, '42'], [1.5, '2'], ['1e9', '7200'],
+    ['Wed, 25 Nov 2026 06:00:00 GMT', '7200'],
+    ['Tue, 24 Nov 2026 23:59:00 GMT', undefined],
+    ['', undefined], ['soon', undefined], ['-5', undefined], [undefined, undefined],
+  ]) assert.equal(retryAfterHeader(value), expected, String(value))
+})
+
+test('WorkBuddy preserves a rate-limit deadline sent as an HTTP date', async (t) => {
+  const { WorkBuddyUpstreamClient } = require('../lib/upstream')
+  t.mock.method(Date, 'now', () => NOW)
+  const client = new WorkBuddyUpstreamClient({ fetchImpl: async () => new Response('rate limited', {
+    status: 429, headers: { 'retry-after': RETRY_AT },
+  }) })
+  const result = await client.chatStream({
+    accessToken: 'fixture', refreshToken: '', domain: 'www.codebuddy.cn', expiresAtMs: 0,
+  }, '{}')
+  assert.equal(result.ok, false)
+  assert.equal(result.kind, 'soft_rate')
+  assert.equal(result.retryAfter, 300)
+})
+
+test('source accounts stay behind healthy accounts until the HTTP-date wait expires', (t) => {
+  let now = NOW
+  t.mock.method(Date, 'now', () => now)
+  const pool = sourcePoolFor(60_000)
+  const accounts = [{ label: 'limited' }, { label: 'healthy' }]
+  const order = () => pool.orderSourceCredentials('trae', 'cn', accounts, account => account.label, true)
+    .map(account => account.label)
+  pool.noteSourceFailure('trae', 'cn', 'limited', RETRY_AT)
+  now += 120_000
+  assert.deepEqual(order(), ['healthy', 'limited'])
+  now += 180_000
+  assert.deepEqual(order(), ['limited', 'healthy'])
 })
 
 /**
@@ -3100,7 +3100,6 @@ test('a declaration that already says the same thing is not rewritten', () => {
   const changed = context.writeDeclaration([{ id: 'wtqpool-cn', baseUrl: 'http://127.0.0.1:41831/v1', models: [{ id: 'other-model', name: 'Other' }] }])
   assert.equal(changed.changed, true, 'a different model list is a real change and must be written')
   assert.equal(before.equals(fs.readFileSync(manifestPath)), false, 'and the file on disk must reflect it')
-  fs.rmSync(temporary, { recursive: true, force: true })
 })
 
 /**
@@ -3714,25 +3713,23 @@ test('a credential whose refresh token has expired still reaches the pool', asyn
   }
   const spentPool = new WorkBuddyAccountPool({ authDirs: [spentDir] })
   const livePool = new WorkBuddyAccountPool({ authDirs: [liveDir] })
-  try {
-    signIn(spentDir, past)
-    assert.equal((await spentPool.scan()).length, 1,
-      'a sign-in whose refresh token is spent must still be listed, not discarded whole')
-    const spent = spentPool.list()[0].credential
-    assert.equal(spent.accessToken, 'live-token',
-      'the access token beside a spent refresh token is still a usable sign-in')
-    assert.equal(spent.refreshToken, '',
-      'a refresh token past its own expiry renews nothing, so it must not be carried')
-    assert.equal(spent.refreshExpiresAtMs, undefined,
-      'and the expiry that disqualified it must not be published either')
-    // The control: the same file with time left on the refresh token keeps it.
-    signIn(liveDir, future)
-    assert.equal((await livePool.scan()).length, 1, 'the control must list the same sign-in')
-    const live = livePool.list()[0].credential
-    assert.equal(live.accessToken, 'live-token', 'the control must read the same access token')
-    assert.equal(live.refreshToken, 'refresh-me', 'a refresh token with time left is still carried')
-    assert.equal(live.refreshExpiresAtMs, future, 'and so is the expiry it carries')
-  } finally { fs.rmSync(temporary, { recursive: true, force: true }) }
+  signIn(spentDir, past)
+  assert.equal((await spentPool.scan()).length, 1,
+    'a sign-in whose refresh token is spent must still be listed, not discarded whole')
+  const spent = spentPool.list()[0].credential
+  assert.equal(spent.accessToken, 'live-token',
+    'the access token beside a spent refresh token is still a usable sign-in')
+  assert.equal(spent.refreshToken, '',
+    'a refresh token past its own expiry renews nothing, so it must not be carried')
+  assert.equal(spent.refreshExpiresAtMs, undefined,
+    'and the expiry that disqualified it must not be published either')
+  // The control: the same file with time left on the refresh token keeps it.
+  signIn(liveDir, future)
+  assert.equal((await livePool.scan()).length, 1, 'the control must list the same sign-in')
+  const live = livePool.list()[0].credential
+  assert.equal(live.accessToken, 'live-token', 'the control must read the same access token')
+  assert.equal(live.refreshToken, 'refresh-me', 'a refresh token with time left is still carried')
+  assert.equal(live.refreshExpiresAtMs, future, 'and so is the expiry it carries')
 })
 
 /**
@@ -4327,6 +4324,7 @@ test('a WorkBuddy stream that fails mid-flight ends with a terminator', async ()
     account: { uin: 'u-1', nickname: 'Fixture' },
   }))
   const pool = new WorkBuddyAccountPool({ authDirs: [dir] })
+  const secret = 'sample.token.value'
   let sent = false
   const failing = new ReadableStream({
     pull(controller) {
@@ -4338,7 +4336,7 @@ test('a WorkBuddy stream that fails mid-flight ends with a terminator', async ()
         controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'))
         return
       }
-      controller.error(new Error('Bearer sample.token.value rejected'))
+      controller.error(new Error(`Bearer ${secret} rejected`))
     },
   })
   const client = {
@@ -4356,10 +4354,11 @@ test('a WorkBuddy stream that fails mid-flight ends with a terminator', async ()
       body: JSON.stringify({ model: 'hy3', messages: [{ role: 'user', content: 'hi' }] }),
     })
     const body = await answer.text()
+    assert.ok(body.includes('"content":"hi"'), 'the first content reaches the client before the failure')
     assert.match(body, /"error"\s*:\s*\{/, 'the failure must reach the client in band')
     assert.match(body, /upstream_error/, 'and it must be named as the upstream\'s doing')
     assert.match(body, /data: \[DONE\]/, 'and the stream must still carry its terminator')
-    assert.doesNotMatch(body, /eyJhbGciOi\.real\.token\.value/,
+    assert.equal(body.includes(secret), false,
       'the relayed error text is redacted before it leaves the process')
   } finally {
     await shim.close()
@@ -5861,11 +5860,7 @@ test('a nickname-only sign-in is not adopted into a new copy on every scan', asy
   }))
   const { WorkBuddyAccountPool } = require('../lib/accounts')
   const pool = new WorkBuddyAccountPool({ authDirs: [dir], dataPath: () => data, cooldownMs: 60_000 })
-  try {
-    assert.equal((await pool.scan()).length, 1)
-    assert.equal((await pool.scan()).length, 1,
-      'a snapshot with no uin/uid keeps serving from where it lies; it must not spawn a copy per scan')
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
-  }
+  assert.equal((await pool.scan()).length, 1)
+  assert.equal((await pool.scan()).length, 1,
+    'a snapshot with no uin/uid keeps serving from where it lies; it must not spawn a copy per scan')
 })
