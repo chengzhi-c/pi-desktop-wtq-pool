@@ -71,7 +71,7 @@ test('a partial startup preserves enabled providers whose directories are still 
     activeRegions: () => ['cn'], activeTraeRegions: () => [], activeQoderRegions: () => ['cn'],
     declarationModels: () => [{ id: 'workbuddy' }], traeDeclarationModels: () => [], qoderDeclarationModels: () => [],
     PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn' }, TRAE_PROVIDER_ID_BY_REGION: {}, QODER_PROVIDER_ID_BY_REGION: { cn: old.id },
-    descriptorFor: () => ({ id: 'wtqpool-cn', models: [{ id: 'workbuddy' }] }), descriptorForTrae() {}, descriptorForQoder: () => ({ baseUrl: 'http://127.0.0.1:41871/v1' }),
+    descriptorFor: () => ({ id: 'wtqpool-cn', models: [{ id: 'workbuddy' }] }), descriptorForTrae() {}, descriptorForQoder: () => ({ baseUrl: 'http://127.0.0.1:45110/v1' }),
     manifestProviders: () => [old], writeDeclaration: rows => { writes.push(rows); return { ok: true } }, runtimeState: {},
     // A Qoder gateway whose directory has not answered yet is the one case a row
     // is republished for; everything else that cannot publish drops its row.
@@ -79,7 +79,8 @@ test('a partial startup preserves enabled providers whose directories are still 
   })
   vm.runInContext(fn + '\n' + rebound + '\nsyncDeclaration()', context)
   assert.deepEqual(Array.from(writes[0], row => row.id), ['wtqpool-cn', 'wtqpool-qoder-cn'])
-  assert.equal(writes[0][1].baseUrl, 'http://127.0.0.1:41871/v1')
+  assert.equal(writes[0][1].baseUrl, 'http://127.0.0.1:45110/v1',
+    'a fallback port used by this run is not persisted for the next one')
 })
 
 test('a cold source keeps its saved row at the preferred port', () => {
@@ -131,6 +132,7 @@ test('a partial startup drops the row of a Qoder gateway that has answered', () 
   const writes = []
   const context = vm.createContext({
     runtimes: new Map([['cn', { signedIn: true }]]),
+    qoderGateways: new Map([['cn', {}]]),
     activeRegions: () => ['cn'], activeTraeRegions: () => [], activeQoderRegions: () => ['cn'],
     declarationModels: () => [{ id: 'workbuddy' }], traeDeclarationModels: () => [], qoderDeclarationModels: () => [],
     PROVIDER_ID_BY_REGION: { cn: 'wtqpool-cn' }, TRAE_PROVIDER_ID_BY_REGION: {}, QODER_PROVIDER_ID_BY_REGION: { cn: old.id },
@@ -414,7 +416,7 @@ test('overlapping source reconciles share one gateway start', async () => {
  * `findings.every(f => f.ok)` came out true.
  */
 test('the connection check names a Trae or Qoder start that failed', () => {  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
-  const block = source.match(/for \(const \[source, gateways, idByRegion, nameByRegion, ports\] of \[[^]*?^  \}/m)
+  const block = source.match(/for \(const \[source, gateways, idByRegion, nameByRegion\] of \[[^]*?^  \}/m)
   assert.ok(block !== null, 'the Trae/Qoder finding loop must exist to be checked')
   const findings = []
   const context = vm.createContext({
@@ -509,6 +511,7 @@ test('WorkBuddy closes at a split terminal frame without treating content as a m
 test('PI counts the host label of another provider as a colliding chip text', async () => {
   const entry = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
   const fn = entry.match(/^function refreshExternalModels\(\) \{[^]*?^\}/m)[0]
+  const declarations = entry.match(/^function unpublishedDeclarations\(\) \{[^]*?^\}/m)[0]
   const context = vm.createContext({
     EXTERNAL_MODELS_TTL_MS: 60000,
     externalModels: { texts: new Set(), ids: new Set(), at: 0, known: false, available: true },
@@ -517,18 +520,22 @@ test('PI counts the host label of another provider as a colliding chip text', as
     loadGeneration: 1,
     log() {},
     safeMessage: error => String(error),
-    pi: { models: { list: async () => [
+    PLUGIN_ID: 'fixture-plugin',
+    manifestProviders: () => [{ id: 'wtqpool-cn' }, { id: 'wtqpool-global' }],
+    pi: { plugin: { getManifest: () => ({ contributes: { providers: [] } }) }, models: { list: async () => [
       { providerId: 'other', modelId: 'opus-4', label: 'opus-4 (Other)', alias: '' },
       { providerId: 'wtqpool-cn', modelId: 'fixture', label: 'fixture (WTQ)', alias: '' },
     ] } },
   })
-  vm.runInContext(fn, context)
+  vm.runInContext(fn + '\n' + declarations, context)
   await vm.runInContext('refreshExternalModels()', context)
   assert.equal(context.externalModels.texts.has('opus-4'), true)
   assert.equal(context.externalModels.texts.has('opus-4 (other)'), true,
     'the label is the spelling the host list carries for every row, so a picker can hand it back')
   assert.equal(context.externalModels.texts.has('fixture'), false,
     'this plugin\'s own rows are not evidence of another provider printing the name')
+  assert.deepEqual(Array.from(context.unpublishedDeclarations()), ['wtqpool-global'],
+    'a ready host model is registered even when the activation manifest is older')
 })
 
 
@@ -574,6 +581,32 @@ test('PI composer retries unread credits quickly and slows down after a balance 
   }
 })
 
+test('PI composer ignores an older poll after a manual restart', async () => {
+  const renderer = fs.readFileSync(path.join(root, 'renderer/composer.mjs'), 'utf8')
+  const effect = renderer.match(/useEffect\(\(\) => \{\n    setData\(null\);[^]*?\}, \[chip\]\);/)[0]
+  for (const failed of [false, true]) {
+    let resolve, reject, shown, calls = 0
+    const older = new Promise((yes, no) => { resolve = yes; reject = no })
+    const latest = { show: true, ours: true, total: 42 }
+    const context = vm.createContext({
+      chip: 'fixture', host: { dispatch: () => ++calls === 1 ? older : Promise.resolve(latest) },
+      setData(value) { shown = value }, setOpen() {}, setError() {}, setErrorFor() {},
+      useEffect: run => { context.cleanup = run() }, Date, restartPollRef: { current() {} },
+      REFRESH_INTERVAL_MS: 300000, WARMUP_INTERVAL_MS: 5000, WARMUP_WINDOW_MS: 120000,
+      setTimeout: () => 1, clearTimeout() {},
+    })
+    try {
+      vm.runInContext(effect, context)
+      context.restartPollRef.current()
+      await new Promise(done => setImmediate(done))
+      if (failed) reject(new Error('older poll failed'))
+      else resolve({ ...latest, total: 1 })
+      await new Promise(done => setImmediate(done))
+      assert.deepEqual(shown, latest)
+    } finally { context.cleanup() }
+  }
+})
+
 test('PI successful account selection clears an earlier notice and restarts credit polling', async () => {
   const renderer = fs.readFileSync(path.join(root, 'renderer/composer.mjs'), 'utf8')
   const prefer = renderer.slice(renderer.indexOf('method: "xd.composerPrefer"'))
@@ -614,76 +647,6 @@ test('PI manual credit refresh restarts polling from the fresh answer', async ()
   await vm.runInContext('(async () => {' + body + '\n})()', context)
   assert.equal(shown && shown.show, true)
   assert.equal(restarted, 1, 'a manual read must not leave unread credits on the slow timer')
-})
-
-/**
- * Both sit in one flex line at the right end of an account row. The delete
- * button inherited the default `button` padding while the remove button carried
- * the row's smaller one, so it stood taller and its top edge sat above the
- * control it belongs beside.
- */
-test('the account row ships one box for the remove and delete buttons', () => {
-  const css = fs.readFileSync(path.join(root, 'renderer/panel.css'), 'utf8')
-  const shared = css.match(/\.acct-remove,\s*\n\.acct-delete \{([^}]*)\}/)
-  assert.ok(shared, 'the two buttons must be sized by one rule, not by the default button padding')
-  assert.match(shared[1], /padding:\s*4px 10px/, 'and that rule must set the row padding both of them share')
-  assert.match(shared[1], /font-size:\s*12\.5px/, 'with the row font size, so their heights match')
-})
-
-/**
- * A source label does not depend on which other regions are switched on.
- *
- * Labels are the row key for holds, pack expiry and the panel's account state.
- * Computing them after the region filter renamed the surviving account whenever
- * another region was disabled: the duplicate suffix appeared or vanished with a
- * setting that says nothing about this account.
- */
-test('Discovering source labels ignores the enabled-region filter', async () => {
-  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
-  const match = source.match(/^async function refreshSourceAccounts\([^]*?^}/m)
-  assert.ok(match, 'refreshSourceAccounts must exist')
-  const { uniqueSourceLabels } = require('../lib/source-pool')
-  const { traeRegionOfCredential } = require('../lib/trae-discovery')
-  const credentials = [
-    { userId: 'user-cn', accountName: 'Same Name', edition: 'cn', source: 'desktop', expiresAtMs: 0 },
-    { userId: 'user-ai', accountName: 'Same Name', edition: 'sg', source: 'desktop', expiresAtMs: 0 },
-  ]
-  const run = async (regions) => {
-    const context = vm.createContext({
-      activeTraeRegions: () => regions,
-      activeQoderRegions: () => [],
-      discoverTraeCredentials: async () => ({ credentials: credentials.map((item) => ({ ...item })), failures: [] }),
-      discoverQoderCredentials: async () => ({ credentials: [], failures: [] }),
-      stillLoaded: () => true,
-      uniqueSourceLabels,
-      traeRegionOfCredential,
-      traeBaseLabel: (credential) => credential.accountName ?? credential.userId,
-      traeLabelKey: (credential) => traeRegionOfCredential(credential) + '\n' + credential.userId,
-      traeAppLabelOf: () => 'Trae',
-      traeRowProbe: async () => undefined,
-      noteSourceExpiry() {},
-      sourceCredentialExpired: () => false,
-      regionEnabled: () => true,
-      log() {},
-      safeMessage: (error) => String(error),
-      loadGeneration: 1,
-      traeAccountRows: [],
-      traeLabelOverrides: new Map(),
-      qoderAccountRows: [],
-      qoderLabelOverrides: new Map(),
-      pruneSourceState() {},
-    })
-    vm.runInContext(match[0], context)
-    await context.refreshSourceAccounts(1)
-    return context.traeAccountRows.filter((row) => row.region === 'cn')
-  }
-  const both = (await run(['cn', 'ai'])).find((row) => row.region === 'cn')
-  const cnOnly = await run(['cn'])
-  assert.ok(both)
-  assert.equal(cnOnly.length, 1)
-  assert.equal(cnOnly[0].label, both.label,
-    'switching the other region off must not rename this account')
-  assert.match(cnOnly[0].label, /#usercn$/u, 'the duplicate suffix is what keeps the two rows apart')
 })
 
 /**

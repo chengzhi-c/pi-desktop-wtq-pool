@@ -483,15 +483,12 @@ test('only the current login writes credentials and returns the panel document',
   const { createRequire } = require('node:module')
   const temporary = scratch('entry-login-ok-')
   const dataPath = path.join(temporary, 'data')
-  // The repointed auth file sits in the plugin's own sign-in directory, which
-  // is the directory a panel login writes into: one walk reads both, and the
-  // machine's real auth directory is never opened.
   const own = path.join(dataPath, 'signins')
-  fs.mkdirSync(own, { recursive: true })
   const manifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8'))
   if (manifest.contributes) manifest.contributes.providers = []
   fs.writeFileSync(path.join(temporary, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n')
-  const authFile = path.join(own, 'workbuddy-desktop.info')
+  const authFile = path.join(temporary, 'desktop', 'workbuddy-desktop.info')
+  fs.mkdirSync(path.dirname(authFile))
   fs.writeFileSync(authFile, JSON.stringify({
     auth: {
       accessToken: 'fixture-token', refreshToken: 'fixture-refresh',
@@ -535,7 +532,7 @@ test('only the current login writes credentials and returns the panel document',
   // carry is the pool as the login left it, not the pool the panel had.
   const settings = {
     enabled: true, sourceWorkbuddy: true, sourceTrae: false, sourceQoder: false,
-    disabledRegions: ['workbuddy:cn', 'workbuddy:global'], authFile,
+    disabledRegions: ['workbuddy:global'], authFile,
   }
   let service = null
   const context = vm.createContext({
@@ -572,9 +569,8 @@ test('only the current login writes credentials and returns the panel document',
     const answer = await plugin.onPanelInvoke('xd.pollLogin', { realm: 'cn' })
     assert.equal(answer.status, 'ok')
     assert.equal(answer.nickname, 'Added From Panel')
-    assert.ok(answer.state !== undefined && typeof answer.state === 'object'
-      && Array.isArray(answer.state.accounts),
-      'the answer must carry the document the panel adopts, or the list keeps painting the pool it already had')
+    assert.ok(answer.state.accounts.some((account) => account.label === 'Added From Panel'),
+      'the panel login is visible alongside the desktop sign-in override')
     assert.ok(fs.existsSync(path.join(own, 'workbuddy-panel-90000000021.info')),
       'the sign-in landed in the plugin directory, not the app\'s')
     // The document is the one this process serves, so adopting it paints what

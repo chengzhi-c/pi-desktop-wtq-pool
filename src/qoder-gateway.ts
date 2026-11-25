@@ -32,6 +32,8 @@ export interface QoderGatewayOptions {
   fetchImpl?: typeof fetch
   /** Preferred loopback port; 0 asks the OS for any free one. */
   port?: number
+  /** PI encodes both off and omit by leaving out the effort. */
+  offWhenOmitted?: boolean
   logger?: QoderGatewayLogger
   /** Ids this run publishes. Discovery lists these and no others. Absent means the whole directory. */
   listedIds?: () => readonly string[]
@@ -73,7 +75,7 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
   let catalogAt = 0
   let catalogFailedAt = 0
   let catalogErrorText = ''
-  let catalogInFlight: Promise<QoderChatModel[]> | undefined
+  let catalogInFlight: { promise: Promise<QoderChatModel[]>; force: boolean } | undefined
 
   /**
    * Every sign-in that could read the directory, in the order the chat path
@@ -98,18 +100,22 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
   }
 
   /** Read the directory, at most once per TTL even under concurrent requests. */
-  async function models(): Promise<readonly QoderChatModel[]> {
+  async function models(force = false): Promise<readonly QoderChatModel[]> {
     const fresh = Date.now() - catalogAt < MODELS_TTL_MS
-    if (fresh && cachedModels.length > 0) return cachedModels
-    if (catalogInFlight !== undefined) return catalogInFlight
+    if (!force && fresh && cachedModels.length > 0) return cachedModels
+    if (catalogInFlight !== undefined) {
+      if (!force || catalogInFlight.force) return catalogInFlight.promise
+      await catalogInFlight.promise.catch(() => {})
+      return models(true)
+    }
     // A read that just failed is not retried on the next request: the cached
     // roster serves in the meantime, and a cold cache fails fast instead of
     // walking five upstream functions again.
-    if (catalogFailedAt > 0 && Date.now() - catalogFailedAt < CATALOG_FAILURE_BACKOFF_MS) {
+    if (!force && catalogFailedAt > 0 && Date.now() - catalogFailedAt < CATALOG_FAILURE_BACKOFF_MS) {
       if (cachedModels.length > 0) return cachedModels
       throw new Error(`Qoder model directory read failed recently, backing off: ${catalogErrorText}`)
     }
-    catalogInFlight = (async () => {
+    const promise = (async () => {
       try {
         // Walk the sign-ins until one answers: the directory is a per-account
         // read, and a revoked sign-in fails it the same way it fails a chat.
@@ -132,11 +138,13 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
         catalogFailedAt = Date.now()
         catalogErrorText = error instanceof Error ? error.message : String(error)
         throw error
-      } finally {
-        catalogInFlight = undefined
       }
     })()
-    return catalogInFlight
+    const entry = { promise, force }
+    catalogInFlight = entry
+    return promise.finally(() => {
+      if (catalogInFlight === entry) catalogInFlight = undefined
+    })
   }
 
   async function chatCompletions(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -197,7 +205,7 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
     }
     if (watcher.signal.aborted) return
     const directory = roster.find(entry => entry.id === model)
-    const call = qoderRequestBody(raw, model, directory)
+    const call = qoderRequestBody(raw, model, directory, options.offWhenOmitted)
 
     /**
      * One sign-in's attempt: the chat call plus the peek that turns a refusal
@@ -384,15 +392,13 @@ export function createQoderGateway(options: QoderGatewayOptions): QoderGateway {
       return
     }
     if (req.method === 'GET' && (url === '/v1/models' || url === '/v1/models/')) {
+      const force = req.headers['cache-control'] === 'no-cache'
       let served: readonly QoderChatModel[]
       try {
-        served = await models()
+        served = await models(force)
       } catch (error: unknown) {
         served = cachedModels
-        // An empty list is never returned: the host discards a provider whose
-        // discovery came back empty, which would strip the whole group. So a
-        // directory that cannot be read right now is an honest 503.
-        if (served.length === 0) {
+        if (force || served.length === 0) {
           writeOpenAIError(res, 503, 'upstream_unavailable', String(error instanceof Error ? error.message : error))
           return
         }

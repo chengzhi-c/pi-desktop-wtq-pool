@@ -225,7 +225,9 @@ function loadEntry(t, settings) {
     assert.equal(unexpectedFetch.mock.callCount(), 0, 'the fixture must stay offline')
   })
   const { WorkBuddyUpstreamClient } = require('../lib/upstream')
-  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchModels', async () => [])
+  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchModels', async () => [
+    { id: 'shared-model', name: 'Shared model', contextWindow: 128000, maxTokens: 8192 },
+  ])
   t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCredits', async () => ({ total: 0, packages: [] }))
   t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ active: false }))
   const dataPath = path.join(temporary, 'data')

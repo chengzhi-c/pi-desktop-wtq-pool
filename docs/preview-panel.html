@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>WTQ Pool panel preview</title>
+  <title>WTQ Pool 面板预览</title>
   <style>
     /* PI-Desktop owns a 46px drag band above every panel and the panel offsets
        itself by that much. This frame has no host band, so the offset is zero -
@@ -24,13 +24,14 @@
     (function () {
       "use strict";
       var data = window.__previewData;
-      var appearance = { base: "light", locale: "zh-CN" };
+      var appearance = { base: new URLSearchParams(location.search).get("theme") === "dark" ? "dark" : "light", locale: "zh-CN" };
       var handlers = {};
       function copy(value) { return JSON.parse(JSON.stringify(value)); }
 
       window.pluginBridge = {
         invoke: function (channel, payload) {
           if (channel === "xd.state") return Promise.resolve(copy(data.state));
+          if (channel.startsWith("xd.growth")) return data.invokeGrowth(channel, payload);
           if (channel === "xd.doctor") return Promise.resolve(copy(data.doctor));
           if (channel === "app.getAppearance") {
             return Promise.resolve({ base: appearance.base, locale: appearance.locale });

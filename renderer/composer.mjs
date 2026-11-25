@@ -80,20 +80,20 @@ const WORDS = {
   zh: {
     planQuota: "套餐", addOnQuota: "资源包", credits: "积分",
     never: "不过期", monthly: "月度", days: (days) => days + "天",
-    title: "查看账号积分", account: "账号", balance: "积分",
+    title: "账号积分", account: "账号", balance: "积分",
     refresh: "刷新积分", refreshing: "正在刷新…",
-    refused: "这个账号无法切换，刷新后重试",
-    saved: "已设为优先；积分面板暂不可用，恢复后自动生效",
-    unavailable: "已设为优先，但该账号现在不能服务（冷却或已停用），恢复后自动生效",
+    refused: "无法使用此账号。请刷新后重试。",
+    saved: "已设为优先账号。积分面板恢复后自动生效。",
+    unavailable: "账号已设为优先，但当前不可用（冷却或已停用）。恢复后自动生效。",
   },
   en: {
     planQuota: "Plan", addOnQuota: "Add-on", credits: "Credits",
     never: "never expires", monthly: "monthly", days: (days) => days + " days",
     title: "Account credits", account: "Account", balance: "Credits",
     refresh: "Refresh credits", refreshing: "Refreshing…",
-    refused: "That account cannot be switched; refresh and try again",
-    saved: "Set as preferred; the credits panel is unavailable right now and it takes over once it recovers",
-    unavailable: "Set as preferred, but that account cannot serve right now (cooling or switched off); it takes over once it recovers",
+    refused: "This account cannot be used. Refresh and try again.",
+    saved: "Set as the preferred account. It will take effect when the credits panel recovers.",
+    unavailable: "Set as the preferred account, but it is currently unavailable (cooling down or disabled). It will take effect when available.",
   },
 };
 function currentLocale() {
@@ -192,6 +192,7 @@ function ComposerPoints() {
     if (!host || chip === "") return undefined;
     let stop = false;
     let timer = 0;
+    let request = 0;
     let startedAt = Date.now();
     // Re-armed rather than fixed-interval: the readout asks again quickly while
     // a balance of ours is still unread, and slowly once it has one - or once
@@ -205,9 +206,10 @@ function ComposerPoints() {
       timer = setTimeout(pull, settled || !warming ? REFRESH_INTERVAL_MS : WARMUP_INTERVAL_MS);
     };
     const pull = () => {
+      const current = ++request;
       host.dispatch("plugin.call", { method: "xd.composerPoints", args: { chip } })
         .then((next) => {
-          if (stop) return;
+          if (stop || current !== request) return;
           // The chip is switched off in the panel: `show: false` alone cannot
           // say that, and the readout renders nothing while it stays off. Keep
           // the slow poll, though: the panel can switch it back on without a
@@ -221,7 +223,7 @@ function ComposerPoints() {
           setData(next && next.show === true ? next : null);
           schedule(next);
         })
-        .catch(() => { if (!stop) { setData(null); schedule(null); } });
+        .catch(() => { if (!stop && current === request) { setData(null); schedule(null); } });
     };
     restartPollRef.current = () => { clearTimeout(timer); startedAt = Date.now(); pull(); };
     pull();

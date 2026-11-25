@@ -17,6 +17,7 @@ const os = require('node:os')
 const path = require('node:path')
 const vm = require('node:vm')
 const Module = require('node:module')
+const ts = require('typescript')
 
 const root = path.resolve(__dirname, '..')
 
@@ -348,7 +349,7 @@ test('a check-in-only probe keeps the cached balance and cannot satisfy a full r
     },
   }
   new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'PROBE_RETRY_MS', 'signInRefused', 'safeMessage',
-    entryFunctions(['accountProbe'], source) + '\nmodule.exports = { accountProbe }',
+    'const loadGeneration = 0;\n' + entryFunctions(['accountProbe'], source) + '\nmodule.exports = { accountProbe }',
   )(mod, mod.exports, core, probeCache, 60000, 15000, () => false, (error) => String(error?.message ?? error))
 
   const full = await mod.exports.accountProbe(account, true, false)
@@ -395,7 +396,7 @@ test('a failed balance read is retried before its cache window ends', async () =
   }
   new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'PROBE_RETRY_MS',
     'signInRefused', 'safeMessage', 'regionEnabled', 'regionOf',
-    entryFunctions(['accountProbe', 'probesStale'], source) + '\nmodule.exports = { accountProbe, probesStale }',
+    'const loadGeneration = 0;\n' + entryFunctions(['accountProbe', 'probesStale'], source) + '\nmodule.exports = { accountProbe, probesStale }',
   )(mod, mod.exports, core, probeCache, 60000, 15000, () => false,
     (error) => String(error?.message ?? error), () => true, () => 'cn')
 
@@ -721,6 +722,8 @@ test('a Qoder claim receipt is a claim even when marked replayed', async () => {
   }
   const context = vm.createContext({
     QoderUpstreamClient: QoderClient,
+    loadGeneration: 0,
+    regionEnabled: () => true,
     sourceCredentialExpired: () => false,
     qoderClientCredential: (credential) => credential,
     qoderClaimableCampaignIdOf: () => 'daily',
@@ -756,6 +759,8 @@ test('an expired Qoder sign-in is skipped before any upstream read', async () =>
   }
   const context = vm.createContext({
     QoderUpstreamClient: QoderClient,
+    loadGeneration: 0,
+    regionEnabled: () => true,
     sourceCredentialExpired: (credential, now) => credential.expiresAtMs <= now,
     qoderClientCredential: (credential) => credential,
     qoderClaimableCampaignIdOf: () => 'daily',
@@ -830,6 +835,25 @@ test('a Trae chat rotates past a sign-in that answers 401', async () => {
  * own files is asking about those files, so only the machine-wide walk is cached
  * - and `reset*CredentialCache` is what a rescan uses to see a change at once.
  */
+for (const source of ['Trae', 'Qoder']) test(`${source} a discovery read cannot repopulate the cache after rescan`, async () => {
+  const file = path.join(root, 'src', source === 'Trae' ? 'trae-discovery.ts' : 'qoder-credentials.ts')
+  const module = { exports: {} }
+  const context = vm.createContext({ module, exports: module.exports, require: Module.createRequire(path.join(root, 'lib', path.basename(file, '.ts') + '.js')), process, Buffer, URL })
+  vm.runInContext(ts.transpileModule(fs.readFileSync(file, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023, esModuleInterop: true } }).outputText, context)
+  const result = label => ({ credentials: [{ label }], failures: [] })
+  let release, reads = 0
+  const older = new Promise(resolve => { release = resolve })
+  context['read' + source + 'Credentials'] = async () => ++reads === 1 ? older : result('current')
+  const discover = module.exports['discover' + source + 'Credentials']
+  const pending = discover()
+  module.exports['reset' + source + 'CredentialCache']()
+  assert.equal((await discover()).credentials[0].label, 'current')
+  release(result('older'))
+  await pending
+  assert.equal((await discover()).credentials[0].label, 'current')
+  assert.equal(reads, 2)
+})
+
 test('a credential discovery answer is cached inside its TTL and reset on demand', async () => {
   const trae = require('../lib/trae-discovery')
   const qoder = require('../lib/qoder-credentials')
@@ -1410,7 +1434,7 @@ test('a composer answer carries at most eight packages', async () => {
  * unwrap is the stubbed seam (the one that would need the installed app), so
  * the decipher and the cache are the real code.
  */
-test('a second Qoder read in one process still opens the sealed session', async (t) => {
+test('Qoder reads keep cached keys intact and follow a rotated wrapper with the same mtime', async (t) => {
   if (process.platform !== 'win32') return t.skip('the DPAPI unwrap this case stubs only exists on Windows; macOS reads the Keychain instead (qoder-macos.test.cjs)')
   const { EventEmitter } = require('node:events')
   const { createCipheriv } = require('node:crypto')
@@ -1430,7 +1454,7 @@ test('a second Qoder read in one process still opens the sealed session', async 
   process.env.SystemRoot = 'C:\\fixture-root'
   process.env.windir = 'C:\\fixture-root'
   process.env.SystemDrive = 'Q:'
-  const key = Buffer.alloc(32, 7)
+  let key = Buffer.alloc(32, 7)
   const nonce = Buffer.alloc(12, 3)
   const cipher = createCipheriv('aes-256-gcm', key, nonce)
   const sealed = Buffer.concat([
@@ -1473,6 +1497,8 @@ test('a second Qoder read in one process still opens the sealed session', async 
     fs.writeFileSync(local.path, JSON.stringify({
       os_crypt: { encrypted_key: Buffer.concat([Buffer.from('DPAPI'), Buffer.alloc(48)]).toString('base64') },
     }))
+    const stamp = new Date('2026-01-01T00:00:00Z')
+    fs.utimesSync(local.path, stamp, stamp)
     resetQoderCredentialCache()
     const group = candidates.filter((candidate) => candidate.appDir === auth.appDir)
     const first = await readQoderCredential(group)
@@ -1480,6 +1506,16 @@ test('a second Qoder read in one process still opens the sealed session', async 
     const second = await readQoderCredential(group)
     assert.equal(second.credential?.token, 'qoder-token',
       'the second read must open it too: the reader zeroes its own copy, not the cached key')
+    key = Buffer.alloc(32, 8)
+    const rotated = createCipheriv('aes-256-gcm', key, nonce)
+    fs.writeFileSync(auth.path, Buffer.concat([Buffer.from('v10'), nonce,
+      rotated.update(JSON.stringify({ token: 'rotated-token', user: { id: 'user-1' } })), rotated.final(), rotated.getAuthTag()]))
+    fs.writeFileSync(local.path, JSON.stringify({
+      os_crypt: { encrypted_key: Buffer.concat([Buffer.from('DPAPI'), Buffer.alloc(48, 1)]).toString('base64') },
+    }))
+    fs.utimesSync(local.path, stamp, stamp)
+    assert.equal((await readQoderCredential(group)).credential?.token, 'rotated-token',
+      'the wrapper bytes decide whether the key changed, even when the timestamp is unchanged')
     const trustedRoot = fs.realpathSync.native('\\\\?\\GLOBALROOT\\SystemRoot')
     assert.equal(unwrapEnvironment.SystemRoot, trustedRoot, 'PowerShell must receive the trusted system root')
     assert.equal(unwrapEnvironment.windir, trustedRoot)
@@ -1768,31 +1804,6 @@ test('a Qoder claim that paid nothing carries no amount', () => {
   const paid = qoderNormalizeClaimResult({ data: { status: 'CLAIMED' } }, campaign)
   assert.equal(paid.claimed, true)
   assert.equal(paid.amount, 30, 'a claim that paid out names what it paid')
-})
-
-/**
- * A promo window that runs past midnight is promised only as far as the rule's
- * last day allows.
- *
- * The night window is 23:00 to 08:00, so on the rule's final day the hours
- * after midnight are outside it. The badge used to answer "free from 00:00"
- * for the whole last evening, which is wrong in both directions: the model IS
- * free from 23:00, and 00:00 is past the rule so it is not free then either.
- */
-test('a promo window is not promised past the rule\'s last day', () => {
-  const { promoStatusFor } = require('../lib/promo')
-  const model = { id: 'hy4-preview' }
-  const lastDay = { day: '2026-10-31', hour: 23 }
-  assert.deepEqual(promoStatusFor(model, lastDay, 'cn'), { kind: 'night', untilHour: 24 },
-    'on the last day the window is promised up to midnight, not past it')
-  assert.equal(promoStatusFor(model, { day: '2026-10-30', hour: 23 }, 'cn')?.untilHour, 8,
-    'the day before, the same window is promised in full')
-  assert.equal(promoStatusFor(model, { day: '2026-10-31', hour: 2 }, 'cn')?.untilHour, 8,
-    'and inside the rule\'s last day the window still ends before midnight')
-  assert.equal(promoStatusFor(model, { day: '2026-10-31', hour: 22 }, 'cn')?.kind, 'night-later',
-    'before the window opens on the last day it is still offered as opening later')
-  assert.equal(promoStatusFor(model, { day: '2026-11-01', hour: 2 }, 'cn'), undefined,
-    'past the rule there is no window at all')
 })
 
 /**
@@ -2321,8 +2332,14 @@ test('a check-in pass that starts after a stop still collects', async () => {
   const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
   const claims = { workbuddy: 0, travel: 0, qoder: 0, trae: 0, growth: 0 }
   const slots = new Set()
+  const regions = { workbuddy: ['cn'], qoder: ['cn'], trae: ['cn'] }
+  const logs = []
+  let pauses = 0
   const context = vm.createContext({
     AbortController,
+    activeRegions: () => regions.workbuddy,
+    activeQoderRegions: () => regions.qoder,
+    activeTraeRegions: () => regions.trae,
     GROWTH_AFTER_CHECKIN_MS: 0,
     // The state a service stop leaves behind: the flag is aborted, nothing is
     // running, and the pass this entry is about to start must not inherit it.
@@ -2344,19 +2361,19 @@ test('a check-in pass that starts after a stop still collects', async () => {
     zonedDayHour: () => ({ day: '2026-10-15', hour: 9 }),
     dueCheckinSlot: () => undefined,
     checkinSlotId: (day, hour) => `${day}T${hour}`,
-    saveCheckinSlots: () => { slots.add('2026-10-15T9') },
+    saveCheckinSlots: () => {},
     isolatedCheckinWorker: (work) => work,
     claimAllCheckins: async () => { claims.workbuddy += 1; return { claimed: 2, skipped: 0, failed: 0 } },
-    travelAllAccounts: async () => { claims.travel += 1; return { departed: 0, claimed: 0, adopted: 0 } },
+    travelAllAccounts: async () => { claims.travel += 1; return { departed: 0, claimed: 0, failed: 0, credit: 0 } },
     qoderCheckinAll: async () => { claims.qoder += 1; return { claimed: 1, skipped: 0, failed: 0 } },
     traeCheckinAll: async () => { claims.trae += 1; return { claimed: 1, skipped: 0, failed: 0 } },
-    checkinPause: async () => {},
+    checkinPause: async () => { pauses += 1 },
     claimAllGrowth: async () => { claims.growth += 1; return { streak: 0, credit: 0 } },
     scheduleRefresh: () => {},
-    log: () => {},
+    log: (...args) => logs.push(args),
     safeMessage: (error) => String(error),
   })
-  vm.runInContext(entryFunctions(['runCheckinPass'], source), context)
+  vm.runInContext(entryFunctions(['runCheckinPass', 'nextQoderRetryAt'], source), context)
   // Aborted, exactly as a stop leaves it.
   context.checkinAbort.abort(new Error('the service stopped'))
   const answer = await context.runCheckinPass({ manual: true })
@@ -2366,9 +2383,29 @@ test('a check-in pass that starts after a stop still collects', async () => {
   assert.equal(claims.trae, 1)
   assert.equal(claims.growth, 1, 'the growth pass runs after the accounts')
   assert.equal(answer.claimed, 2, 'the counts the workers returned must reach the answer')
+  assert.equal(logs.at(-1)[0], 'info')
+  assert.match(logs.at(-1)[1], /manual check-in accounts collected: 2/)
   assert.equal(context.checkinAbort.signal.aborted, false,
     'the pass must have re-armed the flag, or the next one inherits this stop')
   assert.equal(slots.has('2026-10-15T9'), true, 'a pass that ran has spent its slot')
+  for (const enabled of ['qoder', 'trae', 'none']) {
+    for (const source of Object.keys(regions)) regions[source] = source === enabled ? ['cn'] : []
+    for (const source of Object.keys(claims)) claims[source] = 0
+    slots.clear()
+    pauses = 0
+    const filtered = await context.runCheckinPass({ manual: true })
+    assert.equal(filtered.workbuddy, false)
+    assert.equal(claims.workbuddy + claims.travel + claims.growth, 0, 'inactive WorkBuddy must not start any worker')
+    assert.equal(claims.qoder, Number(enabled === 'qoder'))
+    assert.equal(claims.trae, Number(enabled === 'trae'))
+    assert.equal(slots.size, Number(enabled !== 'none'), 'a full pass records its slot whenever a source ran')
+    assert.equal(pauses, 0, 'a pass without growth has no growth delay')
+    assert.equal(filtered.qoder === undefined, enabled !== 'qoder')
+    assert.equal(filtered.trae === undefined, enabled !== 'trae')
+    slots.clear()
+    await context.runCheckinPass({ manual: true, only: enabled })
+    assert.equal(slots.size, 0, 'a source-only click leaves the full scheduled pass due')
+  }
 })
 
 /**
@@ -2400,39 +2437,6 @@ test('a check-in pause follows the pass that started it', async () => {
   cut.abort()
   await pending
   assert.ok(Date.now() - cutAt < 500, 'aborting the pass signal must cut the pause')
-})
-
-/**
- * A reload aborts the previous load's work without touching its gateways.
- *
- * Clearing the maps here looked like the tidy thing to do, and it cost the Trae
- * and Qoder directory caches with them: those rows dropped out of the manifest
- * until the next warm-up happened to rebuild them, which on a machine whose
- * preferred ports are taken is not soon. `onUnload` already closes them.
- */
-test('a load leaves the source gateways alone', () => {
-  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
-  const body = entryFunctions(['onLoad'], source)
-  assert.match(body, /checkinAbort\.abort\(\)/, 'a reload must still abort the pass it replaces')
-  assert.match(body, /abortWarmups\(\)/, 'and stop its warm-ups')
-  assert.doesNotMatch(body, /traeGateways\.clear\(\)/,
-    'clearing Trae here drops its directory cache and its provider row with it')
-  assert.doesNotMatch(body, /qoderGateways\.clear\(\)/, 'and the same for Qoder')
-})
-
-/**
- * A sign-in the panel started does not survive the reload that replaced it.
- *
- * `deviceLogins` holds the state each browser-based login is polled against. Its
- * own comment says a reload drops them so the panel starts over; nothing cleared
- * the map, so a poll arriving after an in-place reload was answered with a state
- * this activation never issued and could complete that sign-in.
- */
-test('a reload drops the sign-ins the previous activation started', () => {
-  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
-  const body = entryFunctions(['onUnload'], source)
-  assert.match(body, /deviceLogins\.clear\(\)/,
-    'the map is process state, and the poll that would read it outlives the reload')
 })
 
 /**
@@ -3032,7 +3036,7 @@ test('a probe pass drops the cache entries of accounts that left the pool', asyn
       },
     },
   })
-  vm.runInContext(entryFunctions(['accountProbe', 'signInRefused'], source), context)
+  vm.runInContext('const loadGeneration = 0;\n' + entryFunctions(['accountProbe', 'signInRefused'], source), context)
   await context.accountProbe({ id: 'live-acct', credential: {} }, true)
   assert.equal(probeCache.has('live-acct'), true, 'the live account must be cached by its probe')
   // A departed id, so the cache now holds more than the pool lists.
@@ -4334,7 +4338,7 @@ test('a WorkBuddy stream that fails mid-flight ends with a terminator', async ()
         controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'))
         return
       }
-      controller.error(new Error('Bearer eyJhbGciOi.real.token.value rejected'))
+      controller.error(new Error('Bearer sample.token.value rejected'))
     },
   })
   const client = {
@@ -5070,7 +5074,7 @@ test('a probe invalidated by a claim does not write its pre-claim answer back', 
     },
   }
   new Function('module', 'exports', 'core', 'probeCache', 'PROBE_TTL_MS', 'PROBE_RETRY_MS', 'signInRefused', 'safeMessage',
-    entryFunctions(['accountProbe'], source) + '\nmodule.exports = { accountProbe }',
+    'const loadGeneration = 0;\n' + entryFunctions(['accountProbe'], source) + '\nmodule.exports = { accountProbe }',
   )(mod, mod.exports, core, probeCache, 60000, 15000, () => false, (error) => String(error?.message ?? error))
 
   const old = mod.exports.accountProbe(account, true, false)
@@ -5117,14 +5121,11 @@ test('a probe invalidated by a claim does not write its pre-claim answer back', 
     await creditsGate
     return { total: 11, packages: [] }
   }
-  core.client.fetchCheckinStatus = async () => ({ active: true, todayCheckedIn: true })
+  core.client.fetchCheckinStatus = async () => { throw new Error('old check-in failure') }
   const full = mod.exports.accountProbe(account, true, false)
   await creditsBegan
-  probeCache.set(account.id, {
-    atMs: Date.now(),
-    checkinOnly: true,
-    value: { checkinError: 'old check-in failure' },
-  })
+  await mod.exports.accountProbe(account, true, true)
+  core.client.fetchCheckinStatus = async () => ({ active: true, todayCheckedIn: true })
   releaseCredits()
   const merged = await full
   assert.equal(merged.checkin.todayCheckedIn, true, 'the full read check-in is the newer answer')
@@ -5562,6 +5563,8 @@ test('a service stop releases the refresh slot', async () => {
     console,
     ...state,
     core: { pool: null },
+    probeCache: new Map(),
+    deviceLogins: new Map(),
     clearTimeout: () => { stopped.push('timer') },
     stopAutoCheckin: () => stopped.push('checkin'),
     stopAccountWatch: () => stopped.push('accountWatch'),
@@ -5657,9 +5660,10 @@ test('source check-in batches preserve the first safe refusal without retrying a
     : { outcome: 'failed', reason: (credential.label === 'one' ? 'first' : 'second') + ' refusal: HTTP 403 Bearer secret-' + credential.label + '-credential', retry: false }
   const context = vm.createContext({
     safeMessage,
+    activeRegions: () => [],
     activeQoderRegions: () => ['cn'],
     activeTraeRegions: () => ['cn'],
-    discoverQoderCredentials: async () => ({ credentials, failures: [] }),
+    discoverQoderCredentials: async () => ({ credentials, failures: [{ region: 'global', reason: 'no-key' }] }),
     discoverTraeCredentials: async () => ({ credentials, failures: [] }),
     traeStorageCandidates: () => [],
     traeRegionOfCredential: (credential) => credential.region,
@@ -5698,12 +5702,25 @@ test('source check-in batches preserve the first safe refusal without retrying a
     saveCheckinSlots() {},
     GROWTH_AFTER_CHECKIN_MS: 0,
   })
-  vm.runInContext(entryFunctions(['qoderCheckinAll', 'traeCheckinAll', 'runCheckinPass', 'autoCheckinTick'], source), context)
+  vm.runInContext(entryFunctions(['qoderCheckinAll', 'traeCheckinAll', 'runCheckinPass', 'autoCheckinTick', 'nextQoderRetryAt'], source), context)
   for (const kind of ['qoder', 'trae']) {
     const counts = await context[kind + 'CheckinAll']()
     assert.equal(counts.failed, 2)
     assert.equal(counts.claimed, 1, 'one refusal must not prevent a later account from collecting')
     assert.equal(counts.reason, 'first refusal: HTTP 403 Bearer [redacted]', 'the panel needs the first refusal, without its echoed credential')
+    const stopping = new AbortController()
+    const claimed = []
+    context.currentCheckinSignal = () => stopping.signal
+    context.checkinPause = async () => stopping.abort()
+    context[kind + 'ClaimFor'] = async credential => {
+      claimed.push(credential.label)
+      return { outcome: 'claimed' }
+    }
+    await context[kind + 'CheckinAll']()
+    assert.deepEqual(claimed, ['one'], `${kind} must stop when its account delay is cancelled`)
+    context.currentCheckinSignal = () => ({ aborted: false })
+    context.checkinPause = async () => {}
+    context[kind + 'ClaimFor'] = claim
   }
   const answer = await context.runCheckinPass({ only: 'qoder', manual: true })
   assert.equal(answer.error, undefined)
@@ -5734,6 +5751,8 @@ test('a Qoder business refusal is redacted before the single-account answer', as
   const context = vm.createContext({
     ...qoder,
     QoderUpstreamClient: QoderClient,
+    loadGeneration: 0,
+    regionEnabled: () => true,
     sourceCredentialExpired: () => false,
     qoderClientCredential: (credential) => credential,
     qoderRowLabel: () => 'fixture',

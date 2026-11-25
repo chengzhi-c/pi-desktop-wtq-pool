@@ -193,11 +193,13 @@ export function qoderRequestBody(
   openAiBody: string,
   model: string,
   entry?: QoderChatModel,
+  offWhenOmitted = false,
 ): { body: string; model: string; options: { enableThinking?: boolean; reasoningEffort?: string } } {
   // The picked level is only honoured if it reaches the client builder, so it
   // is read here instead of being left to the caller: without this the menu
   // the host offers would change nothing at all on the wire.
   const requested = readReasoningEffort(openAiBody)
+    ?? (offWhenOmitted && entry?.effortLevels?.length && !entry.alwaysThinking ? 'off' : undefined)
   // Qoder spells the off value "none" where the host drops the field entirely,
   // so both spellings mean the same switch and neither carries a level.
   const off = requested === 'off' || requested === 'none'

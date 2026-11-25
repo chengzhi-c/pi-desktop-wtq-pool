@@ -10,7 +10,7 @@
 
 <p align="center"><sub>PI-Desktop edition · <a href="https://github.com/chengzhi-c/dsh-wtq-pool">DeepSeek Harness edition</a></sub></p>
 
-<p align="center"><b>Use local WorkBuddy, Trae and Qoder accounts in PI-Desktop, with account failover based on each source's rules.</b></p>
+<p align="center"><b>Use local WorkBuddy, Trae and Qoder accounts in PI-Desktop and switch accounts when one becomes unavailable.</b></p>
 
 <p align="center">
   <b>English</b> | <a href="README.md">简体中文</a>
@@ -30,15 +30,15 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/chengzhi-c/pi-desktop-wtq-pool?style=flat-square" alt="MIT license"></a>
 </p>
 
-> For learning use only. Unofficial clients may trigger account restrictions. Review the risks and follow the relevant service terms.
+> For educational use only. Unofficial clients may trigger account restrictions. Review the risks and follow the relevant service terms.
 
-WTQ Pool registers model groups by source and region. When an account is rate-limited, out of credits or signed out, the plugin switches accounts according to that source's rules.
+WTQ Pool registers model groups by source and region. When an account is rate-limited, out of credits or signed out, it switches accounts according to that source's rules.
 
 ## Install
 
 1. Download `io.github.chengzhi-c.pi-desktop-wtq-pool-<version>.piplug` from [Releases](https://github.com/chengzhi-c/pi-desktop-wtq-pool/releases).
 2. In PI-Desktop, open **Extensions**, open the top-right more menu, select **Install package**, and choose the downloaded file.
-3. Reload WTQ Pool. Restart PI-Desktop if the installed version is not shown.
+3. Re-enable WTQ Pool or restart PI-Desktop to refresh its providers.
 
 Requires PI-Desktop 0.15.0 or later. After upgrading from 1.1.x to 1.2.0, provider IDs changed to `wtqpool-*`; select your models again.
 
@@ -46,11 +46,11 @@ Requires PI-Desktop 0.15.0 or later. After upgrading from 1.1.x to 1.2.0, provid
 
 In PI-Desktop 0.22 or later, press `Alt+Space` to open the launcher, or run `WTQ Pool: Open panel` from the command palette (command ID: `wtqpool.open`).
 
-Sign in to WorkBuddy, Trae or Qoder, then select **Detect accounts again**. WorkBuddy supports multiple sign-ins; domestic Trae reads Trae CN and TRAE SOLO CN separately. Each Qoder installation and the international WorkBuddy edition retain one sign-in, so switching accounts replaces it.
+Sign in to WorkBuddy, Trae or Qoder, then select **Detect accounts again** in the panel. WorkBuddy supports multiple sign-ins; domestic Trae reads Trae CN and TRAE SOLO CN separately. Each Qoder installation and the international WorkBuddy edition retain one sign-in. Signing in to another account replaces the current one.
 
 WorkBuddy 5.6+ `$wbEncrypted` sign-ins require a key from the local WorkBuddy installation. On Windows, the plugin uses a signed executable with a supported public key on a fixed local drive; elevated processes skip decryption. On macOS, it runs the local app to read the key without verifying its signature; root processes on macOS and Linux also skip decryption. Use a trusted installation.
 
-The panel provides the account pool, models, connection check and growth centre. Each model group publishes up to 64 models. Automatic check-in is off by default, defaults to 09:00 Beijing time and can be changed in the panel; check-in and WorkBuddy **Run now** may consume make-up cards or lottery draws. **Refresh now** renews plugin-owned sign-ins issued at least six hours ago or expiring within five minutes; the desktop app renews its active sign-in.
+The panel provides the account pool, models, connection check and growth centre. Each model group publishes up to 64 models. Automatic check-in is off by default, runs at 09:00 Beijing time and can be changed in the panel. Check-in and WorkBuddy **Run now** may use make-up cards or lottery draws. **Refresh now** renews plugin-managed sign-ins issued at least six hours ago or expiring within five minutes; the desktop app renews sign-ins it manages.
 
 ### Add an account
 
@@ -66,18 +66,24 @@ node .\tools\import-signins.cjs --data $pluginData --from $accountFile
 
 Optional arguments: `--region cn|global|all`, `--dry-run`, `--force`.
 
-Files in `signins/` contain usable access and refresh tokens; protect them like account passwords. Panel-added sign-ins can be deleted after two confirmations; the desktop app's active sign-in cannot be deleted from the panel.
+Files in `signins/` contain usable access and refresh tokens; protect them as account passwords. Deleting a panel-managed sign-in requires a second confirmation; the desktop app's active sign-in cannot be deleted from the panel.
+
+Expand an account in the growth centre to see this month’s login status. Green marks active days and gray marks inactive days. Hover over a day to see its date. The growth centre supports streak and travel rewards, destination selection, a single lottery draw and make-up check-ins. **Run now** handles cat travel and growth rewards in one pass. Actions that spend cards, trips or lottery chances require confirmation. Feature availability varies by region.
 
 ## Features
 
-- Distribution: priority, round robin and expiring credits first. WorkBuddy also supports conversation-sticky routing.
-- Composer credits: show the current account's balance and switch accounts by clicking the readout; with the readout off, balance polling runs every five minutes.
+- Account distribution: priority, round robin and expiring credits first. WorkBuddy also supports conversation-sticky routing.
+- Composer credits show the current account's balance. Click the balance to switch accounts.
 - Model catalogues load at startup and refresh on demand when their cache expires; disabled or signed-out accounts are not probed.
 - Gateways return SSE `chat.completion.chunk` responses.
 
+PI encodes thinking **Off** and **Omit** identically; both disable thinking on Qoder models that support turning it off.
+
+PI-Desktop 0.24.0-beta.1 ignores the selected thinking level for WorkBuddy DeepSeek models; this requires host support for plugin-declared reasoning-effort capabilities.
+
 ### Failover and recovery
 
-| Condition | Behaviour |
+| Condition | Handling |
 | --- | --- |
 | Invalid request, or Trae/Qoder model missing from the catalogue | Return 400 or 404 without sending a chat request |
 | WorkBuddy rate limit, upstream 5xx or host unavailable | Try the next account; rate limits follow the upstream wait time or configured cooldown |
@@ -112,7 +118,7 @@ The panel also edits distribution, source switches, regional preferences, credit
 | Trae | `41851` | `41861` |
 | Qoder | `41871` | `41881` |
 
-If a preferred port is occupied, the gateway uses an ephemeral port and the connection check reports the actual address. The DeepSeek Harness edition uses a separate range starting at `42831`; the editions keep settings and credentials separately. Sharing a WorkBuddy sign-in can let refresh-token rotation invalidate the other edition.
+If the connection check reports an occupied port, stop using the affected models, free the port, and restart PI-Desktop. The DeepSeek Harness edition uses a separate range starting at `42831`; the editions keep settings and credentials separately. Sharing a WorkBuddy sign-in can let refresh-token rotation invalidate the other edition.
 
 ## Privacy and network access
 
@@ -131,6 +137,8 @@ Tokens are sent only to these hosts:
 ## Preview
 
 ![Account pool](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-pool.png)
+
+![Growth centre](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-growth.png)
 
 The [live preview](https://chengzhi-c.github.io/pi-desktop-wtq-pool/) uses the actual panel code with demo data. The in-app panel follows PI-Desktop's theme and language.
 

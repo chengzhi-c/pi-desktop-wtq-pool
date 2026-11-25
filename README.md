@@ -10,7 +10,7 @@
 
 <p align="center"><sub>PI-Desktop 版 · <a href="https://github.com/chengzhi-c/dsh-wtq-pool">DeepSeek Harness 版</a></sub></p>
 
-<p align="center"><b>在 PI-Desktop 中使用本机 WorkBuddy、Trae 和 Qoder 账号，按账号状态自动换号。</b></p>
+<p align="center"><b>在 PI-Desktop 中使用本机 WorkBuddy、Trae 和 Qoder 账号，并在账号不可用时自动切换。</b></p>
 
 <p align="center">
   <a href="README.en.md">English</a> | <b>简体中文</b>
@@ -32,13 +32,13 @@
 
 > 本项目仅供学习使用。非官方客户端可能触发厂商的账号限制。使用前请评估风险并遵守相关服务条款。
 
-按来源和区域注册模型组。账号限流、额度耗尽或登录失效时，插件按来源规则切换账号。
+插件按来源和区域注册模型组。账号限流、额度耗尽或登录失效时，按来源规则切换账号。
 
 ## 安装
 
 1. 从 [Releases](https://github.com/chengzhi-c/pi-desktop-wtq-pool/releases) 下载 `io.github.chengzhi-c.pi-desktop-wtq-pool-<版本>.piplug`。
 2. 在 PI-Desktop「扩展」页打开右上角更多菜单，选择「安装插件包」，选中下载的文件。
-3. 重新加载 WTQ Pool；仍显示旧版本时重启 PI-Desktop。
+3. 重新启用 WTQ Pool 或重启 PI-Desktop，以刷新提供商列表。
 
 需要 PI-Desktop 0.15.0 或更高版本。从 1.1.x 升级到 1.2.0 后，提供商 ID 改为 `wtqpool-*`，请重新选择模型。
 
@@ -46,15 +46,15 @@
 
 PI-Desktop 0.22 起可按 `Alt+Space` 打开启动器，或从命令面板运行 `WTQ Pool: Open panel`（命令 ID：`wtqpool.open`）。
 
-先在 WorkBuddy、Trae 或 Qoder 桌面应用登录，再在面板选择「重新检测账号」。WorkBuddy 支持多个登录；国内 Trae 分别读取 Trae CN 和 TRAE SOLO CN。每个 Qoder 安装及 WorkBuddy 国际版各保留一个登录，切换账号会替换原登录。
+在 WorkBuddy、Trae 或 Qoder 桌面应用中登录后，在面板中点击「重新检测账号」。WorkBuddy 支持多个登录；国内 Trae 分别读取 Trae CN 和 TRAE SOLO CN。每个 Qoder 安装及 WorkBuddy 国际版各保留一个登录，登录其他账号会替换当前账号。
 
 WorkBuddy 5.6 起的 `$wbEncrypted` 登录需要本机应用的解密密钥。Windows 只使用签名有效且公钥受支持的本地安装，管理员进程跳过解密；macOS 会运行本机应用读取密钥，不校验签名，root 进程跳过解密。请使用可信的 WorkBuddy 安装。
 
-面板提供账号池、模型、连接检查和成长中心。模型组最多发布 64 个模型。自动签到默认关闭，默认北京时间 09:00，可在面板调整；签到和「立即执行」可能消耗补签卡或抽奖次数。「立即刷新」只续期签发满六小时或五分钟内到期的插件自管登录，桌面应用登录由应用续期。
+面板提供账号池、模型、连接检查和成长中心。每个模型组最多发布 64 个模型。自动签到默认关闭，时间为北京时间 09:00，可在面板修改。签到和「立即执行」可能消耗补签卡或抽奖机会；「立即刷新」仅续期签发满六小时或五分钟内到期的插件管理登录，桌面应用管理的登录由应用续期。
 
 ### 添加账号
 
-在面板通过官方登录页添加，或导入含 `{auth, account}` 的 `.info` 文件。从源码仓库运行：
+在面板通过官方登录页添加账号，或导入含 `{auth, account}` 的 `.info` 文件。从源码仓库运行：
 
 ```powershell
 $storageFile = Join-Path $env:APPDATA "PI-Desktop\storage-location.json"
@@ -66,18 +66,24 @@ node .\tools\import-signins.cjs --data $pluginData --from $accountFile
 
 可选参数：`--region cn|global|all`、`--dry-run`、`--force`。
 
-`signins/` 含可用的访问令牌和刷新令牌，应按账号密码保护。面板添加的登录可二次确认后删除；桌面应用当前使用的登录不能从面板删除。
+`signins/` 含可用的访问令牌和刷新令牌，应按账号密码保护。删除面板添加的登录需要再次确认；桌面应用当前使用的登录不能从面板删除。
+
+展开账号可查看本月登录状态：绿色表示已登录，灰色表示未登录，悬停日期可查看日期。成长中心支持领取连登档位和旅行积分、选择旅行地点、单次抽奖及补签。「立即执行」批量处理猫猫旅行和成长奖励；补签、抽奖和派遣会先确认消耗。功能可用性因地区而异。
 
 ## 功能
 
-- 分发：优先、轮流、临期积分优先；WorkBuddy 另支持同一对话固定账号。
-- 输入框积分：显示当前账号积分，点击读数切换账号；关闭时每五分钟读取一次。
+- 账号分配：支持优先使用、轮流使用和临期积分优先；WorkBuddy 另支持同一对话固定账号。
+- 输入框积分：显示当前账号积分，点击读数后可以更换账号。
 - 模型目录：启动时加载，过期后按需刷新；停用或登录失效的账号不参与探测。
 - 网关：始终以 SSE 返回 `chat.completion.chunk`。
 
-### 换号与恢复
+PI-Desktop 将「关闭思考」和「省略」编码为相同请求；Qoder 可关闭思考的模型将两者均按关闭处理。
 
-| 情况 | 处理方式 |
+PI-Desktop 0.24.0-beta.1 会忽略 WorkBuddy 的 DeepSeek 思考档位；该功能需要宿主支持插件的思考参数能力声明。
+
+### 账号切换与恢复
+
+| 情况 | 处理 |
 | --- | --- |
 | 请求无效，或 Trae、Qoder 模型不在目录 | 返回 400 或 404，不发送对话 |
 | WorkBuddy 限流、5xx 或主机不可达 | 尝试下一个账号；限流按上游等待时间或冷却处理 |
@@ -112,7 +118,7 @@ Trae、Qoder 冷却默认 60 秒，最长 24 小时。WorkBuddy 登录失效时�
 | Trae | `41851` | `41861` |
 | Qoder | `41871` | `41881` |
 
-端口被占用时网关改用临时端口，连接检查会显示实际地址。DeepSeek Harness 版使用 `42831` 起始的独立端口范围；两版设置和凭证分开，共用 WorkBuddy 登录时刷新令牌轮换可能使另一版失效。
+连接检查提示端口被占用时，请暂停使用受影响的模型，释放端口后重启 PI-Desktop。DeepSeek Harness 版使用 `42831` 起始的独立端口范围；两版设置和凭证分开，共用 WorkBuddy 登录时刷新令牌轮换可能使另一版失效。
 
 ## 隐私与出网
 
@@ -131,6 +137,8 @@ PI-Desktop 不提供系统级沙箱。网关只监听 `127.0.0.1`，同机进程
 ## 预览
 
 ![账号池](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-pool.png)
+
+![成长中心](https://github.com/chengzhi-c/pi-desktop-wtq-pool/raw/main/docs/preview-growth.png)
 
 [在线预览](https://chengzhi-c.github.io/pi-desktop-wtq-pool/) 使用实际面板代码和演示数据。应用内面板跟随 PI-Desktop 的主题和语言。
 

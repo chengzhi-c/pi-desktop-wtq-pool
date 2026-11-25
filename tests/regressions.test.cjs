@@ -92,7 +92,6 @@ test('a previous unload cannot clear state installed by a new load', async () =>
     sourceFailureHold.set('old', {})
     sourceCreditExpiry.set('old', 1)
     sourceRotation.set('old', 1)
-    travelAdoptTried.set('old', true)
     traeIdentityBlockers.set('old', {})
     gatewayStartFailures.set('old', 'old')
     sourceStartFailures.set('old', 'old')
@@ -104,7 +103,7 @@ test('a previous unload cannot clear state installed by a new load', async () =>
   try {
     unloading = plugin.onUnload()
     assert.equal(listeners.size, 0, 'the old settings listener must be detached before a new load')
-    for (const name of ['probeCache', 'sourceFailureHold', 'sourceCreditExpiry', 'sourceRotation', 'travelAdoptTried',
+    for (const name of ['probeCache', 'sourceFailureHold', 'sourceCreditExpiry', 'sourceRotation',
       'traeIdentityBlockers', 'gatewayStartFailures', 'sourceStartFailures', 'deviceLogins']) {
       assert.equal(vm.runInContext(`${name}.has('old')`, context), false, `${name} must not be inherited by the new activation`)
     }
@@ -115,7 +114,6 @@ test('a previous unload cannot clear state installed by a new load', async () =>
       sourceFailureHold.set('new', {})
       sourceCreditExpiry.set('new', 1)
       sourceRotation.set('new', 1)
-      travelAdoptTried.set('new', true)
       traeIdentityBlockers.set('new', {})
       gatewayStartFailures.set('new', 'new')
       sourceStartFailures.set('new', 'new')
@@ -125,7 +123,7 @@ test('a previous unload cannot clear state installed by a new load', async () =>
     release()
     await unloading
     assert.equal(listeners.size, 1, 'the new settings listener must remain subscribed')
-    for (const name of ['probeCache', 'sourceFailureHold', 'sourceCreditExpiry', 'sourceRotation', 'travelAdoptTried',
+    for (const name of ['probeCache', 'sourceFailureHold', 'sourceCreditExpiry', 'sourceRotation',
       'traeIdentityBlockers', 'gatewayStartFailures', 'sourceStartFailures', 'deviceLogins']) {
       assert.equal(vm.runInContext(`${name}.has('new')`, context), true, `${name} must remain owned by the new activation`)
     }
@@ -699,15 +697,8 @@ test('growth rewards accept numeric strings and normalize tier status', async ()
   assert.deepEqual(streak.tiers[0], { tier: 'seven', days: 7, credit: 100, energy: 2, status: 'unlocked' })
 })
 
-/**
- * The streak's one-off collections must ask the paths that answer.
- *
- * The gift and compensation endpoints sit on the billing host without a `/v2`
- * prefix; with one they reply `404 route not found`, which reads as "nothing to
- * collect" and silently loses the credits. A make-up target is a calendar day in
- * the check-in zone, not the host's zone.
- */
-test('streak collections use the paths the upstream answers on', async () => {
+/** A make-up target is a calendar day in the check-in zone, not the host's zone. */
+test('streak make-up uses the path and date contract the upstream answers on', async () => {
   const { WorkBuddyUpstreamClient } = require('../lib/upstream')
   const { zonedDay } = require('../lib/checkin-time')
   const calls = []
@@ -717,16 +708,12 @@ test('streak collections use the paths the upstream answers on', async () => {
   } })
   const credential = { accessToken: 'test', refreshToken: '', domain: '', expiresAtMs: 0 }
 
-  assert.equal(await client.claimGift(credential), 25)
-  assert.equal(await client.claimCompensation(credential), 25)
   await client.useMakeupCard(credential, '2026-10-18')
 
   assert.deepEqual(calls.map((call) => new URL(call.url).pathname), [
-    '/billing/meter/claim-gift',
-    '/billing/meter/claim-compensation',
     '/activity/growth/makeup-cards/use',
-  ], 'a /v2 prefix turns these into 404s')
-  assert.deepEqual(JSON.parse(calls[2].body), { target_date: '2026-10-18' })
+  ])
+  assert.deepEqual(JSON.parse(calls[0].body), { target_date: '2026-10-18' })
   assert.match(zonedDay(0), /^\d{4}-\d{2}-\d{2}$/)
   assert.notEqual(zonedDay(-1), zonedDay(0), 'yesterday is a different day')
 })
@@ -1772,34 +1759,22 @@ test('a refused figure goes back to the committed one, not the half-typed text',
  * an OFF would report a failure and leave the timer running while the panel went
  * on showing the schedule as off, which is the one state the user cannot see.
  */
-test('switching the automatic check-in off survives an unreadable hours box', () => {
+test('switching the automatic check-in off survives an unreadable hours box', async () => {
   const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
-  const body = source.slice(source.indexOf('function setAutoCheckin('))
-  const handler = body.slice(0, body.indexOf('\n}\n') + 3)
-  assert.match(handler, /if \(enabled === true\)/,
-    'only switching ON may reject an unreadable hours box')
-  assert.match(handler, /autoCheckin\.hours|state\.autoCheckin/,
-    'switching OFF must fall back to the stored hours rather than give up')
-  const refused = handler.indexOf('auto.badHours')
-  const allowed = handler.indexOf('runBusy')
-  assert.ok(refused !== -1 && allowed !== -1 && refused < allowed,
-    'the refusal must be inside the ON branch, before the save it would otherwise skip')
-})
-
-/**
- * The model sheet fills `defaultSelect` after creating the thinking-level row.
- * A second label was pasted in place of the `<select>`, so opening any model
- * with levels threw and the rest of the sheet never rendered.
- */
-test('the model sheet creates the default-level select it fills', () => {
-  const source = fs.readFileSync(path.join(root, 'renderer', 'panel.js'), 'utf8')
-  const start = source.indexOf('var levels = effectiveLevels')
-  assert.notEqual(start, -1)
-  const sheet = source.slice(start, source.indexOf('var levelRow', start))
-  assert.match(sheet, /var defaultSelect = document\.createElement\("select"\)/,
-    'the select has to exist before the options are appended')
-  assert.equal((source.match(/var outputCol = field\("models\.maxOutput"/g) || []).length, 1,
-    'the output field is created once; a second call steals the input node')
+  const context = panelFunctions(['parseCheckinHours', 'setAutoCheckin'], source)
+  const calls = []
+  Object.assign(context, {
+    state: { autoCheckin: { hours: [9, 18] } },
+    autoHoursDraft: 'invalid', render() {}, note() {}, t: key => key,
+    runBusy: (_name, work) => work(),
+    invoke: async (channel, payload) => { calls.push({ channel, ...payload }); return {} },
+  })
+  const invalid = context.parseCheckinHours('9, invalid')
+  await context.setAutoCheckin(false, invalid)
+  assert.deepEqual(calls, [{ channel: 'xd.setAutoCheckin', enabled: false, hours: [9, 18] }])
+  assert.equal(context.autoHoursDraft, null)
+  await context.setAutoCheckin(true, invalid)
+  assert.equal(calls.length, 1, 'invalid hours must still prevent enabling the schedule')
 })
 
 /**

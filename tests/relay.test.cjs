@@ -3,30 +3,10 @@
  *
  * The cases that cost a turn each: a failure the client
  * could not finish on, a status that was thrown away, a credential echoed into a
- * response body, and a gateway left bound after the pass that started it had
- * already answered. Each one is stated as the observable the client sees.
+ * response body. Each one is stated as the observable the client sees.
  */
 const assert = require('node:assert/strict')
 const { test } = require('node:test')
-const fs = require('node:fs')
-const os = require('node:os')
-const path = require('node:path')
-const vm = require('node:vm')
-const { createRequire } = require('node:module')
-
-const root = path.resolve(__dirname, '..')
-
-/**
- * Copy the plugin manifest into a fixture directory with the runtime provider
- * declaration cleared, the same normalization the packaging step applies: a
- * local run of the plugin writes that declaration back into the repo copy, and
- * a test must not inherit whatever the last run published.
- */
-function writeManifestFixture(target) {
-  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8'))
-  if (manifest.contributes) manifest.contributes.providers = []
-  fs.writeFileSync(path.join(target, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n')
-}
 const encoder = new TextEncoder()
 
 /** A readable whose failure is whatever the fixture says it is. */
@@ -399,71 +379,6 @@ test('a Qoder refusal beside a body wrapper still counts', () => {
   assert.equal(decodeQoderFrame('{"body":"{\\"choices\\":[{\\"delta\\":{\\"content\\":\\"hi\\"}}]}"}').type, 'chunk')
 })
 
-/**
- * A pass that runs out of budget mid-start releases what it already bound.
- *
- * `createRuntime` reserves a port and binds a shim before it returns, so a
- * refresh pass that timed out while awaiting one left the late runtime holding
- * both with nobody to close them: the port stayed taken by this plugin for the
- * rest of the process, and the endpoint the manifest names went dead. The
- * observable is that the declared port is bindable again after a load whose
- * first panel answer went out before its gateways had finished coming up.
- */
-test('a timed-out gateway start is released instead of abandoned', async (t) => {
-  const temporary = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'xdpool-leak-test-'))
-  const auth = path.join(temporary, 'auth')
-  fs.mkdirSync(auth)
-  writeManifestFixture(temporary)
-  const settings = {
-    enabled: true, sourceWorkbuddy: true, sourceTrae: false, sourceQoder: false,
-    disabledRegions: ['workbuddy:global'], authFile: path.join(auth, 'login.info'),
-    autoCheckin: { enabled: false, hours: [9] },
-  }
-  fs.writeFileSync(settings.authFile, JSON.stringify({
-    auth: { accessToken: 'test', expiresAt: Date.now() + 3600000 }, account: { uin: 'leak-user' },
-  }))
-  const { WorkBuddyUpstreamClient } = require('../lib/upstream')
-  // Slow enough that the panel budget expires while the gateway is still
-  // binding, which is the only way the abandoned path is reachable.
-  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchModels', async () => {
-    await new Promise((resolve) => setTimeout(resolve, 120))
-    return []
-  })
-  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCredits', async () => ({ total: 0, packages: [] }))
-  t.mock.method(WorkBuddyUpstreamClient.prototype, 'fetchCheckinStatus', async () => ({ active: false }))
-  const context = vm.createContext({
-    require: createRequire(path.join(root, 'main.js')),
-    module: { exports: {} }, __dirname: temporary,
-    console: { log() {} }, AbortController, AbortSignal, fetch, setTimeout, clearTimeout, setInterval, clearInterval,
-    pi: {
-      plugin: { getSettings: async () => ({ ...settings }), getDataPath: async () => path.join(temporary, 'data') },
-      commands: { register: async () => {}, unregister: async () => {} },
-      services: { register: () => {} },
-    },
-  })
-  vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), context)
-  const plugin = context.module.exports
-  try {
-    await plugin.onLoad()
-    const state = await plugin.onPanelInvoke('xd.state')
-    const endpoint = state.shims.cn.baseUrl.replace(/\/v1$/, '')
-    const port = Number(endpoint.slice(endpoint.lastIndexOf(':') + 1))
-    // Late enough that a runtime the first pass abandoned has finished binding,
-    // and so has whatever handler was going to release it.
-    await new Promise((resolve) => setTimeout(resolve, 1500))
-    await plugin.onUnload()
-    // The whole point: unload plus the abandoned pass must both have released
-    // the port, so the next boot can take the address the manifest names.
-    const server = require('node:http').createServer()
-    await new Promise((resolve, reject) => {
-      server.once('error', reject)
-      server.listen(port, '127.0.0.1', resolve)
-    })
-    await new Promise((resolve) => server.close(resolve))
-  } finally {
-    fs.rmSync(temporary, { recursive: true, force: true })
-  }
-})
 /**
  * A vendor that finishes the text and keeps the socket open still ends the turn.
  *

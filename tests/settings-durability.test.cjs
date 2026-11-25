@@ -557,6 +557,11 @@ test('a host edit that raced a local save is re-read, not dropped', async () => 
     const current = json(entry.read('settings'))
     assert.equal(current.sourceTrae, true, 'the local save must survive the host event')
     assert.equal(current.cooldownSeconds, 120, 'the host edit that raced the save must land too')
+    for (const patch of [{ disabledRegions: ['workbuddy:cn'] }, { enabled: false }]) {
+      entry.read('growthRead = { rows: [] }')
+      await entry.read('onHostSettingsChanged(' + JSON.stringify({ ...json(entry.read('settings')), ...patch }) + ')')
+      assert.equal(entry.read('growthRead'), null, 'host scope changes invalidate the growth read')
+    }
   } finally {
     await entry.read('onUnload()')
     entry.cleanup()
@@ -953,15 +958,7 @@ test('a Trae model that states a credit rate carries it to the panel', () => {
   }
 })
 
-/**
- * A default thinking level saved for a Trae or Qoder model has to be published.
- *
- * The panel stores it per model, and the host applies a declaration's
- * `defaultThinkingLevel` to requests that name no effort. The source
- * declarations never carried the field, so picking one of those models fell
- * back to the catalog's own default while the saved setting read as accepted.
- */
-test('a saved source default thinking level reaches the declaration', () => {
+test('thinking defaults and request support reach source declarations', () => {
   const entry = loadEntry()
   try {
     entry.read('settings = ' + JSON.stringify({
@@ -970,6 +967,15 @@ test('a saved source default thinking level reaches the declaration', () => {
         'qoder:cn': { overrides: { gmodel: { defaultThinkingLevel: 'max' } } },
       },
     }))
+    entry.read('runtimes.set("cn", { catalog: { visible: () => ['
+      + '{ id: "deepseek-v4.1", supportedEfforts: ["low", "high", "max"], defaultThinkingLevel: "max" },'
+      + '{ id: "plain" }'
+      + '] } })')
+    const workbuddy = entry.read('declarationModels("cn")')
+    assert.equal(workbuddy[0].defaultThinkingLevel, 'max')
+    assert.equal(workbuddy[0].supportsReasoningEffort, true)
+    assert.equal(workbuddy[1].supportsReasoningEffort, undefined)
+
     entry.read('traeGateways.set("cn", { gateway: { models: () => ['
       + '{ id: "kimi-k3", name: "Kimi K3", contextWindow: 256000, maxTokens: 32000,'
       + ' reasoning: { supported: ["off", "low", "high"], defaultEffort: "low" } }'
@@ -977,6 +983,7 @@ test('a saved source default thinking level reaches the declaration', () => {
     const trae = entry.read('traeDeclarationModels("cn")')
     assert.equal(trae[0].defaultThinkingLevel, 'high',
       'the Trae default the panel saved must be the one the host applies')
+    assert.equal(trae[0].supportsReasoningEffort, true)
 
     entry.read('qoderGateways.set("cn", { gateway: { models: () => ['
       + '{ id: "gmodel", name: "GLM-5.3", contextWindow: 1000000, maxInputTokens: 180000,'
@@ -985,6 +992,7 @@ test('a saved source default thinking level reaches the declaration', () => {
     const qoder = entry.read('qoderDeclarationModels("cn")')
     assert.equal(qoder[0].defaultThinkingLevel, 'max',
       'and the Qoder default must reach its declaration too')
+    assert.equal(qoder[0].supportsReasoningEffort, true)
   } finally {
     entry.cleanup()
   }
