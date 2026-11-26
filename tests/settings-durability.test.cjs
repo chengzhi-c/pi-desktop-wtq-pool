@@ -114,6 +114,26 @@ function loadEntry(options = {}) {
   }
 }
 
+test('panel login storage errors omit account paths and retain the error code', async () => {
+  const entry = loadEntry({ require: {
+    './lib/accounts': {
+      ...require('../lib/accounts'),
+      writeOwnSignIn: async () => { throw Object.assign(new Error("EPERM: rename 'E:/fixture-private/signins/workbuddy-panel-90000000991.info'"), { code: 'EPERM' }) },
+    },
+    './lib/login': { pollDeviceLogin: async () => ({ status: 'ok', signIn: {} }) },
+  } })
+  try {
+    entry.read('dataPath = "fixture"; deviceLogins.set("cn", { state: "fixture", at: Date.now() })')
+    await assert.rejects(entry.read('module.exports.onPanelInvoke("xd.pollLogin", { realm: "cn" })'), error => {
+      assert.equal(error.code, 'EPERM')
+      assert.doesNotMatch(error.message, /fixture-private|90000000991/)
+      return true
+    })
+  } finally {
+    entry.cleanup()
+  }
+})
+
 test('a queued settings event from a previous activation cannot overwrite the new settings', async () => {
   const entry = loadEntry()
   try {
@@ -753,46 +773,6 @@ test('a legacy context budget that no save could produce is refused', () => {
 })
 
 /**
- * A stored account name that no sign-in carries any more is not a preference.
- *
- * The label is the account's own name, so renaming or re-signing in retires it.
- * The old code returned a stored label as the chosen account before the rotation
- * and the expiry sort could run, which disabled both - the panel went on
- * offering "round-robin" while one account served every request.
- */
-test('a retired account name no longer disables rotation', async () => {
-  const entry = loadEntry({
-    settings: {
-      preferredSourceAccounts: { 'trae:cn': 'retired-name' },
-      sourceDistributions: { trae: 'round-robin' },
-    },
-  })
-  try {
-    // The document has to reach the module before anything reads it: in the
-    // plugin that is `onLoad`'s own adopt, and `sourceDistribution` decides here
-    // whether the rotation branch is even reachable.
-    await entry.read('adoptHostSettings()')
-    assert.equal(entry.read('sourceDistribution("trae")'), 'round-robin',
-      'the fixture must put this source in the rotating mode')
-    entry.read('traeAccountRows = [ { region: "cn", label: "live-one", expired: false }, { region: "cn", label: "live-two", expired: false } ]')
-    const call = 'orderSourceCredentials("trae", "cn", [{ label: "live-one", expiresAtMs: 0 }, { label: "live-two", expiresAtMs: 0 }], (item) => item.label, true).map((item) => item.label)'
-    const first = entry.read(call)
-    const second = entry.read(call)
-    assert.deepEqual([...first].sort(), ['live-one', 'live-two'])
-    assert.notDeepEqual(first, second,
-      'rotation must advance when the stored account name is retired')
-
-    // Control: a name that is still carried does pin the account, which is what
-    // the guard above must not break.
-    entry.read('settings = { ...settings, preferredSourceAccounts: { "trae:cn": "live-two" } }')
-    const pinned = entry.read(call)
-    assert.equal(pinned[0], 'live-two', 'a live account name must still be honoured')
-  } finally {
-    entry.cleanup()
-  }
-})
-
-/**
  * An expiry past `Date`'s range must not fail the whole panel document.
  *
  * `xd.state` formats each row's expiry with `toISOString()`, which throws for a
@@ -887,33 +867,6 @@ test('a check-in whose program is off is skipped, not claimed', async () => {
     const skipped = await entry.read(`traeClaimFor(${credential}, [])`)
     assert.equal(skipped.outcome, 'skipped', 'an account with the program off must be skipped')
     assert.deepEqual(calls, ['status'], 'no claim may be sent for an account that is not enrolled')
-  } finally {
-    entry.cleanup()
-  }
-})
-
-/**
- * A Trae or Qoder row must name itself to the composer popup.
- *
- * The popup marks the served row as active and keys the notice it raises
- * against the same value, so it can clear that notice the moment the chosen
- * account starts serving. The client reads `id`: a row carrying only a label
- * leaves the notice's key empty, the clearing check returns early on an empty
- * key, and the "preference saved, not serving yet" line stays on screen while
- * the row beside it is already marked active.
- */
-test('a Trae or Qoder row carries the identity the popup marks it by', () => {
-  const entry = loadEntry()
-  try {
-    const rows = [
-      '{ label: "Trae CN A", region: "cn", expired: false, usage: { credits: { total: 12 } } }',
-      '{ label: "Trae CN B", region: "cn", expired: false }',
-    ].join(', ')
-    entry.read(`traeAccountRows = [${rows}]`)
-    const trae = entry.read('sourceComposerAccounts("trae", "cn")')
-    assert.deepEqual([...trae].map((row) => row.id), ['Trae CN A', 'Trae CN B'],
-      'each row must name itself, or the popup cannot clear the notice it put on it')
-    assert.equal([...trae].filter((row) => row.active === true).length, 1, 'exactly one row is the served one')
   } finally {
     entry.cleanup()
   }

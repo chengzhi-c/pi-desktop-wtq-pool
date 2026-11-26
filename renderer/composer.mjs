@@ -160,8 +160,8 @@ function ComposerPoints() {
   const W = words();
   const rootRef = useRef(null);
   const panelRef = useRef(null);
-  const chipRef = useRef(chip);
-  chipRef.current = chip;
+  const chipRef = useRef({ chip });
+  if (chipRef.current.chip !== chip) chipRef.current = { chip };
   const restartPollRef = useRef(() => {});
 
   // The host prints the selected model on the chip it renders beside this slot
@@ -189,6 +189,7 @@ function ComposerPoints() {
     setOpen(false);
     setError("");
     setErrorFor("");
+    setRefreshing(false);
     if (!host || chip === "") return undefined;
     let stop = false;
     let timer = 0;
@@ -323,7 +324,7 @@ function ComposerPoints() {
               if (!host || refreshing) return;
               setRefreshing(true);
               setError("");
-              const requestedChip = chip;
+              const requestedChip = chipRef.current;
               host.dispatch("plugin.call", { method: "xd.composerRefresh", args: { chip } })
                 .then((next) => {
                   if (chipRef.current !== requestedChip) return;
@@ -337,7 +338,7 @@ function ComposerPoints() {
                   if (chipRef.current !== requestedChip) return;
                   setError(String(failure && failure.message ? failure.message : failure));
                 })
-                .finally(() => { setRefreshing(false); });
+                .finally(() => { if (chipRef.current === requestedChip) setRefreshing(false); });
             },
           }, refreshing ? W.refreshing : W.refresh),
         ),
@@ -345,7 +346,7 @@ function ComposerPoints() {
           if (!host || account.active === true) return;
           setError("");
           setErrorFor("");
-          const requestedChip = chip;
+          const requestedChip = chipRef.current;
           host.dispatch("plugin.call", {
             method: "xd.composerPrefer",
             args: {
@@ -353,7 +354,6 @@ function ComposerPoints() {
               source: data.source,
               region: data.region,
               accountId: account.id || "",
-              accountLabel: account.label || "",
             },
           }).then((next) => {
             if (chipRef.current !== requestedChip) return;

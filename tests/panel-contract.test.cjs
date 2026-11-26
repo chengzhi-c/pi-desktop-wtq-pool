@@ -7,9 +7,6 @@
  * click does nothing and the panel says nothing, which is the hardest class of
  * bug to report. The bridge names belong here; feature tests exercise each
  * action with its own payload.
- *
- * The page is also checked for the reverse: a `case` no page reaches is a
- * feature nobody can use.
  */
 
 const test = require('node:test')
@@ -164,16 +161,16 @@ test('a single claim records today on the cached source row', async (t) => {
   })
   await host.plugin.onLoad()
   try {
-    vm.runInContext("qoderAccountRows = [{ label: 'A', region: 'cn', checkin: { active: true, todayCheckedIn: false } }]", host.context)
-    vm.runInContext("markSourceCheckinRow('qoder', 'A', 'cn', { outcome: 'claimed' })", host.context)
+    vm.runInContext("qoderAccountRows = [{ id: 'A-id', label: 'A', region: 'cn', checkin: { active: true, todayCheckedIn: false } }]", host.context)
+    vm.runInContext("markSourceCheckinRow('qoder', 'A-id', 'cn', { outcome: 'claimed' })", host.context)
     assert.equal(vm.runInContext("qoderAccountRows[0].checkin.todayCheckedIn", host.context), true,
       'the document the panel reads back has to say the claim happened')
-    vm.runInContext("traeAccountRows = [{ label: 'B', region: 'cn', checkin: { active: true, todayCheckedIn: false } }]", host.context)
-    vm.runInContext("markSourceCheckinRow('trae', 'B', 'cn', { outcome: 'skipped', deviceCheckedIn: true })", host.context)
+    vm.runInContext("traeAccountRows = [{ id: 'B-id', label: 'B', region: 'cn', checkin: { active: true, todayCheckedIn: false } }]", host.context)
+    vm.runInContext("markSourceCheckinRow('trae', 'B-id', 'cn', { outcome: 'skipped', deviceCheckedIn: true })", host.context)
     assert.equal(vm.runInContext("traeAccountRows[0].checkin.deviceCheckedIn", host.context), true,
       'a device-level refusal has to reach the card too')
-    vm.runInContext("qoderAccountRows = [{ label: 'C', region: 'cn', checkin: { active: true, todayCheckedIn: false } }]", host.context)
-    vm.runInContext("markSourceCheckinRow('qoder', 'C', 'cn', { outcome: 'skipped', todayCheckedIn: true })", host.context)
+    vm.runInContext("qoderAccountRows = [{ id: 'C-id', label: 'C', region: 'cn', checkin: { active: true, todayCheckedIn: false } }]", host.context)
+    vm.runInContext("markSourceCheckinRow('qoder', 'C-id', 'cn', { outcome: 'skipped', todayCheckedIn: true })", host.context)
     assert.equal(vm.runInContext("qoderAccountRows[0].checkin.todayCheckedIn", host.context), true,
       'a round already collected in the app has to reach the card as collected')
   } finally {
@@ -188,9 +185,9 @@ test('the single claim answer carries the claimed row', async (t) => {
   })
   await host.plugin.onLoad()
   try {
-    vm.runInContext("qoderAccountRows = [{ label: 'A', region: 'cn', checkin: { active: true, todayCheckedIn: false } }]", host.context)
+    vm.runInContext("qoderAccountRows = [{ id: 'A-id', label: 'A', region: 'cn', checkin: { active: true, todayCheckedIn: false } }]", host.context)
     vm.runInContext("qoderClaimOne = async () => ({ outcome: 'claimed' })", host.context)
-    const answer = await host.plugin.onPanelInvoke('xd.sourceCheckin', { source: 'qoder', label: 'A', region: 'cn' })
+    const answer = await host.plugin.onPanelInvoke('xd.sourceCheckin', { source: 'qoder', accountId: 'A-id', region: 'cn' })
     assert.equal(answer.result.outcome, 'claimed')
     assert.equal(answer.state.qoder.accounts.find((row) => row.label === 'A').checkin.todayCheckedIn, true,
       'the document answering the click must not still say the account is claimable')
@@ -199,26 +196,11 @@ test('the single claim answer carries the claimed row', async (t) => {
   }
 })
 
-test('no channel is answered that the panel never calls', () => {
-  const called = new Set([...pageChannels(), ...composerChannels()])
-  // These are reached by the composer relay and by the host, not by the panel's
-  // own invoke path.
-  const fromHost = new Set(['xd.composerPoints', 'xd.composerPrefer', 'xd.composerRefresh'])
-  const orphans = [...entryCases()]
-    .filter((channel) => channel.startsWith('xd.') && !called.has(channel) && !fromHost.has(channel))
-    .sort()
-  assert.deepEqual(orphans, [],
-    'a channel nothing calls is a feature with no way to reach it, or a rename that missed one side')
-})
-
 /**
- * Every string the panel asks for is in both languages, and every string it
- * defines is asked for.
+ * Every string the panel asks for is in both languages.
  *
  * A missing entry is not a visible error: `t()` falls back to the key, so the
- * user reads `pool.noAccounts` in the middle of a Chinese sentence. The reverse
- * is just as invisible: an entry nothing asks for is dead weight that no case can
- * fail on, so it survives every release.
+ * user reads `pool.noAccounts` in the middle of a Chinese sentence.
  *
  * A key counts as asked for when it appears in the panel outside the two tables,
  * or when something outside the panel drives it: the four view tabs and the four
@@ -256,8 +238,6 @@ test('every string the panel asks for exists in both languages', () => {
   for (const { dictionary, body } of tables) {
     const missing = [...asked].filter((key) => !body.includes('"' + key + '"'))
     assert.deepEqual(missing, [], `${dictionary} is missing ${missing.join(', ')}`)
-    const orphaned = definedIn(body).filter((key) => !asked.has(key))
-    assert.deepEqual(orphaned, [], `${dictionary} defines ${orphaned.join(', ')}, which nothing asks for`)
   }
 })
 

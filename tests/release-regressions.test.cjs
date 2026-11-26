@@ -571,7 +571,7 @@ test('PI composer retries unread credits quickly and slows down after a balance 
     const waits = []
     const context = vm.createContext({
       chip: 'fixture', host: { dispatch: async () => ({ show: true, total, ours: true }) },
-      setData() {}, setOpen() {}, setError() {}, setErrorFor() {},
+      setData() {}, setOpen() {}, setError() {}, setErrorFor() {}, setRefreshing() {},
       useEffect: run => { context.cleanup = run() }, Date,
       restartPollRef: { current: () => {} },
       REFRESH_INTERVAL_MS: 300000, WARMUP_INTERVAL_MS: 5000, WARMUP_WINDOW_MS: 120000,
@@ -594,7 +594,7 @@ test('PI composer ignores an older poll after a manual restart', async () => {
     const latest = { show: true, ours: true, total: 42 }
     const context = vm.createContext({
       chip: 'fixture', host: { dispatch: () => ++calls === 1 ? older : Promise.resolve(latest) },
-      setData(value) { shown = value }, setOpen() {}, setError() {}, setErrorFor() {},
+      setData(value) { shown = value }, setOpen() {}, setError() {}, setErrorFor() {}, setRefreshing() {},
       useEffect: run => { context.cleanup = run() }, Date, restartPollRef: { current() {} },
       REFRESH_INTERVAL_MS: 300000, WARMUP_INTERVAL_MS: 5000, WARMUP_WINDOW_MS: 120000,
       setTimeout: () => 1, clearTimeout() {},

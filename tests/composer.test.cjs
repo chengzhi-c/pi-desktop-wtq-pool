@@ -467,7 +467,7 @@ test('a slow source account does not skip the other balances in a composer refre
     module: { exports: {} }, __dirname: path.dirname(entry), Date,
     console: { log() {} }, AbortController, AbortSignal, fetch,
     setTimeout, clearTimeout, setInterval, clearInterval,
-    fixtureRows: credentials.map(({ name, region }) => ({ label: name, region })),
+    fixtureRows: credentials.map(({ name, region }) => ({ id: baseRequire('./lib/source-pool').sourceAccountId(region, name), label: name, region })),
   })
   vm.runInContext(fs.readFileSync(entry, 'utf8'), context)
   vm.runInContext('serviceStopped = false; qoderAccountRows = fixtureRows', context)

@@ -68,3 +68,29 @@ for (const [name, open] of Object.entries(clients)) {
     }
   })
 }
+
+test('WorkBuddy closes a JSON refusal transport returned with HTTP 200', async () => {
+  let captured, onClose
+  const closed = new Promise(resolve => { onClose = resolve })
+  const server = createServer((_req, res) => {
+    res.on('close', onClose)
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.write(JSON.stringify({ code: 6004, msg: 'rate limited', padding: 'x'.repeat(10_000) }))
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const result = await clients.workbuddy(async (_url, init) => {
+      const response = await fetch(`http://127.0.0.1:${server.address().port}/chat`, init)
+      captured = response.clone().text().then(() => {}, () => {})
+      return response
+    })
+    assert.equal(result.ok, true)
+    assert.match(await result.response.text(), /rate limited/)
+    await within(captured)
+    await within(closed)
+  } finally {
+    server.closeAllConnections()
+    await new Promise(resolve => server.close(resolve))
+    await captured
+  }
+})

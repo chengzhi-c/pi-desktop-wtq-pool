@@ -1,7 +1,6 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
-
-
+const { createServer } = require('node:http')
 
 const { WorkBuddyUpstreamClient } = require('../lib/upstream')
 const { TraeSoloUpstreamClient } = require('../lib/trae-upstream')
@@ -87,4 +86,44 @@ for (const [name, open] of Object.entries(clients)) {
       }
     })
   }
+}
+
+for (const refused of ['directory', 'reasoning']) {
+  test(`trae closes a refused ${refused} response while the host captures a clone`, async () => {
+    const captured = [], closed = []
+    const server = createServer((req, res) => {
+      if (refused === 'reasoning' && req.url === '/directory') {
+        res.end(JSON.stringify({ config_info_list: [{ config_name: 'fixture-model' }] }))
+        return
+      }
+      closed.push(new Promise(resolve => res.once('close', resolve)))
+      res.writeHead(403, { 'content-type': 'text/plain' })
+      res.write('fixture upstream refusal')
+    })
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+    const client = new TraeSoloUpstreamClient({
+      credential: async () => ({ accessToken: 'fixture', userId: 'fixture', edition: 'cn', source: 'desktop', expiresAtMs: 0 }),
+      identity: async () => ({ machineId: 'fixture', deviceId: 'fixture', platform: 'win32' }),
+      fetchImpl: async (url, init) => {
+        const route = String(url).includes('get_detail_param') ? 'directory' : 'reasoning'
+        const response = await fetch(`http://127.0.0.1:${server.address().port}/${route}`, init)
+        captured.push(response.clone().text().then(() => {}, () => {}))
+        return response
+      },
+    })
+    try {
+      if (refused === 'directory') await assert.rejects(client.fetchModels(), /HTTP 403/)
+      else {
+        const result = await client.fetchModels()
+        assert.deepEqual(result.models.map(model => model.id), ['fixture-model'])
+        assert.equal(result.partial, false)
+      }
+      assert.ok(closed.length > 0)
+      await within(Promise.all([...captured, ...closed]))
+    } finally {
+      server.closeAllConnections()
+      await new Promise(resolve => server.close(resolve))
+      await Promise.all(captured)
+    }
+  })
 }

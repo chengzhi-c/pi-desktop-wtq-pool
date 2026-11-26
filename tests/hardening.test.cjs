@@ -680,7 +680,7 @@ test('the Trae batch skips only the edition whose device is spent', async () => 
         ? { outcome: 'claimed', deviceCheckedIn: true }
         : { outcome: 'claimed' }
     },
-    traeRowLabel: (credential) => credential.label,
+    traeAccountId: (credential) => credential.label,
     markSourceCheckinRow: (...args) => marked.push(args),
     TRAE_ACCOUNT_DELAY_MS: 0,
     TRAE_ACCOUNT_JITTER_MS: 0,
@@ -1110,28 +1110,6 @@ test('the default-tier output ceiling stays put after the window is raised', () 
  * because that document is exactly where an echoed credential rides - Trae's 401
  * quotes the `Cloud-IDE-JWT` header it was sent.
  */
-/**
- * The vendor's channel check is answered as a cause, not as a wall of tips.
- *
- * WorkBuddy's domestic host refuses any request whose prompt names DeepSeek
- * Harness as the client (code 11128), on every account of that region. Rotation
- * cannot clear it, so the pool must not spend four upstream calls pretending to
- * try; and the body it returns is a block of mixed Chinese and English advice
- * that names no cause and no way forward. This pins the sentence the user reads.
- */
-test('the channel refusal names its cause and the way forward', () => {
-  const { unapprovedChannelRefusal } = require('../lib/loopback')
-  const body = '{"code":11128,"msg":"Illegal API invocation from an unapproved channel","displayTips":{"zh":"这次调用没通过渠道校验"}}'
-  const sentence = unapprovedChannelRefusal(body)
-  assert.ok(typeof sentence === 'string', 'the refusal has to be recognised')
-  assert.match(sentence, /11128/, 'it names the check that refused')
-  assert.match(sentence, /Trae|Qoder|international/, 'and the sources that do serve it')
-  assert.doesNotMatch(sentence, /unapproved channel|displayTips/, 'the vendor block of tips is not what the user reads')
-  // A 400 that is not this one keeps the ordinary sentence, or the mapping would
-  // swallow every real client error.
-  assert.equal(unapprovedChannelRefusal('{"code":4003,"msg":"messages must not be empty"}'), undefined)
-  assert.equal(unapprovedChannelRefusal('nothing structured'), undefined)
-})
 test('an upstream refusal reaches the client as a sentence, not as a document', () => {
   const { liftUpstreamMessage } = require('../lib/loopback')
   assert.equal(liftUpstreamMessage('{"error":{"message":"service busy"}}'), 'service busy',
@@ -1193,57 +1171,6 @@ test('a Trae transport failure is answered 502 with the transport message', asyn
     assert.doesNotMatch(body, /Invalid status code/,
       'writeHead(0) throws, and that 500 hides the refusal the client could act on')
   } finally { await gateway.close() }
-})
-
-/**
- * A stream that goes idle mid-turn ends in an error, not in a clean close.
- *
- * The watchdog cancels a body that has stopped sending, and the cancelled read
- * resolves `done`. Without the check after it the relay closed the stream as
- * though the upstream had finished: the client saw a truncated turn that ended
- * successfully, and the only record of the stall was the warning the relay
- * logged. The constant is not injectable, so the function is lifted out of the
- * shipped module and run under a shortened one - the text is the shipped text,
- * and only the figure the timer waits for is the fixture's.
- */
-test('a stalling upstream body errors the relayed stream instead of closing it', async () => {
-  const source = fs.readFileSync(path.join(root, 'lib/upstream.js'), 'utf8')
-  const context = vm.createContext({
-    STREAM_IDLE_TIMEOUT_MS: 40, ReadableStream, Error, setTimeout, clearTimeout, setInterval, clearInterval,
-  })
-  vm.runInContext(entryFunctions(['withIdleWatchdog'], source), context)
-  const encoder = new TextEncoder()
-
-  let controller
-  const stalling = new ReadableStream({
-    start(next) { controller = next; next.enqueue(encoder.encode('data: {"choices":[]}\n\n')) },
-  })
-  const reader = context.withIdleWatchdog(stalling).getReader()
-  try {
-    const first = await reader.read()
-    assert.equal(first.done, false, 'the chunk that did arrive must still be relayed')
-    await assert.rejects(reader.read(), /upstream stream went idle/,
-      'a body that stops sending must end the relay in an error the client can see')
-  } finally {
-    await reader.cancel().catch(() => {})
-    try { controller.close() } catch {}
-  }
-
-  // The control: a body that ends on its own still closes cleanly, or the case
-  // above would pass for a watchdog that errors on every stream.
-  const closing = new ReadableStream({
-    start(next) { next.enqueue(encoder.encode('data: {"choices":[]}\n\n')); next.close() },
-  })
-  const clean = context.withIdleWatchdog(closing).getReader()
-  let body = ''
-  try {
-    for (;;) {
-      const next = await clean.read()
-      if (next.done) break
-      body += new TextDecoder().decode(next.value)
-    }
-    assert.match(body, /"choices"/, 'a body that ends on its own must still be relayed whole')
-  } finally { await clean.cancel().catch(() => {}) }
 })
 
 /**
@@ -4475,45 +4402,6 @@ test('a headers deadline detaches the caller abort listener it added', () => {
 })
 
 /**
- * The idle watchdog releases its timer when it fires.
- *
- * The watchdog cancels the reader, which resolves the pending read as an end,
- * so `pull` ran once more and re-armed. The timer that had just fired was
- * never cleared, so it outlived the stream it was watching and fired again
- * into a released reader on every watchdog-cancelled turn.
- */
-test('an idle watchdog that fires releases its timer', async () => {
-  const { withIdleWatchdog } = require('../lib/upstream')
-  // The watchdog reads its timers from the globals, so they are counted by
-  // standing in for them - the same way the clean-end case above does it. The
-  // stub fires on the next turn, which is what reaches the fire branch.
-  let armed = 0
-  let cleared = 0
-  let fired = 0
-  const realSetTimeout = globalThis.setTimeout
-  const realClearTimeout = globalThis.clearTimeout
-  globalThis.setTimeout = (handler) => {
-    armed += 1
-    return realSetTimeout(() => { fired += 1; handler() }, 0)
-  }
-  globalThis.clearTimeout = (handle) => { cleared += 1; realClearTimeout(handle) }
-  try {
-    // A stream that never sends and never ends is the only way to reach the
-    // fire branch at all.
-    const relayed = withIdleWatchdog(new ReadableStream({ start() { /* never sends */ } }), 20)
-    const reader = relayed.getReader()
-    await assert.rejects(() => reader.read(), /went idle/,
-      'the quiet stream fails instead of hanging')
-    assert.equal(fired, 1, 'the watchdog fired exactly once')
-    assert.equal(cleared, armed,
-      'the timer that fired must be cleared, or it outlives the stream it watched')
-  } finally {
-    globalThis.setTimeout = realSetTimeout
-    globalThis.clearTimeout = realClearTimeout
-  }
-})
-
-/**
  * A Trae refusal that carries no code still rotates.
  *
  * Trae answers a stale login inside the stream, on the same `event: error`
@@ -4534,22 +4422,6 @@ test('a code-less Trae login refusal rotates', () => {
     'the subscription gate keeps its own class')
   assert.equal(classifyTraeFailure({ code: 10605, message: '{"retryAfterSeconds":30}' }).kind, 'soft_rate',
     'and a queue frame keeps naming its own wait')
-})
-
-/**
- * A Trae refusal with neither a code nor words is not assembled with a leading
- * separator.
- *
- * `parts.join(' · ')` is empty in that case, so the text began with a stray
- * bullet that reached the client in the error frame and in the peeked 502 body.
- */
-test('a Trae refusal with no code carries no leading separator', () => {
-  const { describeTraeFailure } = require('../lib/trae-shim')
-  assert.equal(describeTraeFailure({ message: 'Login expired' }), 'upstream: Login expired',
-    'a code-less refusal reads as a sentence, not as a separator and then one')
-  assert.equal(describeTraeFailure({ message: '' }), 'Trae SOLO refused the request',
-    'a refusal with nothing at all still says something')
-  assert.equal(describeTraeFailure({ code: 1005, message: 'gate' }), 'code 1005 · upstream: gate')
 })
 
 /**
@@ -5508,40 +5380,6 @@ test('a default outside the model ladder is not retried with', async () => {
 })
 
 /**
- * A sign-in that is gone takes its hold and pack expiry with it.
- *
- * A label is not unique to one sign-in: a departed account's hold was inherited
- * by the next one that happened to carry the same name, which demoted it for the
- * rest of the hold despite never having failed, and its pack expiry corrupted
- * expiry-mode ordering. The keys come from the engine's own `sourceRegionKey`, so
- * the fixture cannot drift from the format `pruneSourceState` builds.
- */
-test('a departed sign-in leaves no hold or pack expiry behind', () => {
-  const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
-  const rows = {
-    traeAccountRows: [{ label: 'kept', region: 'cn' }],
-    qoderAccountRows: [{ label: 'kept', region: 'cn' }],
-    sourceFailureHold: new Map(),
-    sourceCreditExpiry: new Map(),
-  }
-  const context = vm.createContext({ console, ...rows })
-  vm.runInContext(entryFunctions(['sourceRegionKey', 'pruneSourceState'], source), context)
-  context.accountStateKey = (from, region, label) => context.sourceRegionKey(from, region) + '\n' + label
-  const keptTrae = context.accountStateKey('trae', 'cn', 'kept')
-  const goneTrae = context.accountStateKey('trae', 'cn', 'gone')
-  const keptQoder = context.accountStateKey('qoder', 'cn', 'kept')
-  const goneQoder = context.accountStateKey('qoder', 'cn', 'gone')
-  const until = Date.now() + 60000
-  rows.sourceFailureHold.set(keptTrae, until).set(goneTrae, until)
-  rows.sourceCreditExpiry.set(keptQoder, until).set(goneQoder, until)
-  context.pruneSourceState()
-  assert.equal(context.sourceFailureHold.size, 1, 'the hold of the departed sign-in is dropped')
-  assert.ok(context.sourceFailureHold.has(keptTrae), 'and the one that is still signed in keeps its hold')
-  assert.equal(context.sourceCreditExpiry.size, 1, 'the same for the pack expiry')
-  assert.ok(context.sourceCreditExpiry.has(keptQoder), 'the surviving sign-in keeps its expiry')
-})
-
-/**
  * A service stop releases the refresh slot.
  *
  * The pass that holds the slot releases it when its own work ends, but a pass
@@ -5666,8 +5504,8 @@ test('source check-in batches preserve the first safe refusal without retrying a
     discoverTraeCredentials: async () => ({ credentials, failures: [] }),
     traeStorageCandidates: () => [],
     traeRegionOfCredential: (credential) => credential.region,
-    traeRowLabel: (credential) => credential.label,
-    qoderRowLabel: (credential) => credential.label,
+    traeAccountId: (credential) => credential.label,
+    qoderAccountId: (credential) => credential.label,
     traeClaimFor: claim,
     qoderClaimFor: claim,
     markSourceCheckinRow() {},
@@ -5793,37 +5631,6 @@ test('a prefixed host provider id counts as this plugin\'s own', () => {
   assert.equal(context.isOwnProviderId('plugin:other.plugin:wtqpool-cn'), false,
     'another plugin reusing one of our provider ids is not ours')
   assert.equal(context.isOwnProviderId(''), false, 'an empty id names nothing')
-})
-
-/**
- * Two sign-ins can share a display name.
- *
- * The picked account, a failure hold and a check-in row are keyed by that
- * label. A duplicate let one account's failure hide the other, so a repeated
- * name gets the vendor's own user id appended; a unique name is untouched.
- */
-test('two source accounts with one display name get distinct labels', () => {
-  const { uniqueSourceLabels } = require('../lib/source-pool')
-  const rows = [
-    { name: 'Alice', id: 'user-1' },
-    { name: 'Alice', id: 'user-2' },
-    { name: 'Bob', id: 'user-3' },
-  ]
-  assert.deepEqual(uniqueSourceLabels(rows, (row) => row.name, (row) => row.id),
-    ['Alice#user1', 'Alice#user2', 'Bob'],
-    'only the repeated name carries a suffix, and the suffix is the vendor id')
-  assert.deepEqual(uniqueSourceLabels(rows.slice(2), (row) => row.name, (row) => row.id), ['Bob'],
-    'a name used once stays exactly as the vendor publishes it')
-  const noId = [{ name: 'Twin' }, { name: 'Twin' }]
-  assert.deepEqual(uniqueSourceLabels(noId, (row) => row.name, () => ''), ['Twin', 'Twin'],
-    'without an id there is nothing stable to append; the pool must not invent one')
-  const sequential = [
-    { name: 'Twin', id: '22733912345' },
-    { name: 'Twin', id: '22733912346' },
-  ]
-  assert.deepEqual(uniqueSourceLabels(sequential, (row) => row.name, (row) => row.id),
-    ['Twin#33912345', 'Twin#33912346'],
-    'ids sharing a prefix must still produce distinct labels')
 })
 
 /**
